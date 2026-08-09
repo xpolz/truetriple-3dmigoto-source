@@ -1,0 +1,4326 @@
+diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
+index 6758d9f..c756638 100644
+--- a/DirectX11/CommandList.cpp
++++ b/DirectX11/CommandList.cpp
+@@ -17,6 +17,8 @@
+ #include "profiling.h"
+ #include "Hunting.h"
+ #include "cursor.h"
++#include "DLLMainHook.h"   // v1.66: CNktHookLib cHookMgr para hookear BuildFrustum
++#include <intrin.h>        // _ReturnAddress para identificar el call site de render
+ 
+ #include <D3DCompiler.h>
+ 
+@@ -926,6 +928,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+ 	if (!wcscmp(key, L"reset_per_frame_limits"))
+ 		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+ 
++	if (!wcscmp(key, L"set_scissor")) {
++		if (!wcscmp(val->c_str(), L"save"))
++			return AddCommandToList(new ScissorCommand(section, 1), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		if (!wcscmp(val->c_str(), L"restore"))
++			return AddCommandToList(new ScissorCommand(section, 2), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		int l, t, r, b;
++		if (swscanf_s(val->c_str(), L"%d, %d, %d, %d", &l, &t, &r, &b) == 4)
++			return AddCommandToList(new ScissorCommand(section, l, t, r, b), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		LogInfo("  WARNING: set_scissor requires 4 integers (l,t,r,b) or save/restore\n");
++		return false;
++	}
++	// triple_params = 0|1|2 : bindea la textura de parametros PRE-ARMADA de esa
++	// region (sustituye a "x = N", que costaba un Map de recurso GPU por redibujo).
++	if (!wcscmp(key, L"triple_params")) {
++		int r = _wtoi(val->c_str());
++		// 3 = passthrough EXPLICITO: obligatorio al final de los redibujos.
++		// Si la textura de region quedara enlazada, los pases offscreen que usan
++		// los mismos shaders parcheados (p.ej. el RELLENO DEL SHADOW MAP) leerian
++		// x = 0/1/2 y se renderizarian deformados por region -> sombras cortadas
++		// y parpadeantes (distinto por hilo). Fue el bug de v1.24.
++		if (r >= 0 && r <= 3)
++			return AddCommandToList(new TripleParamsCommand(section, r), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		LogInfo("  WARNING: triple_params requires 0, 1, 2 or 3\n");
++	}
++
++	// triple_scissor = 0|1|2 : fija SOLO el scissor del tercio, como fraccion del
++	// render target real -> funciona a cualquier resolucion.
++	if (!wcscmp(key, L"triple_scissor")) {
++		// "restore" = reponer los rects que el JUEGO habia seteado (copia sombra
++		// de HackerContext); si no habia ninguno, rect neutro de 16384.
++		if (!wcscmp(val->c_str(), L"restore"))
++			return AddCommandToList(new TripleRegionCommand(section, -1, 2), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		int r = _wtoi(val->c_str());
++		if (r >= 0 && r <= 2)
++			return AddCommandToList(new TripleRegionCommand(section, r, 1), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		LogInfo("  WARNING: triple_scissor requires 0, 1, 2 or restore\n");
++	}
++
++	if (!wcscmp(key, L"triple_region")) {
++		int r = -1;
++		if (swscanf_s(val->c_str(), L"%d", &r) == 1 && r >= 0 && r <= 2)
++			return AddCommandToList(new TripleRegionCommand(section, r), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		LogInfo("  WARNING: triple_region requires 0, 1 or 2\n");
++		return false;
++	}
++	if (!wcscmp(key, L"triple_restore"))
++		return AddCommandToList(new TripleRestoreCommand(section), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
+ 	if (!wcscmp(key, L"clear"))
+ 		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+ 
+@@ -1345,6 +1394,2054 @@ void AbortCommand::run(CommandListState *state)
+ 	state->aborted = true;
+ }
+ 
++// Save/restore of the game's own scissor rects around our per-region redraws.
++// Without this, our last set_scissor leaks into the game's UI drawing (which uses
++// scissor rects for panel clipping) and breaks menus while the triple is active.
++static thread_local D3D11_RECT tls_triple_saved_rects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++static thread_local UINT tls_triple_saved_rect_count = 0;
++
++void ScissorCommand::run(CommandListState *state)
++{
++	COMMAND_LIST_LOG(state, "[%S] set_scissor mode=%d rect=%d,%d,%d,%d\n",
++		ini_section.c_str(), mode, rect.left, rect.top, rect.right, rect.bottom);
++
++	if (mode == 1) {
++		tls_triple_saved_rect_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
++		state->mOrigContext1->RSGetScissorRects(&tls_triple_saved_rect_count, tls_triple_saved_rects);
++	} else if (mode == 2) {
++		state->mOrigContext1->RSSetScissorRects(tls_triple_saved_rect_count,
++			tls_triple_saved_rect_count ? tls_triple_saved_rects : NULL);
++	} else {
++		state->mOrigContext1->RSSetScissorRects(1, &rect);
++	}
++}
++
++// ---- Triple-monitor per-region camera cb override ----------------------------
++// Precomputed per-region matrices (column-major, m[col*4+row]) from compute_matrices.py.
++// Camera-INDEPENDENT: P_region = the region projection (Squeeze_i * off-axis frustum),
++// and its inverse. Applied at runtime as: projection_i = P_region,
++// inverseProj_i = inv(P_region), relativeViewProjection_i = P_region * relativeView.
++// This does NOT bake in the game's projection, so it works for any camera (garage,
++// cockpit, cinematic). Column-major (m[col*4+row]) from compute_matrices.py.
++// v1.13: las matrices de region ya NO se hornean aca. Se construyen en RUNTIME a
++// partir de (a) las constantes de geometria K que el d3dx.ini publica en IniParams
++// ([Present] las recalcula por frame desde $eye_d / $panel / $angulo) y (b) el near
++// REAL de la camara capturada. Hornearlas fue un bug: TRIPLE_PREG asumia near=0.052
++// pero la camara de conduccion real tiene near=0.1, y la correccion del shader
++// preserva el near del juego -> la inversa tenia que usar el mismo near o las
++// sombras quedan a profundidad equivocada.
++//
++// Layout de IniParams (ver [Present] en d3dx.ini):
++//   fila0 = (region, KA, KB, KC)   fila1 = (KXc, KYc, sen_ang, cos_ang)
++#define TRIPLE_KA   (G->iniParams[0].y)
++#define TRIPLE_KB   (G->iniParams[0].z)
++#define TRIPLE_KC   (G->iniParams[0].w)
++#define TRIPLE_KXC  (G->iniParams[1].x)
++#define TRIPLE_KYC  (G->iniParams[1].y)
++#define TRIPLE_SA   (G->iniParams[1].z)
++#define TRIPLE_CA   (G->iniParams[1].w)
++
++// v1.15: TODO ESTO ES thread_local (uno por contexto diferido).
++// CAUSA DEL PARPADEO en v1.14: eran globales compartidos. DiRT graba en 7
++// contextos diferidos, y en un contexto diferido UpdateSubresource NO se ejecuta
++// al llamarlo: queda GRABADO en la lista de comandos de ESE contexto. Con un
++// unico juego de buffers y un unico g_triple_frame:
++//   - el hilo A veia frame nuevo, grababa el Update y marcaba el frame como hecho;
++//   - el hilo B veia el frame ya hecho, NO grababa nada, y bindeaba igual;
++//   - si la lista de B se ejecutaba ANTES que la de A, B dibujaba con el contenido
++//     del frame ANTERIOR -> valores alternando entre cuadros = parpadeo.
++// Con buffers y bookkeeping por contexto, cada uno graba su propia actualizacion
++// antes de sus propios draws y queda internamente consistente.
++static thread_local ID3D11Buffer *g_triple_region_cb[3] = { NULL, NULL, NULL };
++// Copia sin modificar de la camara capturada, para restaurar sin usar Get* (los
++// metodos Get* de ID3D11DeviceContext no son fiables en contextos diferidos: fue
++// exactamente la causa del desastre de v1.5b con RSGetScissorRects).
++static thread_local ID3D11Buffer *g_triple_orig_cb = NULL;
++static thread_local UINT g_triple_cb_size = 0;
++static thread_local unsigned g_triple_frame = 0xFFFFFFFF;
++static thread_local bool g_triple_valid = false;
++
++// Per-context: the game's real camera cb3, saved on region 0 and restored by
++// triple_restore after the redraws (else unmatched draws leak the override).
++static thread_local ID3D11Buffer *tls_triple_saved_cb3 = NULL;
++
++// Camera cb captured at write-time (from HackerContext Map/Unmap) to avoid a
++// deferred-context GPU readback, which is illegal on deferred contexts.
++static char g_triple_cam_buf[512];
++static UINT g_triple_cam_size = 0;
++static volatile bool g_triple_cam_valid = false;
++
++// ===== v1.37: CAZAPLANOS — buscar los 6 planos del frustum (SOLO LECTURA) ====
++// El culling no testea contra "un angulo": testea contra 6 planos, y cada plano
++// es un semiespacio independiente. Rotar los dos laterales hacia afuera abre el
++// frustum a cualquier angulo — incluso mas de 180, que ninguna proyeccion plana
++// puede expresar (el techo que mato los intentos por FOV). Esta build BUSCA esos
++// planos y los loguea; no escribe nada. Con el log se decide si la fase 2 es
++// escribir planos o escalar al breakpoint de datos.
++//
++// Que se busca (tres firmas complementarias):
++//  1. PLANOS6 (nuevo): 6 grupos consecutivos de 4 floats con normal ~unitaria
++//     cuyos productos punto entre normales forman el apareamiento exacto de un
++//     frustum con ESTA camara: un par antiparalelo (near/far, dot=-1), un par
++//     lateral (dot=-cos(fovH)) y un par vertical (dot=-cos(fovV)). Los dots son
++//     invariantes a rotacion, asi que la firma funciona igual si el engine
++//     guarda los planos en espacio de VISTA o de MUNDO — el intento anterior
++//     (valor exacto) solo cubria espacio de vista. Exigir el apareamiento
++//     perfecto de a 3 pares sobre 6 normales hace el falso positivo rarisimo
++//     (la trampa del icosaedro del primer intento no pasa este filtro).
++//     El w de cada plano dice en que espacio estan: laterales con d~0 = vista
++//     (pasan por el ojo); d grandes = mundo.
++//  2. Componentes por valor exacto de los planos en vista: normalize(m00,0,-1)
++//     y normalize(0,m11,-1). Barato y con dump de vecindario.
++//  3. Camaras "laxas" ({fov,near,far,aspect} plausibles SIN exigir matriz a
++//     +0x2C): candidatas a la camara del hilo de simulacion, la que la firma
++//     estricta descartaba y probablemente la fuente real (MEMORIA.md).
++// Ademas se reloguean los descriptores estrictos como control positivo de que
++// el escaner ve lo mismo que la sesion pasada.
++
++struct CullScanReq {
++	float P[16];	// proyeccion tal como se sube en cb3[0..3]
++	float m00, m11, nearz, aspect;
++};
++static CullScanReq g_cullscan_req;
++static volatile LONG g_cullscan_state = 0;	// 0=esperando camara, 1=lanzado
++
++// Nombre del modulo dueno de una direccion, o "heap" si es memoria dinamica.
++static const char *cull_owner(const void *addr, char *buf, size_t bufsz)
++{
++	HMODULE hm = NULL;
++	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &hm) && hm) {
++		char full[MAX_PATH];
++		if (GetModuleFileNameA(hm, full, MAX_PATH)) {
++			const char *base = strrchr(full, '\\');
++			_snprintf_s(buf, bufsz, _TRUNCATE, "%s", base ? base + 1 : full);
++			return buf;
++		}
++	}
++	_snprintf_s(buf, bufsz, _TRUNCATE, "heap");
++	return buf;
++}
++
++// Vuelca `antes` floats previos y `despues` posteriores al hit, recortado a la
++// region para no leer afuera. 8 por linea, con un marcador donde cae el hit.
++static void cull_dump(const uint8_t *hit, const uint8_t *rbase, size_t rsize,
++	int antes, int despues)
++{
++	const float *lo = (const float *)max((uintptr_t)rbase, (uintptr_t)(hit - 4 * antes));
++	const float *hi = (const float *)min((uintptr_t)(rbase + rsize), (uintptr_t)(hit + 4 * despues));
++	char linea[512];
++	for (const float *p = lo; p < hi; p += 8) {
++		int n = _snprintf_s(linea, sizeof(linea), _TRUNCATE, "CULLSCAN   %p:", p);
++		for (const float *q = p; q < p + 8 && q < hi; q++) {
++			float v = *q;
++			// los valores absurdos se imprimen en hex para no romper columnas
++			if (v > -1e9f && v < 1e9f)
++				n += _snprintf_s(linea + n, sizeof(linea) - n, _TRUNCATE,
++					(q == (const float *)hit) ? " >%11.5f<" : " %12.5f", v);
++			else
++				n += _snprintf_s(linea + n, sizeof(linea) - n, _TRUNCATE, "  0x%08X ", *(const unsigned *)q);
++		}
++		LogInfo("%s\n", linea);
++	}
++}
++
++// Un descriptor es valido si sus 4 floats son plausibles Y la matriz a +0x2C
++// se deriva de ellos (firma de la sesion pasada, sirve de control positivo).
++static bool cull_desc_ok(const float *d, float aspect_real, float *m11_out)
++{
++	float fov = d[0], near_ = d[1], far_ = d[2], asp = d[3];
++	if (!(fov > 5.0f && fov < 175.0f))
++		return false;
++	if (!(near_ > 0.001f && near_ < 5.0f))
++		return false;
++	if (!(far_ > 200.0f && far_ < 1e6f))
++		return false;
++	if (asp < aspect_real - 0.0005f || asp > aspect_real + 0.0005f)
++		return false;
++
++	float m11 = 1.0f / tanf(fov * 0.008726646f);	// pi/180/2
++	float m00 = m11 / asp;
++	const float *M = d + 11;						// +0x2C
++	float e11 = M[5] - m11; if (e11 < 0) e11 = -e11;
++	float e00 = M[0] - m00; if (e00 < 0) e00 = -e00;
++	if (e11 > m11 * 0.002f || e00 > m00 * 0.002f)
++		return false;
++	// una proyeccion de verdad tiene ceros fuera de la diagonal y w=-z
++	if (M[1] != 0.0f || M[4] != 0.0f || M[12] != 0.0f || M[13] != 0.0f)
++		return false;
++	if (M[11] > -0.9f || M[11] < -1.1f)
++		return false;
++	if (m11_out)
++		*m11_out = m11;
++	return true;
++}
++
++// Resultado de un match de PLANOS6: que par es que, y los angulos medidos.
++struct Planos6Info {
++	int nf0, nf1;		// par near/far (dot ~ -1)
++	int lat0, lat1;		// par lateral (dot ~ -cos fovH)
++	int v0, v1;			// par vertical (dot ~ -cos fovV)
++	float fovh, fovv;	// grados medidos desde los dots
++};
++
++// Layouts posibles de un juego de 6 planos en 24 floats:
++//   AoS (0): x0 y0 z0 d0 | x1 y1 z1 d1 | ...   (lo clasico)
++//   SoA (1): x0..x5 | y0..y5 | z0..z5 | d0..d5 (lo que usa un culler SIMD,
++//            que procesa los 6 planos de a 4/8 lanes — invisible para AoS)
++#define CULL_LAYOUT_AOS 0
++#define CULL_LAYOUT_SOA 1
++
++static inline void cull_plane_at(const float *g, int layout, int i,
++	float *x, float *y, float *z, float *d)
++{
++	if (layout == CULL_LAYOUT_SOA) {
++		*x = g[i]; *y = g[6 + i]; *z = g[12 + i]; *d = g[18 + i];
++	} else {
++		*x = g[i * 4]; *y = g[i * 4 + 1]; *z = g[i * 4 + 2]; *d = g[i * 4 + 3];
++	}
++}
++
++// PLANOS6: ¿hay en `g` 6 planos cuyas normales se aparean como el frustum de
++// esta camara? dot_h = -cos(fovH), dot_v = -cos(fovV).
++static bool cull_planos6_layout(const float *g, int layout, float dot_h,
++	float dot_v, Planos6Info *out)
++{
++	float n[6][3];
++	for (int i = 0; i < 6; i++) {
++		float q[4];
++		cull_plane_at(g, layout, i, &q[0], &q[1], &q[2], &q[3]);
++		// mismo cuidado con NaN que en cull_par_lateral: un rango escrito como
++		// `l2 < min || l2 > max` no rechaza NaN, lo deja pasar.
++		if (!(q[0] > -1e18f && q[0] < 1e18f) || !(q[1] > -1e18f && q[1] < 1e18f) ||
++		    !(q[2] > -1e18f && q[2] < 1e18f))
++			return false;
++		float l2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2];
++		// normal "unitaria con margen": si el engine no normaliza exacto igual
++		// la agarramos, y normalizamos nosotros antes de los dots
++		if (l2 < 0.49f || l2 > 2.25f)
++			return false;
++		float inv = 1.0f / sqrtf(l2);
++		n[i][0] = q[0] * inv; n[i][1] = q[1] * inv; n[i][2] = q[2] * inv;
++	}
++	// clasificar los 15 pares por su dot
++	int nf[15][2], nh[15][2], nv[15][2];
++	int c_nf = 0, c_h = 0, c_v = 0;
++	for (int i = 0; i < 6; i++) {
++		for (int j = i + 1; j < 6; j++) {
++			float d = n[i][0] * n[j][0] + n[i][1] * n[j][1] + n[i][2] * n[j][2];
++			float e;
++			e = d + 1.0f;   if (e < 0) e = -e;
++			if (e < 0.02f && c_nf < 15) { nf[c_nf][0] = i; nf[c_nf][1] = j; c_nf++; }
++			e = d - dot_h;  if (e < 0) e = -e;
++			if (e < 0.03f && c_h < 15)  { nh[c_h][0] = i; nh[c_h][1] = j; c_h++; }
++			e = d - dot_v;  if (e < 0) e = -e;
++			if (e < 0.03f && c_v < 15)  { nv[c_v][0] = i; nv[c_v][1] = j; c_v++; }
++		}
++	}
++	// apareamiento perfecto: un par de cada clase y los 6 indices distintos
++	for (int a = 0; a < c_nf; a++) {
++		for (int b = 0; b < c_h; b++) {
++			for (int c = 0; c < c_v; c++) {
++				unsigned mask = (1u << nf[a][0]) | (1u << nf[a][1]) |
++					(1u << nh[b][0]) | (1u << nh[b][1]) |
++					(1u << nv[c][0]) | (1u << nv[c][1]);
++				// 6 bits prendidos = sin repetidos
++				unsigned m = mask; int bits = 0;
++				while (m) { bits += m & 1; m >>= 1; }
++				if (bits != 6)
++					continue;
++				const float *p1 = &n[nh[b][0]][0], *p2 = &n[nh[b][1]][0];
++				float dh = p1[0] * p2[0] + p1[1] * p2[1] + p1[2] * p2[2];
++				p1 = &n[nv[c][0]][0]; p2 = &n[nv[c][1]][0];
++				float dv = p1[0] * p2[0] + p1[1] * p2[1] + p1[2] * p2[2];
++				out->nf0 = nf[a][0]; out->nf1 = nf[a][1];
++				out->lat0 = nh[b][0]; out->lat1 = nh[b][1];
++				out->v0 = nv[c][0]; out->v1 = nv[c][1];
++				out->fovh = 180.0f - acosf(dh) * 57.29578f;
++				out->fovv = 180.0f - acosf(dv) * 57.29578f;
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++// ===== v1.59: PAR de planos laterales (culler 2D) ===========================
++//
++// El sintoma que describe el usuario es preciso: una linea recta que se va al
++// horizonte, matas que aparecen y desaparecen al cruzarla, y vuelven en marcha
++// atras. Eso es un recorte por PLANO, mata por mata — pero horizontal.
++//
++// Toda la caceria anterior busco juegos de SEIS planos (izq/der/arriba/abajo/
++// near/far), que es la forma clasica de un frustum 3D. Un culler de vegetacion
++// no necesita recortar por arriba ni por abajo: el pasto vive en el suelo. Le
++// alcanzan DOS planos laterales, y con esa firma nunca lo hubieramos visto.
++//
++// Firma: dos float4 con normal unitaria, casi horizontales (|ny| chico) y con
++// dot entre ellos == -cos(fovH). Se aceptan separados hasta 64 bytes porque no
++// tienen por que ser contiguos.
++static bool cull_par_lateral(const float *g, int sep, float dot_h, float *ang)
++{
++	const float *a = g, *b = g + sep;
++	// FILTRO BARATO PRIMERO (rendimiento): un plano lateral de culler 2D tiene
++	// la normal casi horizontal -> ny ~ 0. Esta sola comparacion descarta el
++	// 99%+ de las posiciones de una, y de paso rechaza NaN (toda comparacion
++	// contra NaN es falsa, asi que el `!( )` la mata). Sin esto el barrido de
++	// 8 GB no llegaba a terminar antes de que el usuario cerrara el juego.
++	if (!(a[1] > -0.10f && a[1] < 0.10f))
++		return false;
++	if (!(b[1] > -0.10f && b[1] < 0.10f))
++		return false;
++	// resto de la validacion de NaN sobre los campos que quedan
++	if (!(a[0] > -1e18f && a[0] < 1e18f) || !(a[2] > -1e18f && a[2] < 1e18f) ||
++	    !(b[0] > -1e18f && b[0] < 1e18f) || !(b[2] > -1e18f && b[2] < 1e18f))
++		return false;
++	float la = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
++	float lb = b[0]*b[0] + b[1]*b[1] + b[2]*b[2];
++	if (la < 0.96f || la > 1.04f || lb < 0.96f || lb > 1.04f)
++		return false;
++	// casi horizontales: un plano lateral de un culler 2D tiene la normal en el
++	// plano del suelo. Esto es lo que separa el par lateral de cualquier otro
++	// par de vectores unitarios sueltos que ande dando vueltas en memoria.
++	if (a[1] > 0.10f || a[1] < -0.10f || b[1] > 0.10f || b[1] < -0.10f)
++		return false;
++	float d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
++	float e = d - dot_h; if (e < 0) e = -e;
++	if (e > 0.02f)
++		return false;
++	// y que no sean el mismo plano repetido
++	if (d > 0.999f)
++		return false;
++	*ang = 180.0f - acosf(d) * 57.29578f;
++	return true;
++}
++
++// Prueba los dos layouts. Devuelve el que matcheo, o -1.
++static int cull_planos6_any(const float *g, float dot_h, float dot_v,
++	Planos6Info *out)
++{
++	if (cull_planos6_layout(g, CULL_LAYOUT_AOS, dot_h, dot_v, out))
++		return CULL_LAYOUT_AOS;
++	if (cull_planos6_layout(g, CULL_LAYOUT_SOA, dot_h, dot_v, out))
++		return CULL_LAYOUT_SOA;
++	return -1;
++}
++
++// El interceptor de constant buffers solo usa AoS.
++static bool cull_planos6(const float *g, float dot_h, float dot_v,
++	Planos6Info *out)
++{
++	return cull_planos6_layout(g, CULL_LAYOUT_AOS, dot_h, dot_v, out);
++}
++
++// ===== v1.38 fase 2: ABRIR el frustum escribiendo los planos ================
++// El escaneo del 2026-07-28 encontro dos familias de juegos de 6 planos con
++// los angulos EXACTOS de la camara en uso (ver docs/MEMORIA.md):
++//   GRUPO A (tipo 1): orden canonico [near,far,izq,der,arriba,abajo], w de
++//     miles -> planos en ESPACIO DE MUNDO, actualizados con el movimiento.
++//   GRUPO B (tipo 2): orden [izq,der,near,far,arriba,abajo], w chicos,
++//     angulos con banda (149.90/68.97 vs 150.31/70.00).
++// El truco de escritura no necesita rotar nada: se pisan los DOS planos
++// laterales con copias del par near/far. El test lateral queda redundante
++// (todo lo que pasa near/far pasa los laterales) -> culling horizontal
++// abierto, vertical intacto. Como cada plano es un semiespacio independiente,
++// esto equivale a abrir el frustum a 360 en horizontal — el techo de tan(90)
++// de las proyecciones no aplica.
++// El engine reconstruye los planos por frame, asi que mientras este activado
++// se escribe en bucle apretado (la leccion del descriptor: escribir 1 vez por
++// frame pierde la carrera contra el culling del mismo frame). Un core al 100%
++// mientras esta prendido: es diagnostico, no release.
++// Se controla con $cull_widen desde el ini (F8): 0=off 1=grupoA 2=grupoB 3=ambos.
++
++#define CULL_MAX_SETS 64
++struct PlaneSet {
++	volatile float *p;	// los 24 floats del juego de planos
++	int tipo;			// 1=grupo A, 2=grupo B, 0=no escribible
++	int layout;			// CULL_LAYOUT_AOS / _SOA
++	Planos6Info info;
++	bool aplicado;		// nuestros valores estan puestos ahora mismo
++	bool muerto;		// AV o dejo de parecer un juego de planos
++	int reescrituras;	// veces que el engine nos piso (= reconstruye por frame)
++	int cambios;		// v1.40: cuantas veces cambio SOLO (sin tocarlo)
++	float snapshot[24];
++};
++static PlaneSet g_cull_sets[CULL_MAX_SETS];
++static int g_cull_nsets = 0;
++
++// ===== v1.40: ¿cual de estos juegos de planos esta VIVO? =====================
++// La prueba en pista mostro que los 4 sets del v1.38 apenas se reescriben (~1/s
++// segun reescrituras_engine). El frustum que de verdad decide el culling se
++// reconstruye POR FRAME: sus 24 floats cambian ~60 veces por segundo mientras
++// el auto se mueve. Esta pasada no escribe nada: solo mira quien late.
++// Sin esto seguiriamos escribiendo copias en cache y viendo efectos parciales.
++static DWORD WINAPI cull_vitals_thread(LPVOID)
++{
++	// dejar que el juego llegue a pista y se mueva un poco
++	Sleep(2000);
++
++	for (int i = 0; i < g_cull_nsets; i++) {
++		PlaneSet *s = &g_cull_sets[i];
++		s->cambios = 0;
++		__try {
++			for (int k = 0; k < 24; k++)
++				s->snapshot[k] = s->p[k];
++		} __except (EXCEPTION_EXECUTE_HANDLER) {
++			s->muerto = true;
++		}
++	}
++
++	// 60 muestras cada 50 ms = 3 segundos de observacion
++	for (int muestra = 0; muestra < 60; muestra++) {
++		Sleep(50);
++		for (int i = 0; i < g_cull_nsets; i++) {
++			PlaneSet *s = &g_cull_sets[i];
++			if (s->muerto)
++				continue;
++			__try {
++				bool cambio = false;
++				for (int k = 0; k < 24; k++) {
++					float v = s->p[k];
++					if (v != s->snapshot[k]) {
++						cambio = true;
++						s->snapshot[k] = v;
++					}
++				}
++				if (cambio)
++					s->cambios++;
++			} __except (EXCEPTION_EXECUTE_HANDLER) {
++				s->muerto = true;
++			}
++		}
++	}
++
++	LogInfo("CULLVITAL: ==== quien late (60 muestras en 3s, sin escribir) ====\n");
++	int vivos = 0;
++	for (int i = 0; i < g_cull_nsets; i++) {
++		PlaneSet *s = &g_cull_sets[i];
++		bool vivo = (s->cambios >= 30);	// cambia en al menos la mitad
++		if (vivo)
++			vivos++;
++		LogInfo("CULLVITAL set #%d en %p layout=%s tipo=%d fovH=%.2f fovV=%.2f: "
++			"cambios=%d/60 %s\n",
++			i, (void *)s->p,
++			s->layout == CULL_LAYOUT_SOA ? "SoA" : "AoS",
++			s->tipo, s->info.fovh, s->info.fovv, s->cambios,
++			vivo ? "<== VIVO (se reconstruye por frame)" :
++			(s->cambios > 0 ? "(tibio)" : "(congelado)"));
++	}
++	LogInfo("CULLVITAL: %d de %d sets estan VIVOS. Los vivos son los que de "
++		"verdad decide el culler; F8 escribe SOLO esos si hay alguno.\n",
++		vivos, g_cull_nsets);
++
++	// Si hay vivos, restringir la escritura a ellos: escribir copias muertas
++	// fue exactamente lo que dio el efecto parcial del v1.38.
++	if (vivos > 0) {
++		for (int i = 0; i < g_cull_nsets; i++)
++			// tipo 1 (frustum canonico, angulos EXACTOS de la camara) es la
++			// camara por definicion: NUNCA se demota. El test de vitalidad solo
++			// filtra los ambiguos (tipo 2/4). Sin esto, entrar QUIETO a pista
++			// daba 0 cambios en la ventana y desactivaba hasta la camara real
++			// -> F8 no hacia nada (regresion del RAM-A reportada).
++			if (g_cull_sets[i].cambios < 30 && g_cull_sets[i].tipo != 1)
++				g_cull_sets[i].tipo = 0;	// no escribible
++		LogInfo("CULLVITAL: escritura restringida a los vivos + tipo-1 (camara).\n");
++	} else {
++		LogInfo("CULLVITAL: NINGUNO late. El frustum real no esta en memoria "
++			"escaneable con esta firma (candidatos: otro layout, planos "
++			"derivados en el momento desde la matriz VP, o culling por "
++			"celdas/PVS).\n");
++	}
++	return 0;
++}
++
++// Una pasada de escritura sobre un juego de planos. SEH sin objetos C++: la
++// memoria es del engine y puede liberarse en cualquier momento.
++// `todo` = abrir tambien el par vertical (modo agresivo de diagnostico: sirve
++// para saber SI este frustum manda sobre lo que buscamos, sin depender de haber
++// identificado bien cual par es el lateral y cual el vertical).
++// Devuelve: 1 escrito, 0 ya estaba puesto, -1 ya no son planos, -2 AV.
++static int cull_widen_one(PlaneSet *s, bool todo)
++{
++	// v1.59: par lateral 2D (tipo 5). No hay near/far con que taparlo, asi que
++	// se rota cada normal hacia afuera hasta dejarlas antiparalelas: dos planos
++	// mirando en sentidos opuestos no recortan nada en horizontal. Es el
++	// equivalente 2D de abrir el frustum a 360.
++	if (s->tipo == 5) {
++		__try {
++			volatile float *p = s->p;
++			int sep = s->layout;
++			float ax = p[0], ay = p[1], az = p[2];
++			float bx = p[sep], by = p[sep + 1], bz = p[sep + 2];
++			float la = ax*ax + ay*ay + az*az, lb = bx*bx + by*by + bz*bz;
++			if (la < 0.9f || la > 1.1f || lb < 0.9f || lb > 1.1f)
++				return -1;
++			// ¿ya estan antiparalelas? entonces nuestra escritura sigue puesta
++			float d = ax*bx + ay*by + az*bz;
++			if (d < -0.995f)
++				return 0;
++			if (s->aplicado)
++				s->reescrituras++;
++			// eje comun = bisectriz; cada normal pasa a apuntar al opuesto del
++			// otro. Se conservan las distancias (w): mover el plano de lugar
++			// recortaria por distancia, que no es lo que queremos tocar.
++			float ex = ax - bx, ey = ay - by, ez = az - bz;
++			float le = sqrtf(ex*ex + ey*ey + ez*ez);
++			if (le < 1e-4f)
++				return -1;
++			ex /= le; ey /= le; ez /= le;
++			p[0] = ex;  p[1] = ey;  p[2] = ez;
++			p[sep] = -ex; p[sep+1] = -ey; p[sep+2] = -ez;
++			s->aplicado = true;
++			return 1;
++		} __except (EXCEPTION_EXECUTE_HANDLER) {
++			return -2;
++		}
++	}
++
++	__try {
++		volatile float *p = s->p;
++		// indices de los 4 floats de cada plano segun el layout
++		int paso = (s->layout == CULL_LAYOUT_SOA) ? 1 : 4;
++		int salto = (s->layout == CULL_LAYOUT_SOA) ? 6 : 1;
++		// revalidar barato: las 6 normales siguen teniendo largo sano
++		for (int i = 0; i < 6; i++) {
++			float x = p[i * paso], y = p[i * paso + salto], z = p[i * paso + 2 * salto];
++			float l2 = x * x + y * y + z * z;
++			if (l2 < 0.25f || l2 > 4.0f)
++				return -1;
++		}
++		int na = s->info.nf0 * paso, nb = s->info.nf1 * paso;
++		// planos a neutralizar: los dos laterales, y en modo agresivo tambien
++		// los dos verticales. Cada uno se pisa con una copia de un plano del
++		// par near/far, que ya lo contiene: el test se vuelve redundante.
++		int dst[4], src[4], n = 0;
++		dst[n] = s->info.lat0 * paso; src[n++] = na;
++		dst[n] = s->info.lat1 * paso; src[n++] = nb;
++		if (todo) {
++			dst[n] = s->info.v0 * paso; src[n++] = na;
++			dst[n] = s->info.v1 * paso; src[n++] = nb;
++		}
++		// si ya estan puestos, nuestra escritura sigue vigente
++		bool puesto = true;
++		for (int i = 0; i < n && puesto; i++)
++			for (int k = 0; k < 4 && puesto; k++)
++				if (p[dst[i] + k * salto] != p[src[i] + k * salto])
++					puesto = false;
++		if (puesto)
++			return 0;
++		if (s->aplicado)
++			s->reescrituras++;	// el engine reconstruyo: dato en si mismo
++		for (int i = 0; i < n; i++)
++			for (int k = 0; k < 4; k++)
++				p[dst[i] + k * salto] = p[src[i] + k * salto];
++		s->aplicado = true;
++		return 1;
++	} __except (EXCEPTION_EXECUTE_HANDLER) {
++		return -2;
++	}
++}
++
++static DWORD WINAPI cull_widen_thread(LPVOID)
++{
++	// Lectura directa de la variable del ini (los punteros a valores de un
++	// unordered_map sobreviven; despues de cargar el ini no se agregan claves).
++	CommandListVariable *var = NULL;
++	{
++		auto it = command_list_globals.find(L"$cull_widen");
++		if (it != command_list_globals.end())
++			var = &it->second;
++	}
++	LogInfo("CULLWIDEN: variable $cull_widen %s | %d juego(s) de planos "
++		"registrados\n", var ? "encontrada" : "NO ENCONTRADA -> inerte",
++		g_cull_nsets);
++	if (!var)
++		return 0;
++
++	int ultimo_modo = -1;
++	unsigned escrituras = 0;
++	int ciclos_log = 0;
++
++	while (true) {
++		int modo = (int)var->fval;
++
++		if (modo != ultimo_modo) {
++			ultimo_modo = modo;
++			int na = 0, nb = 0;
++			for (int i = 0; i < g_cull_nsets; i++) {
++				g_cull_sets[i].aplicado = false;
++				if (g_cull_sets[i].muerto || !g_cull_sets[i].tipo)
++					continue;
++				if (g_cull_sets[i].tipo == 1) na++;
++				else nb++;
++			}
++			LogInfo("CULLWIDEN: modo=%d (bits: 1=camara 4=cbufferGPU 8=TODOS los "
++				"frustums vivos) | sets escribibles=%d\n", modo, na + nb);
++			LogOverlay(LOG_WARNING, "Culling: %s%s%s%s\n",
++				modo == 0 ? "original" : "abierto:",
++				(modo & 1) ? " camara" : "",
++				(modo & 4) ? " GPU-cb" : "",
++				(modo & 8) ? " TODOS-los-frustums" : "");
++		}
++
++		// los bits 1/2/8 (RAM) los aplica este hilo; el bit 4 lo aplica el
++		// interceptor de constant buffers (TripleScanPlanesInCB) en el momento
++		// exacto de la subida, sin carrera. Aca solo importa si hay RAM activa.
++		if ((modo & 11) == 0) {
++			// apagado: no restauramos nada a mano — el engine reconstruye los
++			// planos por frame solo (verificado: w cambia con el movimiento)
++			Sleep(50);
++			continue;
++		}
++
++		// prendido: bucle apretado para ganarle a la reconstruccion por frame
++		for (int k = 0; k < 2000; k++) {
++			for (int i = 0; i < g_cull_nsets; i++) {
++				PlaneSet *s = &g_cull_sets[i];
++				if (s->muerto || s->tipo == 0)
++					continue;
++				// bit 1 = solo el frustum canonico de la camara (tipo 1, lo que ya
++				// sabemos que mueve arboles). bit 8 = TODOS los frustums vivos,
++				// abriendo tambien el par vertical: es el modo de diagnostico
++				// para saber si el pasto obedece a ALGUNO de los otros.
++				// tipo 5 = par lateral 2D (el candidato del pasto). Entra siempre
++				// que haya algun modo prendido: es el hallazgo mas nuevo y no
++				// tiene sentido esconderlo detras de un bit extra.
++				bool agresivo = (modo & 8) != 0;
++				if (!agresivo && s->tipo != 1 && s->tipo != 5)
++					continue;
++				int r = cull_widen_one(s, agresivo);
++				if (r == 1)
++					escrituras++;
++				else if (r < 0)
++					s->muerto = true;
++			}
++			YieldProcessor();
++		}
++
++		// estado periodico (~cada 2s con el bucle de 2000): el log habla solo
++		if (++ciclos_log % 32 == 0) {
++			int vivos = 0, pisadas = 0;
++			for (int i = 0; i < g_cull_nsets; i++) {
++				if (!g_cull_sets[i].muerto && g_cull_sets[i].tipo)
++					vivos++;
++				pisadas += g_cull_sets[i].reescrituras;
++			}
++			LogInfo("CULLWIDEN [estado] modo=%d escrituras=%u sets_vivos=%d "
++				"reescrituras_engine=%d\n", modo, escrituras, vivos, pisadas);
++		}
++		Sleep(0);
++	}
++}
++
++// ===== v1.39: planos que viajan por CONSTANT BUFFER (culling en GPU) =========
++// La prueba en pista del v1.38 confirmo que el grupo A (planos en RAM) es
++// consumido por UN camino de culling (arboles que aparecen), pero el pasto y
++// la linea de corte lejana no se inmutaron. El sospechoso: la vegetacion se
++// instancia por GPU (los compute shaders HZBOcclusion* del exe), y un culling
++// en GPU recibe sus planos por constant buffer. Somos un wrapper de D3D11:
++// interceptamos la subida (Map/Unmap y UpdateSubresource, via HackerContext),
++// buscamos la MISMA firma de 6 planos en los datos, y con el bit 4 de
++// $cull_widen los parcheamos ANTES de que la GPU los vea — determinista, sin
++// carrera contra el engine.
++// Devuelve: 0 = nada, 1 = planos encontrados (sin parchear), 2 = parcheados.
++int TripleScanPlanesInCB(void *data, unsigned size, void *res_id,
++	unsigned bindFlags, int allow_patch)
++{
++	return 0;	// v1.74 LIMPIEZA: el "culling por constant buffer GPU" nunca
++				// encontro nada real (todos falsos positivos). Neutralizado.
++	if (!g_triple_cam_valid || !data || size < 96)
++		return 0;
++	// v1.40: SOLO constant buffers. La primera prueba escaneaba tambien vertex
++	// buffers (bind=0x1) y se llenaba de falsos positivos: un buffer de normales
++	// de vertices es, por construccion, un mar de vectores unitarios — justo lo
++	// que esta firma busca. Los 40 CULLCB de esa sesion eran todos basura.
++	if (!(bindFlags & D3D11_BIND_CONSTANT_BUFFER))
++		return 0;
++	const float *cam = (const float *)g_triple_cam_buf;
++	float m00 = cam[0], m11 = cam[5];
++	if (m00 < 0.0001f || m11 < 0.0001f)
++		return 0;
++	// y solo con la camara de CONDUCCION en mano: con la del menu (m11 4.27) los
++	// angulos objetivo son otros y todo lo que matchea es ruido.
++	if (m11 < 1.2f || m11 > 3.0f)
++		return 0;
++	// dots objetivo desde la camara actual (fovH = 2*atan(aspect/m11) =
++	// 2*atan(1/m00)); invariantes a rotacion, igual que en el escaner
++	float dot_h = -cosf(2.0f * atanf(1.0f / m00));
++	float dot_v = -cosf(2.0f * atanf(1.0f / m11));
++
++	// bit 4 de $cull_widen = parchear los cbs. Lectura directa del ini, como
++	// el resto; el puntero al valor del unordered_map es estable tras la carga.
++	static CommandListVariable *var = NULL;
++	static volatile LONG var_init = 0;
++	if (!var_init) {
++		auto it = command_list_globals.find(L"$cull_widen");
++		if (it != command_list_globals.end())
++			var = &it->second;
++		InterlockedExchange(&var_init, 1);
++	}
++	bool patch = allow_patch && var && (((int)var->fval) & 4);
++
++	// presupuesto de log compartido entre hilos (contextos diferidos)
++	static volatile LONG logged = 0;
++
++	int resultado = 0;
++	unsigned limite = size > 16384 ? 16384 : size;
++	for (unsigned off = 0; off + 96 <= limite; off += 16) {
++		float *g = (float *)((uint8_t *)data + off);
++		Planos6Info pi;
++		if (!cull_planos6(g, dot_h, dot_v, &pi))
++			continue;
++
++		if (logged < 40 && InterlockedIncrement(&logged) <= 40) {
++			LogInfo("CULLCB: planos en buffer res=%p size=%u bind=0x%X off=%u | "
++				"nearfar=[%d,%d] lat=[%d,%d] fovH=%.2f vert=[%d,%d] fovV=%.2f | "
++				"w={%.3f %.3f %.3f %.3f %.3f %.3f}%s\n",
++				res_id, size, bindFlags, off,
++				pi.nf0, pi.nf1, pi.lat0, pi.lat1, pi.fovh,
++				pi.v0, pi.v1, pi.fovv,
++				g[3], g[7], g[11], g[15], g[19], g[23],
++				patch ? " -> PARCHEADO" : "");
++		}
++
++		if (patch) {
++			for (int k = 0; k < 4; k++) g[pi.lat0 * 4 + k] = g[pi.nf0 * 4 + k];
++			for (int k = 0; k < 4; k++) g[pi.lat1 * 4 + k] = g[pi.nf1 * 4 + k];
++			resultado = 2;
++		} else if (resultado == 0) {
++			resultado = 1;
++		}
++		off += 80;	// saltar el resto de este set (el for suma los 16 restantes)
++	}
++	return resultado;
++}
++
++// Escanea una region ya validada. SEH aparte (sin objetos C++) porque la region
++// puede liberarse entre el VirtualQuery y la lectura: un AV aca se traga y se
++// sigue con la siguiente.
++static int cull_scan_region(const uint8_t *base, size_t size, const CullScanReq *req,
++	int *n_mat, int *n_fov, int *n_planos, int *n_planos6,
++	int *n_laxos, int *n_pares, const uint8_t **ultimo_plano,
++	const uint8_t **ultimo_p6, const uint8_t **ultimo_par)
++{
++	unsigned needle0 = *(const unsigned *)&req->P[0];
++	float fov_rad = 2.0f * atanf(1.0f / req->m11);
++	float fov_deg = fov_rad * 57.29578f;
++	float tan_half = 1.0f / req->m11;
++	char who[MAX_PATH];
++
++	// Componentes de los planos laterales y verticales del frustum de ESTA
++	// camara, en espacio de vista (firma por valor exacto).
++	float kl = sqrtf(req->m00 * req->m00 + 1.0f);
++	float plano_lat = req->m00 / kl, plano_lat_z = 1.0f / kl;
++	float kv = sqrtf(req->m11 * req->m11 + 1.0f);
++	float plano_vert = req->m11 / kv, plano_vert_z = 1.0f / kv;
++
++	// Dots objetivo del apareamiento (invariantes a rotacion):
++	// laterales: dot = -cos(fovH); verticales: dot = -cos(fovV)
++	float fovH = 2.0f * atanf(req->aspect / req->m11);
++	float dot_h = -cosf(fovH);
++	float dot_v = -cosf(fov_rad);
++
++	__try {
++		for (size_t off = 0; off + 128 <= size; off += 4) {
++			const uint8_t *p = base + off;
++			float v = *(const float *)p;
++
++			// 0. PLANOS6: la firma nueva. Quick-reject adentro (primer grupo).
++			if (*n_planos6 < 48 && (uintptr_t)(p - *ultimo_p6) > 96) {
++				Planos6Info pi;
++				int layout = cull_planos6_any((const float *)p, dot_h, dot_v, &pi);
++				if (layout >= 0) {
++					*ultimo_p6 = p;
++					(*n_planos6)++;
++
++					// clasificar para la fase 2 (v1.38):
++					//   tipo 1 = grupo A: canonico [nf,lat,vert]=[01,23,45] y
++					//            angulos exactos (los del culling en mundo)
++					//   tipo 2 = grupo B: orden [lat,nf,vert]=[01,23,45] invertido
++					float fovh_req = fovH * 57.29578f;
++					float fovv_req = fov_deg;
++					float eh = pi.fovh - fovh_req; if (eh < 0) eh = -eh;
++					float ev = pi.fovv - fovv_req; if (ev < 0) ev = -ev;
++					int tipo = 0;
++					if (pi.nf0 == 0 && pi.nf1 == 1 && pi.lat0 == 2 &&
++						pi.lat1 == 3 && pi.v0 == 4 && pi.v1 == 5 &&
++						eh < 0.2f && ev < 0.2f)
++						tipo = 1;
++					else if (pi.lat0 == 0 && pi.lat1 == 1 && pi.nf0 == 2 &&
++						pi.nf1 == 3 && pi.v0 == 4 && pi.v1 == 5)
++						tipo = 2;
++					// v1.41: registrar TODOS los candidatos, sin filtro de angulo.
++					// La v1.40 exigia coincidir con la camara a menos de 0.5 deg
++					// y dejaba en tipo=0 (ni medidos ni escritos) juegos de
++					// planos con fovH 147.2 / 148.6 / 151.7 / 153.4 — justo el
++					// rango donde caeria un frustum de SIEMBRA con margen, que
++					// es el sospechoso de cullear el pasto. Ahora entran todos y
++					// decide la vitalidad.
++					if (tipo == 0)
++						tipo = 4;	// candidato generico
++					if (tipo && g_cull_nsets < CULL_MAX_SETS) {
++						PlaneSet *s = &g_cull_sets[g_cull_nsets++];
++						s->p = (volatile float *)p;
++						s->tipo = tipo;
++						s->layout = layout;
++						s->cambios = 0;
++						s->info = pi;
++						s->aplicado = false;
++						s->muerto = false;
++						s->reescrituras = 0;
++					}
++
++					const float *g = (const float *)p;
++					int ds = (layout == CULL_LAYOUT_SOA) ? 1 : 4;
++					int d0 = (layout == CULL_LAYOUT_SOA) ? 18 : 3;
++					LogInfo("CULLSCAN PLANOS6 #%d en %p (%s) layout=%s: "
++						"nearfar=[%d,%d] lat=[%d,%d] (fovH medido %.2f deg) "
++						"vert=[%d,%d] (fovV medido %.2f deg) "
++						"d={%.3f %.3f %.3f %.3f %.3f %.3f} tipo=%d\n",
++						*n_planos6, p, cull_owner(p, who, sizeof(who)),
++						layout == CULL_LAYOUT_SOA ? "SoA" : "AoS",
++						pi.nf0, pi.nf1, pi.lat0, pi.lat1, pi.fovh,
++						pi.v0, pi.v1, pi.fovv,
++						g[d0], g[d0 + ds], g[d0 + 2 * ds], g[d0 + 3 * ds],
++						g[d0 + 4 * ds], g[d0 + 5 * ds], tipo);
++					cull_dump(p, base, size, 16, 40);
++				}
++			}
++
++			// 1. DESCRIPTOR estricto (control positivo de la sesion pasada) y
++			//    camaras laxas (candidatas a la camara del hilo de simulacion).
++			if (v > req->aspect - 0.0005f && v < req->aspect + 0.0005f && off >= 12) {
++				const float *d = (const float *)(p - 12);
++				float m11 = 0.0f;
++
++				if (!cull_desc_ok(d, req->aspect, NULL) && *n_laxos < 24 &&
++					d[0] > 5.0f && d[0] < 175.0f &&
++					d[1] > 0.001f && d[1] < 5.0f &&
++					d[2] > 200.0f && d[2] < 1e6f) {
++					(*n_laxos)++;
++					float mm = 1.0f / tanf(d[0] * 0.008726646f);
++					LogInfo("CULLSCAN camara-laxa #%d en %p (%s): fov=%.4f near=%.4f "
++						"far=%.1f -> m11=%.6f%s\n", *n_laxos, d,
++						cull_owner(d, who, sizeof(who)), d[0], d[1], d[2], mm,
++						(mm > req->m11 * 0.9999f && mm < req->m11 * 1.0001f)
++							? "  <== MISMO FOV QUE LA CAMARA EN USO" : "");
++					cull_dump((const uint8_t *)d, base, size, 8, 40);
++				}
++
++				if (cull_desc_ok(d, req->aspect, &m11)) {
++					char w2[MAX_PATH];
++					float em = m11 - req->m11; if (em < 0) em = -em;
++					bool activo = (em < req->m11 * 1e-5f);
++					LogInfo("CULLSCAN descriptor %s en %p (%s): fov=%.4f near=%.4f "
++						"far=%.1f aspect=%.6f -> m11=%.6f fovH=%.1f deg\n",
++						activo ? "**ACTIVO**" : "otro", d,
++						cull_owner(d, w2, sizeof(w2)),
++						d[0], d[1], d[2], d[3], m11,
++						2.0f * atanf(req->aspect / m11) * 57.29578f);
++					if (activo)
++						cull_dump((const uint8_t *)d, base, size, 16, 48);
++				}
++			}
++
++			// 1b. PAR LATERAL (culler 2D del pasto). Se prueban varias
++			//     separaciones porque los dos planos no tienen por que estar
++			//     pegados: pueden vivir en campos distintos de una estructura.
++			//     SOLO en offsets alineados a 16 bytes: los planos float4 casi
++			//     siempre lo estan, y esto divide por 4 el costo del barrido —
++			//     que es lo que hacia que no terminara.
++			if ((off & 15) == 0 && *n_pares < 32 &&
++			    (uintptr_t)(p - *ultimo_par) > 32) {
++				static const int seps[] = { 4, 8, 3 };
++				for (int si = 0; si < 3; si++) {
++					float ang = 0.0f;
++					if (off + (size_t)(seps[si] + 4) * 4 > size)
++						continue;
++					if (!cull_par_lateral((const float *)p, seps[si], dot_h, &ang))
++						continue;
++					*ultimo_par = p;
++					(*n_pares)++;
++					const float *g = (const float *)p;
++					// SOLO LOG. Los pares NO se registran como sets escribibles:
++					// meterlos en g_cull_sets llenaba los 64 lugares y desplazaba
++					// los planos tipo 1 (los que mueven los arbustos), rompiendo
++					// F8. Primero se identifica cual par lateral es el del pasto
++					// leyendo el log; recien ahi se escribe, con su direccion.
++					if (*n_pares <= 12)
++						LogInfo("CULLSCAN PAR-LATERAL #%d en %p (%s) sep=%d: "
++							"fovH=%.2f | n0=(%.4f %.4f %.4f) d0=%.2f | "
++							"n1=(%.4f %.4f %.4f) d1=%.2f\n",
++							*n_pares, p, cull_owner(p, who, sizeof(who)),
++							seps[si], ang, g[0], g[1], g[2], g[3],
++							g[seps[si]], g[seps[si]+1], g[seps[si]+2], g[seps[si]+3]);
++					break;
++				}
++			}
++
++			// 2. Componentes de plano en vista por VALOR EXACTO (firma vieja;
++			//    solo cubre espacio de vista, pero el dump es oro si pega).
++			if (*n_planos < 24) {
++				float av = v < 0 ? -v : v;
++				bool hit = (av > plano_lat - 3e-5f && av < plano_lat + 3e-5f) ||
++				           (av > plano_lat_z - 3e-5f && av < plano_lat_z + 3e-5f) ||
++				           (av > plano_vert - 3e-5f && av < plano_vert + 3e-5f) ||
++				           (av > plano_vert_z - 3e-5f && av < plano_vert_z + 3e-5f);
++				if (hit && (uintptr_t)(p - *ultimo_plano) > 128) {
++					*ultimo_plano = p;
++					(*n_planos)++;
++					LogInfo("CULLSCAN PLANO? #%d = %.6f en %p (%s)\n", *n_planos, v, p,
++						cull_owner(p, who, sizeof(who)));
++					cull_dump(p, base, size, 12, 28);
++				}
++			}
++
++			// 3. matriz completa (normal o traspuesta), ancla en m00 bit-exacto
++			if (*(const unsigned *)p == needle0 && *n_mat < 8) {
++				const float *m = (const float *)p;
++				bool normal = memcmp(m, req->P, 44) == 0 &&
++					m[12] == req->P[12] && m[13] == req->P[13] && m[15] == req->P[15];
++				bool traspuesta = false;
++				if (normal) {
++					normal = m[11] == req->P[11] && m[14] == req->P[14];
++					traspuesta = !normal && m[11] == req->P[14] && m[14] == req->P[11];
++				}
++				if (normal || traspuesta) {
++					(*n_mat)++;
++					LogInfo("CULLSCAN MATRIZ #%d en %p (%s)%s\n", *n_mat, p,
++						cull_owner(p, who, sizeof(who)), traspuesta ? " [traspuesta]" : "");
++					cull_dump(p, base, size, 96, 48);
++				}
++			}
++			// 4. fov vertical suelto en rad / grados / tan-mitad
++			else if (*n_fov < 32 &&
++				((v > fov_rad - 0.0006f && v < fov_rad + 0.0006f) ||
++				 (v > fov_deg - 0.03f && v < fov_deg + 0.03f) ||
++				 (v > tan_half - 0.0004f && v < tan_half + 0.0004f))) {
++				(*n_fov)++;
++				LogInfo("CULLSCAN fov? #%d = %.6f en %p (%s)\n", *n_fov, v, p,
++					cull_owner(p, who, sizeof(who)));
++				cull_dump(p, base, size, 6, 10);
++			}
++		}
++	} __except (EXCEPTION_EXECUTE_HANDLER) {
++		return -1;
++	}
++	return 0;
++}
++
++static DWORD WINAPI cull_scan_thread(LPVOID)
++{
++	CullScanReq req = g_cullscan_req;
++	int n_mat = 0, n_fov = 0, n_av = 0;
++	int n_planos = 0, n_planos6 = 0, n_laxos = 0, n_pares = 0;
++	const uint8_t *ultimo_plano = NULL, *ultimo_p6 = NULL, *ultimo_par = NULL;
++	unsigned long long total = 0;
++
++	{
++		float fovH = 2.0f * atanf(req.aspect / req.m11);
++		float fovV = 2.0f * atanf(1.0f / req.m11);
++		LogInfo("CULLSCAN: empezando (v1.40 AoS+SoA, test de vitalidad). m00=%.6f "
++			"m11=%.6f near=%.4f aspect=%.6f | fovH juego=%.2f deg fovV=%.2f deg | "
++			"dots buscados: lat=%.5f vert=%.5f nearfar=-1\n",
++			req.m00, req.m11, req.nearz, req.aspect,
++			fovH * 57.29578f, fovV * 57.29578f,
++			-cosf(fovH), -cosf(fovV));
++	}
++
++  for (int intento = 1; intento <= 5; intento++) {
++	n_mat = n_fov = n_av = n_planos = n_planos6 = n_laxos = n_pares = 0;
++	ultimo_plano = ultimo_p6 = ultimo_par = NULL;
++	total = 0;
++
++	MEMORY_BASIC_INFORMATION mbi;
++	uint8_t *p = NULL;
++	while (VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
++		uint8_t *sig = (uint8_t *)mbi.BaseAddress + mbi.RegionSize;
++		if (sig <= p)
++			break;
++		uint8_t *base = (uint8_t *)mbi.BaseAddress;
++		size_t size = mbi.RegionSize;
++		p = sig;
++
++		if (mbi.State != MEM_COMMIT)
++			continue;
++		if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))
++			continue;
++		DWORD prot = mbi.Protect & 0xFF;
++		// solo memoria escribible: los planos son dato vivo, no constantes
++		if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE && prot != PAGE_WRITECOPY)
++			continue;
++		if (mbi.Type != MEM_PRIVATE && mbi.Type != MEM_IMAGE)
++			continue;
++
++		total += size;
++		// Por BLOQUES, no por region entera: el juego libera memoria mientras
++		// escaneamos y un AV abortaria todo el resto de la region. Asi se
++		// pierden 64 KB en vez de cientos de megas. Solape de 256 bytes para
++		// no partir una estructura al medio.
++		const size_t BLOQUE = 64 * 1024, SOLAPE = 256;
++		for (size_t o = 0; o < size; o += BLOQUE) {
++			size_t len = min(BLOQUE + SOLAPE, size - o);
++			if (len < 128)
++				break;
++			if (cull_scan_region(base + o, len, &req, &n_mat, &n_fov,
++					&n_planos, &n_planos6, &n_laxos, &n_pares, &ultimo_plano,
++					&ultimo_p6, &ultimo_par) < 0)
++				n_av++;
++		}
++	}
++
++	LogInfo("CULLSCAN: intento %d. %.1f GB | PLANOS6=%d PARES-LATERALES=%d | "
++		"planos-exactos=%d camaras-laxas=%d matrices=%d (AV: %d)\n",
++		intento, total / 1073741824.0, n_planos6, n_pares, n_planos, n_laxos,
++		n_mat, n_av);
++
++	if (n_planos6 > 0 || n_pares > 0)
++		break;
++	if (intento < 5) {
++		LogInfo("CULLSCAN: sin candidatos todavia. Reintento en 3s.\n");
++		Sleep(3000);
++	}
++  }
++
++	// control positivo: nuestra propia copia TIENE que aparecer (d3d11.dll)
++	LogInfo("CULLSCAN: g_triple_cam_buf (control, debe estar arriba) = %p\n",
++		(void *)g_triple_cam_buf);
++
++	// v1.40: primero medir QUIEN LATE (3s sin escribir nada), y recien despues
++	// habilitar la escritura — restringida a los sets vivos. El v1.38 escribia
++	// copias congeladas y por eso el efecto era parcial.
++	if (g_cull_nsets > 0) {
++		HANDLE hv = CreateThread(NULL, 0, cull_vitals_thread, NULL, 0, NULL);
++		if (hv) {
++			WaitForSingleObject(hv, 15000);
++			CloseHandle(hv);
++		}
++		HANDLE h = CreateThread(NULL, 0, cull_widen_thread, NULL, 0, NULL);
++		if (h)
++			CloseHandle(h);
++		else
++			LogInfo("CULLWIDEN: no pude lanzar el hilo aplicador.\n");
++	} else {
++		LogInfo("CULLWIDEN: ningun juego de planos clasificado; no hay nada "
++			"que escribir.\n");
++	}
++	LogInfo("CULLSCAN: terminado.\n");
++	return 0;
++}
++
++// ===== v1.36: aviso en pantalla del ojo virtual ==============================
++// Al ajustar el FOV a mano hace falta saber DONDE se esta parado: cuanto se ve,
++// cuanto dibuja el juego, y si sobra (o sea si los bordes de los laterales
++// quedan vacios). Sin esto, elegir el punto de compromiso es a ciegas.
++// Va como LOG_WARNING y no como LOG_NOTICE a proposito: NOTICE tiene
++// hide_in_release=true, o sea que fuera del modo hunting no se dibuja nunca y el
++// aviso no se veria. Es el mismo canal por el que salian las letras rojas del
++// "Error opening d3dx.ini", asi que sale en naranja y dura unos segundos.
++static volatile LONG g_hud_state = 0;
++
++static CommandListVariable *cl_global(const wchar_t *nombre)
++{
++	auto it = command_list_globals.find(nombre);
++	return (it != command_list_globals.end()) ? &it->second : NULL;
++}
++
++static DWORD WINAPI eye_hud_thread(LPVOID)
++{
++	CommandListVariable *v_eye = cl_global(L"$eye_d");
++	CommandListVariable *v_pw  = cl_global(L"$panel_w");
++	CommandListVariable *v_sa  = cl_global(L"$side_sa");
++	CommandListVariable *v_ca  = cl_global(L"$side_ca");
++	if (!v_eye || !v_pw || !v_sa || !v_ca) {
++		LogInfo("EYEHUD: faltan variables del ini; no se muestra el aviso.\n");
++		return 0;
++	}
++
++	float ultimo = -12345.0f;
++	while (true) {
++		float e = v_eye->fval;
++		if (e != ultimo) {
++			ultimo = e;
++			// Esquina externa del panel lateral, vista desde arriba, con el
++			// centro sobre el eje X y el ojo por delante.
++			float pw = v_pw->fval, sa = v_sa->fval, ca = v_ca->fval;
++			float xc = pw * 0.5f + pw * ca;
++			float yc = pw * sa;
++			// atan2 y no atan: con el ojo por delante de la esquina el angulo
++			// pasa de 90 grados y hay que seguir midiendolo bien.
++			float fov = 2.0f * atan2f(xc, e - yc) * 57.29578f;
++
++			float m00 = g_triple_cam_valid ? ((const float *)g_triple_cam_buf)[0] : 0.0f;
++			float fovj = (m00 > 0.0001f) ? 2.0f * atanf(1.0f / m00) * 57.29578f : 0.0f;
++
++			if (fovj > 1.0f) {
++				float sobra = fov - fovj;
++				LogOverlay(LOG_WARNING, "Ojo virtual %.0f cm  |  ves %.0f deg  |  "
++					"el juego dibuja %.0f deg  |  %s\n", e, fov, fovj,
++					(sobra > 1.0f)
++						? "sobran los bordes de los laterales"
++						: "sin bordes vacios");
++			} else {
++				LogOverlay(LOG_WARNING, "Ojo virtual %.0f cm  |  ves %.0f deg\n", e, fov);
++			}
++		}
++		Sleep(120);
++	}
++}
++
++// ===== v1.66: HOOK de BuildFrustum — abrir el culling de objetos en la FUENTE =
++//
++// El workflow del 2026-07-29 encontro la funcion generica del motor que arma
++// TODOS los frustums (Gribb-Hartmann): dirtrally2.exe+0x8B85D0 =
++// BuildFrustum(rcx=dst, rdx=viewProj). Verificado por desensamblado: escribe 6
++// planos float4 en dst[+0x00..+0x50] (orden near, far, IZQ+0x20, DER+0x30,
++// abajo+0x40, arriba+0x50) + 8 esquinas en +0x60. NO usa r8/r9 -> 2 argumentos.
++//
++// Esta es la FUENTE de los planos que RAM-A encontraba por firma y escribia
++// compitiendo contra el engine (carrera + fragilidad). Hookeando el RETORNO se
++// pisan los planos JUSTO despues de que el engine los escribe y ANTES de que el
++// culler (+0x8BCCD0, quadtree +0xA94840) los lea: determinista, sin carrera,
++// sin escaneo, sin test de vitalidad.
++//
++// Se abre SOLO el frustum de la camara principal (perspectiva, fovH ~100..175),
++// discriminando por el dot de las normales lateral izq/der: ortho (sombras) da
++// dot~-1, cubemap 90 da dot~0; la camara de manejo da dot ~0.17..0.997. Asi no
++// se tocan sombras/reflejos/envmap. Se abre copiando near->izq y far->der (el
++// mismo truco de RAM-A tipo-1, ya probado que trae arboles): el test lateral se
++// vuelve redundante -> horizontal abierto. Con bit 8 tambien el par vertical.
++// Controlado por $cull_widen (F8). Reversible: F8 a 0.
++
++typedef void (*BuildFrustum_t)(void *dst, float *viewProj);
++static BuildFrustum_t g_bf_orig = NULL;
++static CommandListVariable *g_bf_var = NULL;
++static volatile LONG g_bf_var_init = 0;
++static volatile LONG g_bf_hooked = 0;
++// RVA (dentro del exe) del call site de render que SI hay que abrir. 0 = modo
++// diagnostico: NO se abre nada, solo se loguean los call sites. El intento de
++// abrir TODOS los frustums de fovH plausible (v1.66) crasheo el juego (AV en
++// +0x4B2B9D): BuildFrustum lo llaman ~32 sitios (streaming, queries espaciales,
++// visibilidad) y abrir uno que un consumidor asume acotado -> overflow. Hay que
++// abrir SOLO el frustum de la vista de render principal, identificado por su
++// return address.
++static uintptr_t g_bf_target_ret = 0;
++static uintptr_t g_bf_exe_base = 0;
++
++// Pisa los planos laterales con SEH. En helper aparte SIN objetos C++: el __try
++// no convive con el iterador del unordered_map en la misma funcion (C2712).
++static void bf_abrir(float *p, int modo)
++{
++	__try {
++		// normales laterales: izq = p[8..10], der = p[12..14] (ya normalizadas).
++		// dot = -cos(fovH). Solo perspectiva de manejo (fovH ~100..175):
++		float dot = p[8] * p[12] + p[9] * p[13] + p[10] * p[14];
++		if (dot > 0.17f && dot < 0.997f) {
++			// horizontal: izq = copia de near, der = copia de far -> el test
++			// lateral queda redundante y pasa todo en horizontal.
++			for (int k = 0; k < 4; k++) p[8 + k] = p[0 + k];
++			for (int k = 0; k < 4; k++) p[12 + k] = p[4 + k];
++			if (modo & 8) {	// tambien vertical (= modo 8 de RAM-A)
++				for (int k = 0; k < 4; k++) p[16 + k] = p[0 + k];
++				for (int k = 0; k < 4; k++) p[20 + k] = p[4 + k];
++			}
++		}
++	} __except (EXCEPTION_EXECUTE_HANDLER) {}
++}
++
++// DIAGNOSTICO: loguea cada call site distinto (return address -> RVA del exe) con
++// el fovH de su frustum. Con eso se identifica cual es el de la vista de render.
++// SEH y sin objetos C++ (C2712). dot(izq,der)=-cos(fovH) -> fovH=acos(-dot).
++static void bf_diag(void *ret, const float *p)
++{
++	static void *vistos[64];
++	static int n = 0;
++	static volatile LONG lk = 0;
++	__try {
++		float dot = p[8] * p[12] + p[9] * p[13] + p[10] * p[14];
++		while (InterlockedCompareExchange(&lk, 1, 0) != 0)
++			YieldProcessor();
++		bool nuevo = true;
++		for (int i = 0; i < n; i++)
++			if (vistos[i] == ret) { nuevo = false; break; }
++		if (nuevo && n < 64)
++			vistos[n++] = ret;
++		else
++			nuevo = false;
++		InterlockedExchange(&lk, 0);
++		if (nuevo) {
++			float c = -dot; if (c > 1) c = 1; if (c < -1) c = -1;
++			float fovH = acosf(c) * 57.29578f;
++			uintptr_t rva = (uintptr_t)ret - g_bf_exe_base;
++			LogInfo("BFDIAG call site dirtrally2.exe+0x%llX : fovH=%.1f dot=%.3f\n",
++				(unsigned long long)rva, fovH, dot);
++		}
++	} __except (EXCEPTION_EXECUTE_HANDLER) {}
++}
++
++static void Hooked_BuildFrustum(void *dst, float *viewProj)
++{
++	void *ret = _ReturnAddress();
++	g_bf_orig(dst, viewProj);	// el engine arma los 6 planos + 8 esquinas
++
++	bf_diag(ret, (const float *)dst);	// siempre: mapear los call sites
++
++	// Abrir SOLO el call site de render ya identificado (g_bf_target_ret).
++	// Mientras sea 0 esto es inerte -> el juego se comporta normal (no crashea).
++	if (g_bf_target_ret == 0)
++		return;
++	if (((uintptr_t)ret - g_bf_exe_base) != g_bf_target_ret)
++		return;
++
++	if (!g_bf_var_init) {
++		auto it = command_list_globals.find(L"$cull_widen");
++		if (it != command_list_globals.end())
++			g_bf_var = &it->second;
++		InterlockedExchange(&g_bf_var_init, 1);
++	}
++	int modo = g_bf_var ? (int)g_bf_var->fval : 0;
++	if (modo != 0)
++		bf_abrir((float *)dst, modo);
++}
++
++// Instala el hook una sola vez. Verifica el prologo por bytes antes de tocar:
++// si el exe fuera otra version, 0x8B85D0 no seria BuildFrustum -> NO hookear
++// (evita colgar el juego con una version distinta). Prologo esperado:
++// 48 8B C4  mov rax,rsp ; 48 89 58 08  mov [rax+8],rbx ; 57 push rdi ;
++// 48 81 EC C0 00 00 00  sub rsp,0xC0.
++static void triple_install_buildfrustum_hook()
++{
++	if (InterlockedCompareExchange(&g_bf_hooked, 1, 0) != 0)
++		return;
++	HMODULE base = GetModuleHandleA(NULL);
++	if (!base) {
++		LogInfo("BFHOOK: no pude obtener la base del exe.\n");
++		return;
++	}
++	g_bf_exe_base = (uintptr_t)base;
++	uint8_t *fn = (uint8_t *)base + 0x8B85D0;
++	static const uint8_t prologo[] = {
++		0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x57,
++		0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00 };
++	bool ok = true;
++	__try {
++		for (size_t i = 0; i < sizeof(prologo); i++)
++			if (fn[i] != prologo[i]) { ok = false; break; }
++	} __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
++	if (!ok) {
++		LogInfo("BFHOOK: el prologo en exe+0x8B85D0 NO coincide con BuildFrustum "
++			"(otra version del juego?). No se hookea; queda el RAM-A.\n");
++		return;
++	}
++	SIZE_T id = 0;
++	DWORD e = cHookMgr.Hook(&id, (void **)&g_bf_orig, fn, Hooked_BuildFrustum);
++	if (e == ERROR_SUCCESS)
++		LogInfo("BFHOOK: BuildFrustum hookeado en %p. El culling de objetos se "
++			"abre en la fuente (determinista, sin RAM-A).\n", (void *)fn);
++	else
++		LogInfo("BFHOOK: fallo el hook de BuildFrustum (err 0x%x).\n", e);
++}
++
++// Called from HackerContext when the game writes a constant buffer that looks
++// like the main perspective camera (cb3 = CameraParamsConstantBuffer). Captures
++// it CPU-side so no GPU readback is needed.
++// ===========================================================================
++// IDENTIFICACION DEL AUTO POR SU MALLA (v1.36)
++//
++// El problema: el usuario quiere una postura de asiento por camara Y por auto,
++// pero nada de lo que veniamos leyendo distingue el auto. Medido: las camaras de
++// DiRT tienen los mismos parametros en todos los autos (se probo con dos autos y
++// no aparecio ni una firma nueva).
++//
++// Por que la MALLA y no una textura: 3Dmigoto hashea los recursos por CONTENIDO,
++// asi que la textura del auto serviria... hasta que el usuario le cambia la
++// pintura, y ahi el mismo auto pasa a parecer otro. Lo hizo notar el propio
++// usuario. La geometria del interior, en cambio, es la misma pintes como pintes.
++//
++// De donde sale el shader: de una caza del usuario. Al saltear
++// d0d1ddd09d064e71 el interior del auto se pone negro, y ese shader visita 19
++// mallas distintas (los pedazos del habitaculo: volante, tablero, puertas...) y
++// solo 2 texturas en el registro 0 — un shader generico de pista tendria
++// cientos, asi que es del auto. La caza se hace UNA sola vez en la vida del
++// proyecto, no una por auto: de aca en mas el mod aprende cada auto solo.
++//
++// La huella es el hash de la malla MAS GRANDE que dibuje ese shader en el frame
++// (la carroceria del habitaculo). Se elige la mas grande y no el conjunto entero
++// porque el conjunto cambia con el culling de las piezas chicas, mientras que la
++// pieza principal se dibuja siempre.
++//
++// CONTEXTOS DIFERIDOS (regla 5): esto corre en los 7 contextos del juego y el
++// "maximo del frame" es un global sin candado. Una carrera puede hacer que un
++// frame suelto publique la malla equivocada. Es tolerable a proposito: el que
++// consume la huella exige que se mantenga varios frames seguidos antes de
++// hacerle caso, igual que con las camaras. Un candado por draw costaria mas que
++// el problema que evita.
++// ===========================================================================
++#define TRIPLE_CAR_VS 0xd0d1ddd09d064e71ULL
++
++void TripleTrackCarMesh(UINT64 vs_hash, uint32_t ib_hash, UINT index_count)
++{
++	if (!ib_hash || vs_hash != TRIPLE_CAR_VS)
++		return;
++
++	static unsigned frame = 0xFFFFFFFF;
++	static UINT mejor_n = 0;
++	static uint32_t mejor_ib = 0;
++
++	if (G->frame_no != frame) {
++		// Cierre del frame anterior: se publica el ganador.
++		if (mejor_ib) {
++			// Se recortan los 24 bits bajos para que entre EXACTO en un float32
++			// (la mantisa son 24 bits). Si se publicara el hash completo, el
++			// redondeo podria juntar dos autos distintos en el mismo valor.
++			if (G->iniParams.size() >= 9)
++				G->iniParams[8].x = (float)(mejor_ib & 0x00FFFFFF);
++
++			// Log deduplicado: una linea por malla distinta. Con esto se ve si la
++			// huella es estable dentro de un auto y si cambia entre autos.
++			static uint32_t vistos[64];
++			static int nvistos = 0;
++			bool nuevo = true;
++			for (int k = 0; k < nvistos; k++)
++				if (vistos[k] == mejor_ib) { nuevo = false; break; }
++			if (nuevo && nvistos < 64) {
++				vistos[nvistos++] = mejor_ib;
++				LogInfo("TRIPLE car mesh #%d: ib=%08x indices=%u -> huella=%.0f\n",
++					nvistos - 1, mejor_ib, mejor_n,
++					(double)(mejor_ib & 0x00FFFFFF));
++			}
++		}
++		frame = G->frame_no;
++		mejor_n = 0;
++		mejor_ib = 0;
++	}
++
++	if (index_count > mejor_n) {
++		mejor_n = index_count;
++		mejor_ib = ib_hash;
++	}
++}
++
++// LISTA NEGRA de camaras del motor (v1.41). Los tres m11 de las camaras que NO
++// deben recibir el triple: menu principal, menu del garage y la orbita del
++// garage. Son CONSTANTES del juego, bit-exactas en toda sesion — a diferencia
++// del rango de "camaras de conduccion" que se uso antes, que en realidad media
++// el slider de FOV del usuario (m11 = 1/tan(fovV/2), ajustable POR CAMARA en
++// DiRT) y por eso se rompio dos veces. La tolerancia 0.01 en espacio m11 es
++// generosa para constantes exactas y chica frente a la camara real mas cercana
++// medida (cockpit 3.732 vs menu2 3.546: distancia 0.186).
++// El ASM de los shaders hace la misma comparacion por su cuenta (fila 5 de
++// IniParams, publicada por [Present]); esta copia es para los flags x3/x9.
++static inline bool tt_es_camara_de_menu(float m11)
++{
++	const float negras[3] = { 4.272611f, 3.545733f, 1.000000f };
++	for (int i = 0; i < 3; i++) {
++		float d = m11 - negras[i];
++		if (d < 0) d = -d;
++		if (d < 0.01f)
++			return true;
++	}
++	return false;
++}
++
++void TripleCaptureCameraCB(const void *data, unsigned size)
++{
++	// v1.69: hook de BuildFrustum ABANDONADO. Crasheo el juego en la MISMA
++	// direccion (+0x4B2B9D) tanto abriendo planos (v1.66) como en modo inerte
++	// que no tocaba nada (v1.68) -> el problema es HOOKEAR la funcion en si:
++	// Nektra no puede reubicar su prologo (mov rax,rsp + escrituras al shadow
++	// space del caller) sin corromper el frame -> el consumidor +0x4B26F0
++	// crashea. Los objetos quedan cubiertos por RAM-A (ya robusto con el fix de
++	// vitalidad). El codigo del hook queda abajo, inerte, como referencia.
++	// triple_install_buildfrustum_hook();
++
++	if (!data || size < 208 || size > sizeof(g_triple_cam_buf))
++		return;
++	const float *f = (const float*)data;
++	float aspect = (f[0] != 0.0f) ? (f[5] / f[0]) : 0.0f;
++
++	// Gate: solo la camara PRINCIPAL (perspectiva m33~0 + aspecto de triple).
++	//
++	// El rango era 4.5-6.5, hecho a medida del rig del autor (3x 2560x1440 =
++	// 5.39). Eso dejaba afuera EN SILENCIO a cualquier otro triple: tres
++	// ultrawide 21:9 dan 7.1, tres pantallas 5:4 dan 3.75. Esos usuarios
++	// instalaban el mod y no les pasaba absolutamente nada, sin un solo aviso.
++	// Aparecio probando otra cosa (bajar la resolucion para ensanchar el
++	// culling): el aspecto se fue a 7.18 y el mod dejo de ver camaras.
++	//
++	// Ahora cubre de 3x 5:4 (3.75) a 3x 32:9 (10.67) con margen. El piso 3.6
++	// sigue excluyendo los espejos del juego, que son 768x256 = 3.0 exacto, y
++	// el envmap, que es 1.0.
++	if (f[51] < 0.5f && aspect > 3.6f && aspect < 12.0f) {
++		memcpy(g_triple_cam_buf, data, size);
++		g_triple_cam_size = size;
++		g_triple_cam_valid = true;
++
++		// v1.26: DETECCION DE MENU. La camara de fondo del frontend tiene una
++		// firma inconfundible (m11 = 4.2726 / 3.5457; las de conduccion van de
++		// 1.9 a 2.5 y el garage es 1.0). Si en los ultimos frames se escribio
++		// una camara con m11 > 3.0, publicamos x3 = 1 y el d3dx.ini pasa el
++		// triple a passthrough -> los menus se ven como el juego normal.
++		// (Identificada por el analisis del volcado: el fondo 3D del menu usa
++		// los MISMOS shaders de mundo; la UI 2D nunca declara cb3.)
++		{
++			// v1.41: el umbral "m11 > 3.0" dejo de servir — el cockpit del
++			// usuario tiene FOV de 30 grados = m11 3.732, o sea que manejar
++			// contaba como "menu". Se pasa al mismo criterio que el resto: la
++			// LISTA NEGRA de camaras del motor (constantes bit-exactas que el
++			// usuario no puede tocar). Ver tt_es_camara_de_menu().
++			static unsigned g_triple_menu_frame = 0x80000000;
++			if (tt_es_camara_de_menu(f[5]))
++				g_triple_menu_frame = G->frame_no;
++			if (G->iniParams.size() >= 4)
++				G->iniParams[3].x = (G->frame_no - g_triple_menu_frame <= 3) ? 1.0f : 0.0f;
++		}
++
++		// v1.17: publicar m11 (escala vertical de la proyeccion del juego) en
++		// IniParams[3].w para que el d3dx.ini pueda calcular solo la distancia de
++		// ojo EXACTA: eye_d = 19.9688 * m11. En ese valor KXc==m00 y KYc==m11, o
++		// sea que la NDC y el depth del monitor CENTRAL son identicos a los del
++		// juego -> todo lo que se calcula en espacio de pantalla (sombras, AO)
++		// queda correcto en el centro sin parchear nada.
++		// Se escribe directo en G->iniParams porque las EXPRESIONES del ini lo leen
++		// del lado CPU (no hace falta subirlo a la textura para esto).
++		//
++		// v1.35 — ARREGLO: NO publicar las camaras que no son de conduccion.
++		//
++		// Esta funcion se queda con LA ULTIMA camara de pantalla completa del
++		// frame, y una medicion (volcado del cbuffer entero, 2026-07-31) mostro
++		// que el juego escribe DIEZ por frame y que la ultima es SIEMPRE la del
++		// frontend: m11 = 4.272610 / near = -0.2, identica en las 8 vistas del
++		// juego. O sea que w3 nunca fue el FOV de la vista que se esta viendo —
++		// era un valor constante de otra camara. Por eso la deteccion de vista
++		// por m11 fallaba de forma total y silenciosa: todas las vistas
++		// aprendian la misma clave.
++		//
++		// Las de conduccion salen de la anteultima (cap=8 en la medicion) y SI
++		// se distinguen: 2.02780, 2.19430, 2.65694, 2.86356, y son bit-estables
++		// mientras la vista se mantiene. El umbral 3.0 es el mismo que ya usa la
++		// deteccion de menu de arriba, asi que no introduce una constante nueva:
++		// las de conduccion medidas van de 1.57 a 2.87, y las de frontend son
++		// 3.55 y 4.27.
++		//
++		// Se publica tambien el NEAR en w7 (que estaba libre) porque el m11 solo
++		// no alcanza: hay dos vistas que comparten m11 = 2.02780 y solo difieren
++		// en el near (-0.11436 vs -0.05198). El par (m11, near) separa cinco de
++		// las ocho vistas; las tres que faltan comparten los DOS valores con otra
++		// (las dos de persecucion entre si, y las dos interiores cercanas entre
++		// si), asi que no hay nada en este buffer que pueda separarlas.
++		// Ventaja extra del near: no se mueve con el slider de FOV del juego,
++		// que es lo que corre al m11 (regla 9).
++		if (f[5] <= 3.0f) {
++			if (G->iniParams.size() >= 4)
++				G->iniParams[3].w = f[5];
++			if (G->iniParams.size() >= 8)
++				G->iniParams[7].w = f[14];
++
++			// v1.38 — LO QUE NECESITA EL PARCHE DEL AGUA.
++			//
++			// El agua (oceano, rio, lago) NO proyecta con la matriz de camara
++			// de cb3 sino con `modelViewProj` de cb0, asi que nuestros parches
++			// no la alcanzaban: se dibujaba UNA vez sin corregir a lo ancho de
++			// los tres monitores mientras el mundo se triplicaba. De ahi los
++			// tres sintomas que reporto el usuario — el oceano corrido de
++			// lugar, el "no hay nada" al mirar de costado, y el agua pasando
++			// por encima de los objetos (su profundidad no coincide con la del
++			// mundo corregido).
++			//
++			// Esos shaders no pueden auto-calibrarse como los demas: el truco
++			// de recuperar m00/m11 de las filas de la matriz funciona porque la
++			// vista es una rotacion pura, pero en modelViewProj esta el MODELO
++			// horneado adentro y las filas ya no dan la escala de proyeccion.
++			// Asi que se les publica desde aca.
++			if (G->iniParams.size() >= 9) {
++				G->iniParams[8].z = f[0];    // m00
++				G->iniParams[8].w = f[5];    // m11
++			}
++
++			// Y ademas: "en este frame se vio una camara DE CONDUCCION".
++			//
++			// Es el gate que evita repetir el error que rompio los menus. Los
++			// otros grupos se protegen leyendo cb3 para saber si la camara esta
++			// en la lista blanca; el agua no tiene cb3, asi que necesita la
++			// misma respuesta por otro lado.
++			//
++			// Tiene que ser "se vio EN EL FRAME", no "la ultima que se vio": la
++			// medicion del cbuffer mostro que el juego escribe hasta diez
++			// camaras de pantalla completa por frame y que la ULTIMA es siempre
++			// la del frontend, incluso manejando. Un flag basado en la ultima
++			// diria "menu" todo el tiempo — es exactamente el error que hacia
++			// que w3 nunca fuera el FOV de la vista.
++			//
++			// En los menus no aparece ninguna camara en el rango de conduccion
++			// (el frontend usa 4.27 y 3.55, el garage 1.00), asi que el flag da
++			// 0 y el agua queda sin tocar, igual que hoy.
++			{
++				// v1.41: mismo cambio que en el resto — de rango (dependia del
++				// slider de FOV del usuario) a lista negra de camaras del motor.
++				// Ademas se exige perspectiva real (m22 < -0.9): en el log
++				// aparecio una camara ORTOGRAFICA colandose por el gate de
++				// captura (m22 == m00, near -1209) y con lista negra en vez de
++				// rango habria contado como "de conduccion".
++				static unsigned g_frame_conduccion = 0x80000000;
++				if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f)
++					g_frame_conduccion = G->frame_no;
++				if (G->iniParams.size() >= 10)
++					G->iniParams[9].x =
++						(G->frame_no - g_frame_conduccion <= 1) ? 1.0f : 0.0f;
++			}
++		}
++		// Calibration: log each DISTINCT camera (by m11/near) so we can read the
++		// real driving-camera FOV and regenerate the region matrices to match.
++		// Se recuerdan TODAS las firmas ya vistas, no solo la ultima. Y la
++		// deduplicacion es por CUBETA (m11 a 0.02, near a 0.05), no por igualdad:
++		// el juego tiene camaras con FOV ANIMADO (el zoom de entrada, el FOV por
++		// velocidad de la persecucion) que derivan en pasos de ~0.002 — con
++		// igualdad estricta una sola de esas se comia los 64 lugares en el garage
++		// y las camaras de conduccion no se registraban nunca. Paso dos veces:
++		// con el tope de 16 y con el de 64. La cubeta de 0.02 convierte una rampa
++		// de 2.29→2.42 en ~7 entradas en vez de 62.
++		// Ademas se dice si cada una cae en la lista negra (menu/garage), que
++		// es lo que decide si esa vista queda passthrough o recibe el triple.
++		static float vistas_m11[96];
++		static float vistas_m23[96];
++		static int triple_logcount = 0;
++		bool ya_vista = false;
++		for (int k = 0; k < triple_logcount; k++) {
++			float dm11 = f[5] - vistas_m11[k]; if (dm11 < 0) dm11 = -dm11;
++			float dm23 = f[14] - vistas_m23[k]; if (dm23 < 0) dm23 = -dm23;
++			if (dm11 <= 0.02f && dm23 <= 0.05f) { ya_vista = true; break; }
++		}
++		if (!ya_vista && triple_logcount < 96) {
++			bool negra = tt_es_camara_de_menu(f[5]);
++			// las camaras interiores (cockpit/capo/piso) se distinguen por el
++			// near chico; marcarlas hace el log legible de un vistazo
++			bool interior = (f[14] > -0.16f && f[14] < -0.02f);
++			LogInfo("TRIPLE camera #%d: m00=%.6f m11=%.6f aspect=%.3f m22=%.6f"
++				" m23(near)=%.6f %s %s\n",
++				triple_logcount, f[0], f[5], aspect, f[10], f[14],
++				interior ? "[INTERIOR]" : "[exterior]",
++				negra ? "LISTA NEGRA (menu/garage: passthrough)"
++				      : "corregida (triple)");
++			vistas_m11[triple_logcount] = f[5];
++			vistas_m23[triple_logcount] = f[14];
++			triple_logcount++;
++		}
++
++		// Aviso del ojo virtual: una sola vez por sesion, en cuanto hay camara.
++		if (InterlockedCompareExchange(&g_hud_state, 1, 0) == 0) {
++			HANDLE h = CreateThread(NULL, 0, eye_hud_thread, NULL, 0, NULL);
++			if (h)
++				CloseHandle(h);
++		}
++
++		// v1.37: pedir el cazaplanos UNA vez por sesion, cuando hay camara de
++		// CONDUCCION (near ~0.1) con el mismo m11 durante ~100 capturas
++		// seguidas: la proyeccion esta quieta y sirve de firma. Las carreras
++		// entre hilos de captura son benignas; el lanzamiento del hilo esta
++		// serializado por el InterlockedCompareExchange.
++		if (g_cullscan_state == 0 && f[14] > -0.15f && f[14] < -0.05f) {
++			static float cull_last_m11 = 0.0f;
++			static int cull_estable = 0;
++			float d = f[5] - cull_last_m11;
++			if (d > -1e-6f && d < 1e-6f) {
++				cull_estable++;
++			} else {
++				cull_estable = 0;
++				cull_last_m11 = f[5];
++			}
++			if (cull_estable >= 100 &&
++				InterlockedCompareExchange(&g_cullscan_state, 1, 0) == 0) {
++				memcpy(g_cullscan_req.P, f, 64);
++				g_cullscan_req.m00 = f[0];
++				g_cullscan_req.m11 = f[5];
++				g_cullscan_req.nearz = -f[14];
++				g_cullscan_req.aspect = aspect;
++				HANDLE h = CreateThread(NULL, 0, cull_scan_thread, NULL, 0, NULL);
++				if (h)
++					CloseHandle(h);
++				else
++					g_cullscan_state = 0;
++			}
++		}
++	}
++}
++
++// v1.50: la posicion del ojo en coordenadas de mundo, para el volcado del
++// pasto (que vive en HackerContext.cpp y no ve estos globales). Es cb3[8], el
++// mismo valor que el VS del pasto resta a cada instancia antes de proyectar.
++// Devuelve 0 si todavia no hay camara capturada.
++int TripleGetCameraPos(float *out3)
++{
++	if (!g_triple_cam_valid || g_triple_cam_size < 144)
++		return 0;
++	const float *f = (const float *)g_triple_cam_buf;
++	out3[0] = f[32];
++	out3[1] = f[33];
++	out3[2] = f[34];
++	return 1;
++}
++
++// R = A * B, all column-major 4x4 (m[col*4+row]).
++static void triple_mat_mul(float *R, const float *A, const float *B)
++{
++	for (int col = 0; col < 4; col++) {
++		for (int row = 0; row < 4; row++) {
++			float s = 0.0f;
++			for (int k = 0; k < 4; k++)
++				s += A[k * 4 + row] * B[col * 4 + k];
++			R[col * 4 + row] = s;
++		}
++	}
++}
++
++// Inversa general 4x4 (column-major m[col*4+row], igual convencion que el juego:
++// cada registro del cbuffer es una COLUMNA, como se ve en el ASM
++// "clip = cb3[9]*x + cb3[10]*y + cb3[11]*z + cb3[12]").
++// Devuelve false si es singular.
++static bool triple_mat_inverse(float *out, const float *m)
++{
++	float inv[16];
++
++	inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15]
++	         + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
++	inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15]
++	         - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
++	inv[8]  =  m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15]
++	         + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
++	inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14]
++	         - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
++	inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15]
++	         - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
++	inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15]
++	         + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
++	inv[9]  = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15]
++	         - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
++	inv[13] =  m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14]
++	         + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
++	inv[2]  =  m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15]
++	         + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
++	inv[6]  = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15]
++	         - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
++	inv[10] =  m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15]
++	         + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
++	inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14]
++	         - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
++	inv[3]  = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11]
++	         - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
++	inv[7]  =  m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11]
++	         + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
++	inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11]
++	         - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
++	inv[15] =  m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10]
++	         + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
++
++	float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
++	if (det > -1e-20f && det < 1e-20f)
++		return false;
++	det = 1.0f / det;
++	for (int i = 0; i < 16; i++)
++		out[i] = inv[i] * det;
++	return true;
++}
++
++// Construye P_region (view-space del juego -> clip de la region i) desde la
++// geometria viva (constantes K en IniParams) y el near REAL de la camara.
++// Deducida de compute_matrices.py; equivale exactamente a lo que hace el ASM:
++//   laterales: x = KA*Xv + s*KB*Zv ; y = KC*Yv ; w = s*sa*Xv - ca*Zv ; z = w - near
++//   centro:    x = KXc*Xv ; y = KYc*Yv ; w = -Zv ; z = w - near
++// con s = -1 para LEFT y +1 para RIGHT (Zv = -w, de ahi los signos).
++// Fracciones de cada region dentro del ancho total (2560/7760, 2600/7760, ...).
++// Se usan para calcular el scissor a partir del ancho REAL del render target, de
++// modo que funcione tambien en pases a resolucion reducida (la mascara de sombras
++// puede rendarizarse a media resolucion).
++// v1.29: fracciones de region PARAMETRIZADAS. [Present] las publica en las filas
++// 6/7 de IniParams a partir de $mon_px/$bezel_px (z6 = fin izq, w6 = inicio
++// centro, x7 = fin centro, y7 = inicio der). Si aun no estan publicadas (arranque
++// temprano) se usa la tabla historica de 2560/40 como respaldo.
++static void triple_get_frac(int region, float *lo, float *hi);
++
++static const float TRIPLE_FRAC[3][2] = {
++	{ 0.0000000f, 0.3298969f },   // LEFT   0 .. 2560
++	{ 0.3350515f, 0.6649485f },   // CENTER 2600 .. 5160
++	{ 0.6701031f, 1.0000000f },   // RIGHT  5200 .. 7760
++};
++
++static void triple_get_frac(int region, float *lo, float *hi)
++{
++	if (G->iniParams.size() >= 8 && G->iniParams[6].z > 0.0f) {
++		float fl  = G->iniParams[6].z;   // fin de la region izquierda
++		float fcl = G->iniParams[6].w;   // inicio del centro
++		float fcr = G->iniParams[7].x;   // fin del centro
++		float frl = G->iniParams[7].y;   // inicio de la derecha
++		switch (region) {
++			case 0: *lo = 0.0f; *hi = fl;   return;
++			case 1: *lo = fcl;  *hi = fcr;  return;
++			default: *lo = frl; *hi = 1.0f; return;
++		}
++	}
++	*lo = TRIPLE_FRAC[region][0];
++	*hi = TRIPLE_FRAC[region][1];
++}
++
++static void ProcessParamRTSize(CommandListState *state);
++
++// Consulta ROBUSTA del tamano del render target.
++// ProcessParamRTSize (la que alimenta la variable rt_width del ini) solo acepta
++// vistas D3D11_RTV_DIMENSION_TEXTURE2D / TEXTURE2DMS y sale dejando rt_width en
++// -1 para cualquier otra (p.ej. vistas de ARRAY). Esa es la explicacion mas
++// probable de que el gate "rt_width >= N" nunca se cumpliera en el pase de la
++// mascara de sombras. Aca miramos el RECURSO, no la vista, asi que sirve para
++// arrays y cualquier dimension de vista.
++static bool triple_get_rt_size(CommandListState *state, float *w, float *h)
++{
++	ID3D11RenderTargetView *view = NULL;
++	ID3D11Resource *res = NULL;
++	D3D11_RESOURCE_DIMENSION dim;
++	bool ok = false;
++
++	state->mOrigContext1->OMGetRenderTargets(1, &view, NULL);
++	if (!view)
++		return false;
++	view->GetResource(&res);
++	view->Release();
++	if (!res)
++		return false;
++
++	res->GetType(&dim);
++	if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++		D3D11_TEXTURE2D_DESC d;
++		((ID3D11Texture2D*)res)->GetDesc(&d);
++		*w = (float)d.Width;
++		*h = (float)d.Height;
++		ok = (d.Width > 0);
++	}
++	res->Release();
++	return ok;
++}
++
++static void triple_build_pregion(float *P, int region, float nearz)
++{
++	memset(P, 0, 16 * sizeof(float));
++	if (region == 1) {                 // CENTER
++		P[0]  = TRIPLE_KXC;            // col0.row0
++		P[5]  = TRIPLE_KYC;            // col1.row1
++		P[10] = -1.0f;                 // col2.row2
++		P[11] = -1.0f;                 // col2.row3
++		P[14] = -nearz;                // col3.row2
++	} else {
++		float s = (region == 0) ? -1.0f : 1.0f;
++		P[0]  = TRIPLE_KA;             // col0.row0
++		P[2]  = s * TRIPLE_SA;         // col0.row2
++		P[3]  = s * TRIPLE_SA;         // col0.row3
++		P[5]  = TRIPLE_KC;             // col1.row1
++		P[8]  = s * TRIPLE_KB;         // col2.row0
++		P[10] = -TRIPLE_CA;            // col2.row2
++		P[11] = -TRIPLE_CA;            // col2.row3
++		P[14] = -nearz;                // col3.row2
++	}
++}
++
++void TripleRegionCommand::run(CommandListState *state)
++{
++	ID3D11DeviceContext1 *ctx = state->mOrigContext1;
++	ID3D11Device1 *dev = state->mOrigDevice1;
++
++	// Log de entrada INCONDICIONAL: si el pase no se corrige, este log dice por que
++	// (si no aparece, es que el command list ni siquiera se ejecuto).
++	// triple_scissor = restore: reponer los scissor rects del JUEGO desde la
++	// copia sombra (v1.26). Si el juego no habia seteado ninguno, dejamos el
++	// rect neutro de 16384 que no puede recortar nada.
++	if (scissor_only == 2) {
++		HackerContext *hc = state->mHackerContext;
++		if (hc && hc->mTripleScissorShadowCount > 0) {
++			ctx->RSSetScissorRects(hc->mTripleScissorShadowCount, hc->mTripleScissorShadow);
++		} else {
++			D3D11_RECT r;
++			r.left = 0; r.top = 0; r.right = 16384; r.bottom = 16384;
++			ctx->RSSetScissorRects(1, &r);
++		}
++		return;
++	}
++
++	// triple_scissor: solo el rectangulo del tercio, como FRACCION del render
++	// target real. Independiente de la resolucion. No toca ningun cbuffer.
++	if (scissor_only) {
++		float rw = 0.0f, rh = 0.0f;
++		if (region >= 0 && region < 3 && triple_get_rt_size(state, &rw, &rh)) {
++			float flo, fhi;
++			triple_get_frac(region, &flo, &fhi);
++			D3D11_RECT r;
++			r.left   = (LONG)(rw * flo + 0.5f);
++			r.right  = (LONG)(rw * fhi + 0.5f);
++			r.top    = 0;
++			r.bottom = (LONG)(rh + 0.5f);
++			ctx->RSSetScissorRects(1, &r);
++		}
++		return;
++	}
++
++	// Se loguea UNA vez por cada combinacion distinta de (id de shader, tamano de
++	// RT), asi se ve exactamente CUALES de los 15 pases se estan corrigiendo, a que
++	// resolucion, y con que near de camara — sin inundar el log.
++	if (region == 0 && G->iniParams.size() >= 4) {
++		float lw = -1.0f, lh = -1.0f;
++		triple_get_rt_size(state, &lw, &lh);
++		int id = (int)G->iniParams[3].z;
++		const float *cf = (const float*)g_triple_cam_buf;
++		static int seen[32] = { 0 };
++		static int nseen = 0;
++		int key = id * 100000 + (int)lw;
++		bool nuevo = true;
++		for (int k = 0; k < nseen; k++) if (seen[k] == key) { nuevo = false; break; }
++		if (nuevo && nseen < 32) {
++			seen[nseen++] = key;
++			LogInfo("TRIPLE pase #%d: rt=%.0fx%.0f  near_cam=%.4f m00=%.5f m11=%.5f  cam_valid=%d\n",
++				id, lw, lh, g_triple_cam_valid ? -cf[14] : 0.0f,
++				g_triple_cam_valid ? cf[0] : 0.0f, g_triple_cam_valid ? cf[5] : 0.0f,
++				(int)g_triple_cam_valid);
++		}
++	}
++
++	if (!g_triple_cam_valid)
++		return;  // main camera not captured yet
++
++	// v1.13: NADA de Get* aca. Los metodos Get* de ID3D11DeviceContext no son
++	// fiables en contextos diferidos (DiRT usa 7) — fue la causa exacta del
++	// desastre de v1.5b. Para restaurar usamos g_triple_orig_cb, una copia sin
++	// modificar de la camara capturada.
++
++	// Recompute the 3 region cbs at most once per frame from the captured camera.
++	// Only UpdateSubresource / bind here (both valid on deferred contexts).
++	if (g_triple_frame != G->frame_no) {
++		if (g_triple_cb_size != g_triple_cam_size) {
++			for (int i = 0; i < 3; i++) {
++				if (g_triple_region_cb[i]) { g_triple_region_cb[i]->Release(); g_triple_region_cb[i] = NULL; }
++			}
++			if (g_triple_orig_cb) { g_triple_orig_cb->Release(); g_triple_orig_cb = NULL; }
++			g_triple_cb_size = g_triple_cam_size;
++
++			D3D11_BUFFER_DESC rd;
++			rd.ByteWidth = g_triple_cam_size;
++			rd.Usage = D3D11_USAGE_DEFAULT;
++			rd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++			rd.CPUAccessFlags = 0;
++			rd.MiscFlags = 0;
++			rd.StructureByteStride = 0;
++			for (int i = 0; i < 3; i++)
++				dev->CreateBuffer(&rd, NULL, &g_triple_region_cb[i]);
++			dev->CreateBuffer(&rd, NULL, &g_triple_orig_cb);
++		}
++
++		if (g_triple_region_cb[0] && G->iniParams.size() >= 3) {
++			const float *f = (const float*)g_triple_cam_buf;
++			// La camara original: projection en f[0..15], inverseProj en f[16..31],
++			// relativeViewProjection en f[36..51]. Todas column-major (cada registro
++			// del cbuffer es una COLUMNA).
++			const float *Pg   = f;
++			const float *IPg  = f + 16;
++			const float *RVPg = f + 36;
++			float nearz = -f[14];               // m23 = -near
++			if (nearz <= 0.0f) nearz = 0.1f;    // guarda
++
++			float Pgi[16];
++			bool ok_pg = triple_mat_inverse(Pgi, Pg);
++
++			// Copia intacta para restaurar sin Get*.
++			if (g_triple_orig_cb)
++				ctx->UpdateSubresource(g_triple_orig_cb, 0, NULL, g_triple_cam_buf, 0, 0);
++
++			for (int i = 0; i < 3 && ok_pg; i++) {
++				char rbuf[512];
++				memcpy(rbuf, g_triple_cam_buf, g_triple_cam_size);
++				float *rf = (float*)rbuf;
++
++				float Preg[16], Pregi[16], Mi[16], Mii[16], tmp[16];
++				triple_build_pregion(Preg, i, nearz);
++				if (!triple_mat_inverse(Pregi, Preg))
++					continue;
++
++				// REGLA UNIVERSAL (no depende de que mapea cada matriz):
++				// nuestra correccion en el shader equivale a clip_i = M_i * clip_juego,
++				// con M_i = P_region_i * inv(P_juego). Entonces:
++				//   toda matriz que produce CLIP  -> se premultiplica por M_i
++				//   toda matriz que consume CLIP  -> se posmultiplica por inv(M_i)
++				triple_mat_mul(Mi,  Preg, Pgi);    // M_i        = P_region * inv(P_juego)
++				triple_mat_mul(Mii, Pg,   Pregi);  // inv(M_i)   = P_juego  * inv(P_region)
++
++				// v1.14: SOLO se reemplaza inverseProj. projection y
++				// relativeViewProjection se dejan INTACTAS. Esto es esencial:
++				//  - el parche ASM del vertex shader calcula la correccion leyendo
++				//    cb3[9..12] (relativeViewProjection). Si tambien la
++				//    cambiaramos, aplicaria la correccion DOS VECES. Eso es
++				//    exactamente lo que hizo fracasar el intento v2 (menus
++				//    aplastados, auto negro, vegetacion desgarrada).
++				//  - para reconstruir posicion desde el depth alcanza con
++				//    inverseProj, que es lo unico que leen esos pixel shaders.
++				// Radio de dano minimo: si la camara capturada fuera la
++				// equivocada, solo se degrada la reconstruccion (que hoy ya
++				// esta mal), nunca la geometria.
++				(void)Preg; (void)Mi; (void)RVPg;
++				triple_mat_mul(tmp, IPg, Mii);     // inverseProj_i = inverseProj * inv(M_i)
++				memcpy(rf + 16, tmp, 64);
++
++				ctx->UpdateSubresource(g_triple_region_cb[i], 0, NULL, rbuf, 0, 0);
++
++				static int trdbg = 0;
++				if (trdbg < 3) {
++					LogInfo("TRIPLE region %d: near=%.6f KA=%.5f KB=%.5f KC=%.5f KXc=%.5f KYc=%.5f sa=%.5f ca=%.5f\n",
++						i, nearz, TRIPLE_KA, TRIPLE_KB, TRIPLE_KC,
++						TRIPLE_KXC, TRIPLE_KYC, TRIPLE_SA, TRIPLE_CA);
++					LogInfo("            M_i col0=(%.4f %.4f %.4f %.4f) invM col0=(%.4f %.4f %.4f %.4f)\n",
++						Mi[0], Mi[1], Mi[2], Mi[3], Mii[0], Mii[1], Mii[2], Mii[3]);
++					trdbg++;
++				}
++			}
++			g_triple_valid = ok_pg;
++			g_triple_frame = G->frame_no;
++		}
++	}
++
++	if (g_triple_valid && region >= 0 && region < 3 && g_triple_region_cb[region]) {
++		ctx->VSSetConstantBuffers(3, 1, &g_triple_region_cb[region]);
++		ctx->PSSetConstantBuffers(3, 1, &g_triple_region_cb[region]);
++
++		// Scissor PROPORCIONAL al render target real de este pase. Asi funciona
++		// tanto a resolucion completa como a media (la mascara de sombras puede
++		// renderizarse reducida) sin hardcodear pixeles.
++		float rw = 0.0f, rh = 0.0f;
++		if (triple_get_rt_size(state, &rw, &rh)) {
++			float flo, fhi;
++			triple_get_frac(region, &flo, &fhi);
++			D3D11_RECT r;
++			r.left   = (LONG)(rw * flo + 0.5f);
++			r.right  = (LONG)(rw * fhi + 0.5f);
++			r.top    = 0;
++			r.bottom = (LONG)(rh + 0.5f);
++			ctx->RSSetScissorRects(1, &r);
++
++			static int trrt = 0;
++			if (trrt < 6) {
++				LogInfo("TRIPLE fullscreen pass: rt=%.0fx%.0f region=%d scissor=%ld..%ld\n",
++					rw, rh, region, r.left, r.right);
++				trrt++;
++			}
++		}
++	}
++}
++
++// ---- triple_params: texturas de IniParams pre-armadas por region ------------
++// 4 juegos (region 0/1/2 y 3 = passthrough), POR CONTEXTO (thread_local, la
++// leccion de los contextos diferidos). Se refrescan una vez por frame desde
++// G->iniParams — el mismo contenido que subiria el flush normal — con la unica
++// diferencia de que row0.x = region fija.
++static thread_local ID3D11Texture1D *g_triple_par_tex[4] = { NULL, NULL, NULL, NULL };
++static thread_local ID3D11ShaderResourceView *g_triple_par_srv[4] = { NULL, NULL, NULL, NULL };
++static thread_local UINT g_triple_par_size = 0;
++static thread_local unsigned g_triple_par_frame = 0xFFFFFFFF;
++
++void TripleParamsCommand::run(CommandListState *state)
++{
++	ID3D11DeviceContext1 *ctx = state->mOrigContext1;
++	ID3D11Device1 *dev = state->mOrigDevice1;
++	UINT n = (UINT)G->iniParams.size();
++
++	if (!n || G->IniParamsReg < 0)
++		return;
++
++	if (g_triple_par_size != n) {
++		for (int i = 0; i < 4; i++) {
++			if (g_triple_par_srv[i]) { g_triple_par_srv[i]->Release(); g_triple_par_srv[i] = NULL; }
++			if (g_triple_par_tex[i]) { g_triple_par_tex[i]->Release(); g_triple_par_tex[i] = NULL; }
++		}
++		g_triple_par_size = n;
++
++		D3D11_TEXTURE1D_DESC desc;
++		memset(&desc, 0, sizeof(desc));
++		desc.Width = n;
++		desc.MipLevels = 1;
++		desc.ArraySize = 1;
++		desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
++		desc.Usage = D3D11_USAGE_DEFAULT;
++		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++		for (int i = 0; i < 4; i++) {
++			if (FAILED(dev->CreateTexture1D(&desc, NULL, &g_triple_par_tex[i])))
++				return;
++			if (FAILED(dev->CreateShaderResourceView(g_triple_par_tex[i], NULL, &g_triple_par_srv[i]))) {
++				g_triple_par_tex[i]->Release(); g_triple_par_tex[i] = NULL;
++				return;
++			}
++		}
++		g_triple_par_frame = 0xFFFFFFFF;  // forzar refresco
++	}
++
++	if (g_triple_par_frame != G->frame_no && g_triple_par_tex[0]) {
++		std::vector<DirectX::XMFLOAT4> buf(G->iniParams);
++		for (int i = 0; i < 4; i++) {
++			buf[0].x = (float)i;  // 0,1,2 = region ; 3 = passthrough
++			ctx->UpdateSubresource(g_triple_par_tex[i], 0, NULL, buf.data(), n * 16, 0);
++		}
++		g_triple_par_frame = G->frame_no;
++	}
++
++	// y3 == 1 solo en triple normal ($triple_on == 1, lo publica [Present]).
++	// En diagnostico (2) o apagado se bindea la passthrough (x = 3).
++	int idx = region;
++	if (n > 3 && G->iniParams[3].y < 0.5f)
++		idx = 3;
++
++	// DIAGNOSTICO (2026-08-07, "el triple no corrige en cockpit/capo/piso").
++	// Este es EL contador que separa las dos causas posibles de "se ve como
++	// vanilla": si las cuentas de r0/r1/r2 son ~0 mientras se maneja, el command
++	// list del redibujo NO corre (gate de rt_width/triple_on); si son altas pero
++	// todo cae en r3, la maquinaria corre en passthrough (y3). Sin esto, ambas
++	// se ven identicas en pantalla y en el log.
++	// Contadores globales sin candado a proposito: es diagnostico, una carrera
++	// entre contextos pierde alguna cuenta y no importa.
++	{
++		static unsigned cnt[4];
++		static unsigned ultimo_frame = 0;
++		if (idx >= 0 && idx <= 3)
++			cnt[idx]++;
++		if (G->frame_no - ultimo_frame >= 600) {
++			ultimo_frame = G->frame_no;
++			LogInfo("TRIPLE params (ultimos ~600 frames): r0=%u r1=%u r2=%u"
++				" passthrough=%u  y3=%.0f\n",
++				cnt[0], cnt[1], cnt[2], cnt[3],
++				(n > 3) ? G->iniParams[3].y : -1.0f);
++			cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
++		}
++	}
++
++	if (g_triple_par_srv[idx]) {
++		ctx->VSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
++		ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
++	}
++}
++
++void TripleRestoreCommand::run(CommandListState *state)
++{
++	// Rebind la copia INTACTA de la camara (mismo contenido que tenia el juego en
++	// este frame). No usamos Get*/save por ser inseguro en contextos diferidos.
++	if (g_triple_valid && g_triple_orig_cb) {
++		state->mOrigContext1->VSSetConstantBuffers(3, 1, &g_triple_orig_cb);
++		state->mOrigContext1->PSSetConstantBuffers(3, 1, &g_triple_orig_cb);
++	}
++	// v1.26: restaurar los rects del JUEGO (copia sombra); si no habia, el rect
++	// neutro de 16384 que no puede recortar nada (leccion v1.18: el rect de
++	// tijera es estado global que sobrevive al pase — 16384 = max textura D3D11).
++	{
++		HackerContext *hc = state->mHackerContext;
++		if (hc && hc->mTripleScissorShadowCount > 0) {
++			state->mOrigContext1->RSSetScissorRects(hc->mTripleScissorShadowCount, hc->mTripleScissorShadow);
++		} else {
++			D3D11_RECT r;
++			r.left = 0; r.top = 0; r.right = 16384; r.bottom = 16384;
++			state->mOrigContext1->RSSetScissorRects(1, &r);
++		}
++	}
++}
++
+ PerDrawStereoOverrideCommand::PerDrawStereoOverrideCommand(bool restore_on_post) :
+ 		staging_type(false),
+ 		val(FLT_MAX),
+diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
+index 142cbbf..aca1a03 100644
+--- a/DirectX11/CommandList.h
++++ b/DirectX11/CommandList.h
+@@ -379,6 +379,91 @@ public:
+ 	void run(CommandListState*) override;
+ };
+ 
++// set_scissor = left, top, right, bottom
++// Custom addition (triple-monitor per-region rendering): sets an arbitrary
++// scissor rectangle so a redraw can be confined to one screen region. Pair with
++// run = BuiltInCustomShaderEnableScissorClipping to make the scissor test active.
++class ScissorCommand : public CommandListCommand {
++public:
++	wstring ini_section;
++	int mode;  // 0 = set rect, 1 = save current game rects, 2 = restore saved rects
++	D3D11_RECT rect;
++
++	ScissorCommand(wstring section, int left, int top, int right, int bottom) :
++		ini_section(section), mode(0)
++	{
++		rect.left = left;
++		rect.top = top;
++		rect.right = right;
++		rect.bottom = bottom;
++	}
++
++	ScissorCommand(wstring section, int save_restore_mode) :
++		ini_section(section), mode(save_restore_mode)
++	{
++		rect.left = rect.top = rect.right = rect.bottom = 0;
++	}
++
++	void run(CommandListState*) override;
++};
++
++// triple_region = 0 | 1 | 2
++// Custom addition (triple-monitor): overrides the camera constant buffer (b3 =
++// CameraParamsConstantBuffer) with a per-region corrected version, so BOTH the
++// vertex position AND pixel-shader reconstruction (depth->position, shadows, fog)
++// use the same corrected projection. Reads the game's cb3 once per frame, applies
++// the precomputed per-region matrices, and binds the result. No shader patching.
++class TripleRegionCommand : public CommandListCommand {
++public:
++	wstring ini_section;
++	int region;  // 0 = left, 1 = center, 2 = right
++	// scissor_only = 1 -> el comando "triple_scissor": SOLO fija el rectangulo de
++	// tijera del tercio, calculado como FRACCION del render target real, sin tocar
++	// ningun constant buffer. Sirve para que la configuracion no dependa de la
++	// resolucion (antes los rectangulos estaban escritos a mano en pixeles).
++	int scissor_only;
++
++	TripleRegionCommand(wstring section, int r, int so = 0) :
++		ini_section(section), region(r), scissor_only(so)
++	{}
++
++	void run(CommandListState*) override;
++};
++
++// triple_params = 0|1|2 : bindea a t<IniParamsReg> (VS+DS) una textura PRE-ARMADA
++// identica a IniParams pero con x = region. Sustituye el "x = $regN" del ini, que
++// obligaba a un Map(WRITE_DISCARD) de la textura de IniParams antes de CADA
++// redibujo (~2400 actualizaciones de recurso GPU por frame). Bindear un SRV es
++// casi gratis; las 4 texturas (0,1,2 y 3=passthrough) se actualizan UNA vez por
++// frame y por contexto. Si y3 == 0 (triple en modo diagnostico o apagado) se
++// bindea siempre la passthrough.
++class TripleParamsCommand : public CommandListCommand {
++public:
++	wstring ini_section;
++	int region;
++
++	TripleParamsCommand(wstring section, int r) :
++		ini_section(section), region(r)
++	{}
++
++	void run(CommandListState*) override;
++};
++
++// triple_restore
++// Re-binds the game's original camera cb3 (saved by triple_region region 0) after
++// the 3 per-region redraws, so subsequent unmatched draws (car body, cockpit, etc.)
++// are not corrupted by the leftover per-region camera override.
++class TripleRestoreCommand : public CommandListCommand {
++public:
++	wstring ini_section;
++
++	TripleRestoreCommand(wstring section) :
++		ini_section(section)
++	{}
++
++	void run(CommandListState*) override;
++};
++
+ 
+ enum class CustomResourceType {
+ 	INVALID,
+diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
+index a0a8d70..1964ee2 100644
+--- a/DirectX11/HackerContext.cpp
++++ b/DirectX11/HackerContext.cpp
+@@ -14,6 +14,11 @@
+ 
+ //#include "HookedContext.h"
+ 
++// v1.44: para el breakpoint de hardware sobre el contador del pasto —
++// enumerar hilos (tlhelp32) y traducir RIP a offset del exe (psapi).
++#include <tlhelp32.h>
++#include <psapi.h>
++
+ #include "log.h"
+ #include "Globals.h"
+ 
+@@ -71,7 +76,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
+ 	mHackerDevice = NULL;
+ 
+ 	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
++	memset(mTripleScissorShadow, 0, sizeof(mTripleScissorShadow));
++	mTripleScissorShadowCount = 0;
+ 	mCurrentIndexBuffer = 0;
++	mTripleIB = 0;
+ 	mCurrentVertexShader = 0;
+ 	mCurrentVertexShaderHandle = NULL;
+ 	mCurrentPixelShader = 0;
+@@ -725,6 +733,10 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
+ }
+ 
+ 
++// En CommandList.cpp. Se declara aca y no junto a TripleCaptureCameraCB
++// porque aquella esta mas abajo en el archivo que este uso.
++void TripleTrackCarMesh(UINT64 vs_hash, uint32_t ib_hash, UINT index_count);
++
+ void HackerContext::BeforeDraw(DrawContext &data)
+ {
+ 	Profiling::State profiling_state;
+@@ -732,6 +744,10 @@ void HackerContext::BeforeDraw(DrawContext &data)
+ 	if (Profiling::mode == Profiling::Mode::SUMMARY)
+ 		Profiling::start(&profiling_state);
+ 
++	// Identificacion del auto por su malla. Va ANTES del gate de hunting a
++	// proposito: tiene que funcionar en juego normal, no solo analizando.
++	TripleTrackCarMesh(mCurrentVertexShader, mTripleIB, data.call_info.IndexCount);
++
+ 	// If we are not hunting shaders, we should skip all of this shader management for a performance bump.
+ 	if (G->hunting == HUNTING_MODE_ENABLED)
+ 	{
+@@ -1103,6 +1119,14 @@ STDMETHODIMP HackerContext::SetPrivateDataInterface(THIS_
+ // They need to be here in order to pass along the calls, since there is no proper object where
+ // it would normally go to the superclass. 
+ 
++// v1.63 M1: buffer bindeado en VS slot 3 (cb3, camara) y PS slot 0 (cb0/$Globals),
++// por contexto. Los Get* mienten en contextos diferidos (regla 3 de CLAUDE.md),
++// por eso se sombrea aca. El snapshot de su contenido y la medicion viven mas
++// abajo (cb_snap_* / triple_medir_scatter).
++static thread_local ID3D11Resource *tls_vs_cb3 = NULL;
++static thread_local ID3D11Resource *tls_ps_cb0 = NULL;
++static thread_local ID3D11Resource *tls_ps_cb5 = NULL;	// v1.70: ShadowParameters
++
+ STDMETHODIMP_(void) HackerContext::VSSetConstantBuffers(THIS_
+ 	/* [annotation] */
+ 	__in_range(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - 1)  UINT StartSlot,
+@@ -1111,6 +1135,11 @@ STDMETHODIMP_(void) HackerContext::VSSetConstantBuffers(THIS_
+ 	/* [annotation] */
+ 	__in_ecount(NumBuffers) ID3D11Buffer *const *ppConstantBuffers)
+ {
++	// v1.63 M1: sombrear el buffer del VS slot 3 (cb3, camara). Se usa para medir
++	// el fovH de la siembra del pasto en el draw del scatter VS.
++	if (ppConstantBuffers && StartSlot <= 3 && StartSlot + NumBuffers > 3)
++		tls_vs_cb3 = ppConstantBuffers[3 - StartSlot];
++
+ 	mOrigContext1->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+ }
+ 
+@@ -1289,6 +1318,555 @@ out_profile:
+ 		Profiling::end(&profiling_state, &Profiling::map_overhead);
+ }
+ 
++// ===== v1.44: BREAKPOINT DE HARDWARE sobre el contador del pasto ============
++//
++// A donde llegamos: el pasto (ground cover) se dibuja con draw indirecto, y la
++// cantidad sale de g_gcMeshCountsBuffer, que llena la CPU. Ese contador ES el
++// resultado del culling. No pasa por planos en memoria (abrimos los 4 frustums
++// vivos y no se inmuta), ni por constant buffers, ni se puede destapar desde el
++// draw (forzar maxInstances no revelo nada: la geometria directamente no se
++// siembra). Lo unico que queda es preguntarle al procesador QUIEN escribe ese
++// contador.
++//
++// Como: los registros de depuracion (DR0-DR3) del x86 disparan una excepcion
++// cuando se escribe una direccion concreta. Se arma DR0 sobre el buffer en el
++// momento en que el juego lo mapea, y un Vectored Exception Handler captura el
++// RIP de la instruccion culpable. Con ese offset dentro de dirtrally2.exe se
++// llega a la funcion de siembra y a su test de culling.
++//
++// Los DR son POR HILO, asi que hay que sembrarlos en todos los hilos del
++// proceso. Es one-shot: apenas junta unos hits se desarma solo. Diagnostico
++// puro — no cambia nada de lo que el juego hace.
++
++static thread_local ID3D11Resource *tls_cs_srv[2] = { NULL, NULL };
++static thread_local ID3D11Resource *tls_vs_srv[8] = { NULL };
++// v1.50: volcado del buffer del pasto, una sola vez por sesion.
++static thread_local bool tls_triple_dump_gc = false;
++static thread_local ID3D11Resource *tls_triple_dump_gc_res = NULL;
++static thread_local void *tls_triple_dump_gc_ptr = NULL;
++static thread_local UINT tls_triple_dump_gc_size = 0;
++static thread_local UINT tls_triple_dump_gc_stride = 0;
++static thread_local void *tls_gc_meshinfo_ptr = NULL;
++static thread_local UINT tls_gc_meshinfo_size = 0;
++static thread_local int tls_gc_counts_uav_slot = -1;
++static ID3D11Resource *g_gc_counts_res = NULL;		// g_gcMeshCountsBuffer
++// v1.46: EL objetivo de verdad. El VS del pasto lee sus instancias de t1
++// (stride 112) y NO descarta ninguna: proyecta todo lo que le den (se leyo el
++// ASM entero). El contador tampoco es el filtro — nadie lo escribe en todo un
++// frame, o sea que es estatico. Por descarte, el culling del pasto esta en
++// QUIEN LLENA ESTE BUFFER. Ahi va la trampa.
++static ID3D11Resource *g_gc_instances_res = NULL;	// g_gcInstanceBuffer
++static ID3D11Resource *g_gc_meshinfo_res = NULL;	// g_gcMeshNumIndicesBuffer
++
++// v1.45: quien toca el contador del pasto. Un solo reporte por via/shader.
++static void gc_reportar(const char *via, UINT64 hash)
++{
++	static UINT64 vistos[24];
++	static int n = 0;
++	static volatile LONG lock = 0;
++	while (InterlockedCompareExchange(&lock, 1, 0) != 0)
++		YieldProcessor();
++	UINT64 clave = hash ^ (UINT64)(uintptr_t)via;
++	for (int i = 0; i < n; i++) {
++		if (vistos[i] == clave) {
++			InterlockedExchange(&lock, 0);
++			return;
++		}
++	}
++	if (n < 24) {
++		vistos[n++] = clave;
++		LogInfo("CULLBP: el contador del pasto lo escribe %s (cs=%016llX)\n",
++			via, hash);
++	}
++	InterlockedExchange(&lock, 0);
++}
++static volatile LONG g_bp_estado = 0;	// 0=dormido 1=armando 2=armado 3=terminado
++static void *g_bp_addr = NULL;
++static PVOID g_bp_veh = NULL;
++static volatile LONG g_bp_hits = 0;
++// v1.48: la caceria es en dos escalones. Fase 1 = trampa en el buffer que se
++// sube a GPU (cae en el memcpy que lo llena). Fase 2 = trampa en el ORIGEN de
++// ese memcpy, que es donde el generador dejo las instancias ya culleadas.
++static volatile LONG g_bp_fase = 1;
++static volatile LONG g_bp_repostear = 0;
++static void *g_bp_origen = NULL;
++
++// Vuelca las direcciones de retorno plausibles del stack: los qwords que caen
++// dentro de dirtrally2.exe son, casi siempre, la cadena de llamadas. Es lo que
++// convierte "una instruccion suelta" en "esta funcion llama a esta otra".
++static void bp_volcar_pila(const CONTEXT *ctx, uintptr_t base, uintptr_t fin)
++{
++	const uintptr_t *sp = (const uintptr_t *)ctx->Rsp;
++	int encontrados = 0;
++	for (int i = 0; i < 96 && encontrados < 12; i++) {
++		uintptr_t v = 0;
++		__try {
++			v = sp[i];
++		} __except (EXCEPTION_EXECUTE_HANDLER) {
++			break;
++		}
++		if (v > base && v < fin) {
++			encontrados++;
++			LogInfo("CULLBP     retorno #%d: dirtrally2.exe+0x%llX\n",
++				encontrados, (unsigned long long)(v - base));
++		}
++	}
++}
++
++static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
++{
++	if (ep->ExceptionRecord->ExceptionCode != (DWORD)EXCEPTION_SINGLE_STEP)
++		return EXCEPTION_CONTINUE_SEARCH;
++	// bit 0 de DR6 = disparo DR0 (el nuestro). Cualquier otro no nos incumbe.
++	if (!(ep->ContextRecord->Dr6 & 0x1))
++		return EXCEPTION_CONTINUE_SEARCH;
++
++	LONG n = InterlockedIncrement(&g_bp_hits);
++	if (n <= 4) {
++		HMODULE hm = GetModuleHandleA(NULL);
++		uintptr_t base = (uintptr_t)hm, fin = base + 0x2000000;
++		MODULEINFO mi;
++		if (GetModuleInformation(GetCurrentProcess(), hm, &mi, sizeof(mi)))
++			fin = base + mi.SizeOfImage;
++		const CONTEXT *c = ep->ContextRecord;
++		uintptr_t rip = (uintptr_t)c->Rip;
++		LogInfo("CULLBP[fase %d] hit #%d: dirtrally2.exe+0x%llX (hilo %u)\n",
++			(int)g_bp_fase, n, (unsigned long long)(rip - base),
++			GetCurrentThreadId());
++		// v1.48: los registros. El hit de la v1.47 cayo en un memcpy en linea
++		// (movups de a 128 bytes), o sea que NO es el culler: es la subida de
++		// datos ya decididos. RBX/RSI apuntan al ORIGEN de esa copia — la
++		// memoria donde el generador dejo las instancias. Ese es el objetivo
++		// de la fase 2.
++		LogInfo("CULLBP     rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
++			(void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx,
++			(void *)c->Rdx, (void *)c->Rsi, (void *)c->Rdi);
++		// La pila cruda con indices: sin esto no se distingue la direccion de
++		// retorno real de los restos de llamadas anteriores.
++		const uintptr_t *sp = (const uintptr_t *)c->Rsp;
++		for (int i = 0; i < 12; i++) {
++			uintptr_t v = 0;
++			__try { v = sp[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
++			if (v > base && v < fin)
++				LogInfo("CULLBP     [rsp+0x%02X] = dirtrally2.exe+0x%llX\n",
++					i * 8, (unsigned long long)(v - base));
++		}
++		if (g_bp_fase == 1 && n == 1) {
++			// Fase 2: mover la trampa al ORIGEN de la copia. Quien escriba ahi
++			// es el que genera las instancias — y por lo tanto el que cullea.
++			//
++			// Se escala con el PRIMER hit a proposito: el buffer de GPU se
++			// mapea con WRITE_DISCARD, o sea direccion nueva cada frame, asi
++			// que la trampa de fase 1 dispara UNA sola vez y esperar un segundo
++			// hit deja la caceria colgada (paso en la v1.48).
++			//
++			// La direccion: el bucle arranca con rbx = this+0x60 y avanza de a
++			// 0x80. rdi es ese `this` (verificado: rbx == rdi+0xE0 en el hit
++			// tras una vuelta). Se apunta a this+0x60 —el principio del bloque
++			// de instancias— en vez de al rbx del momento, que ya avanzo y
++			// podria caer fuera si el bloque se recorre distinto.
++			g_bp_origen = (void *)(c->Rdi + 0x60);
++			LogInfo("CULLBP     -> objeto del pasto en %p, instancias desde "
++				"%p (this+0x60)\n", (void *)c->Rdi, g_bp_origen);
++			InterlockedExchange(&g_bp_repostear, 1);
++		}
++	}
++	ep->ContextRecord->Dr6 = 0;
++	if (n >= 4) {
++		ep->ContextRecord->Dr7 = 0;
++		InterlockedExchange(&g_bp_estado, 3);
++	}
++	return EXCEPTION_CONTINUE_EXECUTION;
++}
++
++// Siembra DR0 en todos los hilos del proceso. Los DR son estado por hilo: si
++// solo lo pusieramos en el hilo que llama a Map, nos perderiamos al que de
++// verdad escribe si fuera otro (el culling suele vivir en el hilo de update).
++static void bp_armar(void *addr)
++{
++	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++	if (snap == INVALID_HANDLE_VALUE)
++		return;
++	THREADENTRY32 te;
++	te.dwSize = sizeof(te);
++	DWORD pid = GetCurrentProcessId(), yo = GetCurrentThreadId();
++	int armados = 0;
++
++	if (Thread32First(snap, &te)) {
++		do {
++			if (te.th32OwnerProcessID != pid)
++				continue;
++			HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
++				THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
++			if (!h)
++				continue;
++			bool otro = (te.th32ThreadID != yo);
++			if (otro)
++				SuspendThread(h);
++			CONTEXT ctx;
++			memset(&ctx, 0, sizeof(ctx));
++			ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
++			if (GetThreadContext(h, &ctx)) {
++				ctx.Dr0 = (DWORD64)(uintptr_t)addr;
++				ctx.Dr6 = 0;
++				// L0=1 (activo local) | RW0=01 (romper al ESCRIBIR) |
++				// LEN0=11 (4 bytes, que es el tamano del contador)
++				ctx.Dr7 = (ctx.Dr7 & ~(DWORD64)0xF0003) | 0x1 | (0x1 << 16) | (0x3 << 18);
++				ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
++				if (SetThreadContext(h, &ctx))
++					armados++;
++			}
++			if (otro)
++				ResumeThread(h);
++			CloseHandle(h);
++		} while (Thread32Next(snap, &te));
++	}
++	CloseHandle(snap);
++	LogInfo("CULLBP: trampa (fase %d) puesta en %p sobre %d hilo(s).\n",
++		(int)g_bp_fase, addr, armados);
++}
++
++// Pasar a la fase 2: mover la trampa al origen de la copia. NO se puede hacer
++// desde el manejador de excepciones (bp_armar suspende hilos y el handler corre
++// dentro de uno de ellos: deadlock asegurado), asi que el handler solo deja la
++// bandera y el cambio se hace desde el hilo de render.
++static void bp_repostear_si_toca()
++{
++	if (InterlockedCompareExchange(&g_bp_repostear, 0, 1) != 1)
++		return;
++	LogInfo("CULLBP: === FASE 2 === el hit anterior era un memcpy; muevo la "
++		"trampa al ORIGEN de la copia (%p) para cazar a quien GENERA las "
++		"instancias.\n", g_bp_origen);
++	InterlockedExchange(&g_bp_fase, 2);
++	InterlockedExchange(&g_bp_hits, 0);
++	bp_armar(g_bp_origen);
++}
++
++// ⚠️ APAGADO (v1.54). El breakpoint de hardware cumplió su papel de descarte y
++// dejó de hacer falta, pero **hacía crashear el juego al salir**: los DR quedan
++// armados sobre memoria que se libera en el cierre, y el manejador de
++// excepciones sigue instalado mientras el proceso se desarma. El usuario vio
++// "Access violation ... dirtrally2.exe + 0xc830f7" al cerrar.
++// Si alguna vez vuelve a hacer falta, hay que desarmar los DR y quitar el VEH
++// en el DllMain de descarga (o en un hook de salida) antes de reactivarlo.
++#define CULL_BP_ACTIVO 0
++
++// Llamado desde Map cuando el juego mapea el buffer del contador del pasto.
++static void bp_intentar(void *addr)
++{
++#if !CULL_BP_ACTIVO
++	(void)addr;
++	return;
++#else
++	if (InterlockedCompareExchange(&g_bp_estado, 1, 0) != 0)
++		return;
++	g_bp_addr = addr;
++	if (!g_bp_veh)
++		g_bp_veh = AddVectoredExceptionHandler(1, bp_handler);
++	if (!g_bp_veh) {
++		LogInfo("CULLBP: no pude instalar el manejador de excepciones.\n");
++		InterlockedExchange(&g_bp_estado, 3);
++		return;
++	}
++	bp_armar(addr);
++	InterlockedExchange(&g_bp_estado, 2);
++#endif
++}
++
++// ---- Triple-monitor: capture the camera constant buffer at write time -------
++// Reading the game's cb3 via a GPU copy+Map(READ) is illegal on deferred
++// contexts (DiRT Rally 2.0 uses 7 of them), so instead we snoop the CPU-side
++// data the game writes into a constant buffer via Map/Unmap. Each context is
++// used by a single thread, so thread_local tracking is race-free.
++void TripleCaptureCameraCB(const void *data, unsigned size);  // in CommandList.cpp
++int TripleScanPlanesInCB(void *data, unsigned size, void *res_id,
++	unsigned bindFlags, int allow_patch);                     // in CommandList.cpp
++int TripleGetCameraPos(float *out3);                          // in CommandList.cpp
++static thread_local ID3D11Resource *tls_triple_map_res = NULL;
++static thread_local void *tls_triple_map_ptr = NULL;
++static thread_local UINT tls_triple_map_size = 0;
++
++// v1.39: buffers mapeados para escritura que podrian traer planos de frustum
++// (culling en GPU). Se apuntan en Map y se escanean/parchean en Unmap, antes
++// de que la GPU vea los datos. Por hilo (cada contexto diferido es un hilo).
++#define TRIPLE_SNIFF_MAX 8
++static thread_local ID3D11Resource *tls_sniff_res[TRIPLE_SNIFF_MAX];
++static thread_local void *tls_sniff_ptr[TRIPLE_SNIFF_MAX];
++static thread_local UINT tls_sniff_size[TRIPLE_SNIFF_MAX];
++static thread_local UINT tls_sniff_bind[TRIPLE_SNIFF_MAX];
++static thread_local int tls_sniff_n = 0;
++
++static bool triple_buffer_desc(ID3D11Resource *res, D3D11_BUFFER_DESC *out)
++{
++	if (!res)
++		return false;
++	D3D11_RESOURCE_DIMENSION dim;
++	res->GetType(&dim);
++	if (dim != D3D11_RESOURCE_DIMENSION_BUFFER)
++		return false;
++	ID3D11Buffer *buf = NULL;
++	if (FAILED(res->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buf)) || !buf)
++		return false;
++	buf->GetDesc(out);
++	buf->Release();
++	return true;
++}
++
++// ===== v1.63: MEDICION M1 — ¿el gate del pasto es el rasterizador o el PS? ====
++//
++// El pasto se siembra con: VS scatter 3518fc8325dc58fb (proyecta con cb3[9..12])
++// + PS a8b1f59dc16a9a33 (testea contra cb0[19..22]). El corte a ±75° puede venir
++// de cualquiera de los dos, y ambos dan el mismo angulo si las dos matrices son
++// mono. Para elegir el fix hay que saber el fovH de CADA una.
++//
++// Se sombrea el buffer bindeado en VS slot 3 y PS slot 0, se snapshotea el
++// contenido de los constant buffers en Unmap/UpdateSubresource, y en el draw de
++// la siembra se vuelca m00/m11 -> fovH/fovV de ambas. SOLO LECTURA.
++//
++// Del descriptor de camara del juego sabemos: m00=0.265 -> fovH=150.3,
++// m11=1.428 -> fovV=70. Si el cb3 del scatter da ~150 -> gate = rasterizador
++// (hay que ensanchar la siembra). Si da mas ancho -> gate = PS.
++
++#include <math.h>
++
++// v1.70: f[256] (antes 128) para que quepa cb5=ShadowParameters (232 floats,
++// 928 bytes) y poder medir las cascadas de sombra.
++struct CBSnap { ID3D11Resource *buf; float f[256]; UINT n; };
++#define CB_SNAP_MAX 96
++static CBSnap g_cb_snap[CB_SNAP_MAX];
++static volatile LONG g_cb_snap_lock = 0;
++static int g_cb_snap_next = 0;
++
++static void cb_snap_store(ID3D11Resource *buf, const void *data, UINT bytes)
++{
++	return;	// v1.74 LIMPIEZA: snapshots de cbuffer solo servian a las mediciones
++			// (ya removidas). Neutralizado. El resto queda como codigo muerto.
++	if (!buf || !data)
++		return;
++	UINT n = bytes / 4;
++	if (n > 256) n = 256;	// v1.70: cabe cb5 (232 floats)
++	while (InterlockedCompareExchange(&g_cb_snap_lock, 1, 0) != 0)
++		YieldProcessor();
++	int slot = -1;
++	for (int i = 0; i < CB_SNAP_MAX; i++)
++		if (g_cb_snap[i].buf == buf) { slot = i; break; }
++	if (slot < 0) { slot = g_cb_snap_next; g_cb_snap_next = (g_cb_snap_next + 1) % CB_SNAP_MAX; }
++	__try {
++		memcpy(g_cb_snap[slot].f, data, n * 4);
++		g_cb_snap[slot].buf = buf;
++		g_cb_snap[slot].n = n;
++		// v1.72: cb5=ShadowParameters mide EXACTO 928 bytes (58 regs). Volcar
++		// sus cascadas AQUI mismo (una vez), apenas se sube, sin depender de que
++		// el draw del ShadowMask dispare ni de que el snapshot sobreviva. Es la
++		// medicion robusta de las cascadas de sombra.
++		if (bytes == 928) {
++			// v1.73: NO agarrar el primero (sale en ceros, sin inicializar, como
++			// paso con la tabla del pasto). Volcar solo cuando tenga datos REALES
++			// de cascada: numCascades plausible Y clip2depth[0] no todo cero.
++			const float *f = g_cb_snap[slot].f;
++			int nc = (int)f[229];
++			bool plausible = (nc >= 2 && nc <= 4) &&
++				(f[128] != 0.0f || f[132] != 0.0f || f[136] != 0.0f ||
++				 f[140] != 0.0f || f[144] != 0.0f);
++			static volatile LONG dumped = 0;
++			if (plausible && InterlockedCompareExchange(&dumped, 1, 0) == 0) {
++				LogInfo("SOMBRAMED === cb5=ShadowParameters (928 B) : %d cascadas "
++					"| config[57]={%.4f %.4f %.4f %.4f}\n",
++					nc, f[228], f[229], f[230], f[231]);
++				for (int c = 0; c < nc; c++) {
++					int fb = 128 + 16 * c;
++					LogInfo("SOMBRAMED  cascada %d clip2depth U{%.5f %.5f %.5f %.5f}"
++						" V{%.5f %.5f %.5f %.5f} | clip(near=%.2f far=%.2f) "
++						"blendDist=%.2f\n", c,
++						f[fb], f[fb + 4], f[fb + 8], f[fb + 12],
++						f[fb + 1], f[fb + 5], f[fb + 9], f[fb + 13],
++						f[192 + 4 * c], f[193 + 4 * c], f[216 + c]);
++				}
++			}
++		}
++	} __except (EXCEPTION_EXECUTE_HANDLER) {}
++	InterlockedExchange(&g_cb_snap_lock, 0);
++}
++
++static bool cb_snap_find(ID3D11Resource *buf, float *out, UINT need)
++{
++	if (!buf)
++		return false;
++	bool ok = false;
++	while (InterlockedCompareExchange(&g_cb_snap_lock, 1, 0) != 0)
++		YieldProcessor();
++	for (int i = 0; i < CB_SNAP_MAX; i++) {
++		if (g_cb_snap[i].buf == buf && g_cb_snap[i].n >= need) {
++			memcpy(out, g_cb_snap[i].f, need * 4);
++			ok = true;
++			break;
++		}
++	}
++	InterlockedExchange(&g_cb_snap_lock, 0);
++	return ok;
++}
++
++// Vuelca el FOV de una matriz de proyeccion column-major cuyos m00/m11 estan en
++// f[i00] y f[i11]. fovH = 2*atan(1/m00), fovV = 2*atan(1/m11).
++static void medir_fov(const char *quien, const float *f, int i00, int i11)
++{
++	float m00 = f[i00], m11 = f[i11];
++	float fovH = (m00 > 1e-4f) ? 2.0f * atanf(1.0f / m00) * 57.29578f : -1.0f;
++	float fovV = (m11 > 1e-4f) ? 2.0f * atanf(1.0f / m11) * 57.29578f : -1.0f;
++	LogInfo("CULLMED   %s: m00=%.5f m11=%.5f -> fovH=%.2f fovV=%.2f "
++		"| matriz[%d..%d]={%.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f}\n",
++		quien, m00, m11, fovH, fovV, i00, i11 + 3,
++		f[i00], f[i00 + 1], f[i00 + 2], f[i00 + 3],
++		f[i11 - 1], f[i11], f[i11 + 1], f[i11 + 2]);
++}
++
++// Llamado desde los draws: si el VS actual es el scatter del pasto, vuelca una
++// vez el fovH del cb3 (VS) y del cb0 (PS). Eso zanja rasterizador-vs-PS.
++static void triple_medir_scatter(UINT64 vs_hash)
++{
++	if (vs_hash != 0x3518fc8325dc58fbULL)
++		return;
++	static volatile LONG veces = 0;
++	if (InterlockedIncrement(&veces) > 3)
++		return;
++
++	LogInfo("CULLMED === draw de siembra del pasto (scatter VS 3518fc8) ===\n");
++	float f[128];
++	// cb3[9..12]: m00 = cb3[9].x = float 36 ; m11 = cb3[10].y = float 41
++	if (cb_snap_find(tls_vs_cb3, f, 52))
++		medir_fov("VS cb3[9..12] (proyeccion de siembra)", f, 36, 41);
++	else
++		LogInfo("CULLMED   VS cb3 no capturado (buf=%p). Se actualiza por otra "
++			"via?\n", (void *)tls_vs_cb3);
++	// cb0[19..22]: m00 = cb0[19].x = float 76 ; m11 = cb0[20].y = float 81
++	if (cb_snap_find(tls_ps_cb0, f, 92))
++		medir_fov("PS cb0[19..22] (test de frustum del PS)", f, 76, 81);
++	else
++		LogInfo("CULLMED   PS cb0 no capturado (buf=%p).\n", (void *)tls_ps_cb0);
++	LogInfo("CULLMED   ref camara mono del juego: fovH=150.31 fovV=70.00. "
++		"Si el VS cb3 da ~150 -> gate = RASTERIZADOR (ensanchar siembra); "
++		"si da mas ancho -> gate = PS.\n");
++}
++
++// ===== v1.70: MEDICION de las cascadas de sombra (cb5=ShadowParameters) =======
++//
++// Las sombras desaparecen en los laterales a distancia porque las CASCADAS de
++// sombra estan ajustadas al frustum mono ±75°: mas alla, ninguna cascada cubre
++// el pixel -> salida=1=sin sombra. El ajuste vive en cb5 (slot b5, 928 bytes =
++// 232 floats): clip2depth[c] (regs 32+4c..35+4c = floats 128+16c..) codifica la
++// caja XY de cada cascada; numCascades=(int)f[229]; splits de profundidad en
++// f[192+4c]/f[193+4c]; umbral de distancia (blend) en f[216+c].
++//
++// Esta medicion SOLO VUELCA los datos crudos de cada cascada (una vez por
++// shader) para calcular offline exactamente cuanto y cual ensanchar. NO
++// modifica nada. SEH, sin objetos C++, imposible de crashear.
++
++static bool ps_es_shadowmask(UINT64 h)
++{
++	// 8 hashes (se quito a006a3e7a8141b30: es TDepthBufferMinMax, no ShadowMask).
++	static const UINT64 H[8] = {
++		0xf73d7cade6a47680ULL, 0xf9651d4a758602bbULL, 0x04993ade0791e26eULL,
++		0x26ff02d2e14c5266ULL, 0x0b28e88c06b5ca31ULL, 0xbfb33192c8120414ULL,
++		0x9cca7d03aa24d9f2ULL, 0xb64fa09f1ee479bbULL };
++	for (int i = 0; i < 8; i++)
++		if (H[i] == h)
++			return true;
++	return false;
++}
++
++static void triple_medir_sombras(UINT64 ps)
++{
++	if (!ps_es_shadowmask(ps))
++		return;
++	// one-shot POR HASH (el mod redibuja cada ShadowMask 3x por region; un tope
++	// global se lo comeria el primer shader).
++	static UINT64 vistos[16];
++	static int nv = 0;
++	static volatile LONG lk = 0;
++	bool nuevo = false;
++	while (InterlockedCompareExchange(&lk, 1, 0) != 0)
++		YieldProcessor();
++	bool seen = false;
++	for (int i = 0; i < nv; i++)
++		if (vistos[i] == ps) { seen = true; break; }
++	if (!seen && nv < 16) { vistos[nv++] = ps; nuevo = true; }
++	InterlockedExchange(&lk, 0);
++	if (!nuevo)
++		return;
++
++	float f[256];
++	if (!cb_snap_find(tls_ps_cb5, f, 232)) {
++		LogInfo("SOMBRAMED PS %016llX: cb5 no capturado (buf=%p)\n",
++			(unsigned long long)ps, (void *)tls_ps_cb5);
++		return;
++	}
++	__try {
++		int nc = (int)f[229];
++		if (nc < 1 || nc > 4)
++			nc = 4;
++		LogInfo("SOMBRAMED === PS %016llX : %d cascadas | config[57]="
++			"{%.4f %.4f %.4f %.4f}\n", (unsigned long long)ps, nc,
++			f[228], f[229], f[230], f[231]);
++		for (int c = 0; c < nc; c++) {
++			int fb = 128 + 16 * c;
++			// clip2depth[c]: columna U (out.x) = f[fb],f[fb+4],f[fb+8],f[fb+12];
++			// columna V (out.y) = f[fb+1],f[fb+5],f[fb+9],f[fb+13].
++			LogInfo("SOMBRAMED  cascada %d clip2depth U{%.5f %.5f %.5f %.5f} "
++				"V{%.5f %.5f %.5f %.5f} | clip(near=%.2f far=%.2f) blendDist=%.2f\n",
++				c, f[fb], f[fb + 4], f[fb + 8], f[fb + 12],
++				f[fb + 1], f[fb + 5], f[fb + 9], f[fb + 13],
++				f[192 + 4 * c], f[193 + 4 * c], f[216 + c]);
++		}
++	} __except (EXCEPTION_EXECUTE_HANDLER) {}
++}
++
++// ===== v1.71: MEDICION del pipeline del pasto — ¿por que los BLOQUES? =========
++//
++// Tras parchear el PS, el pasto se extiende a los lados pero por BLOQUES. Dos
++// causas posibles, con fix distinto:
++//  A) el instance buffer se DESBORDA (mas candidatos que capacidad) -> se cortan
++//     por tope; se veria: candidatos >> capacidad.
++//  B) el juego solo GENERA candidatos en ciertas zonas (seleccion CPU de tiles)
++//     -> se veria: candidatos MUCHO menos que la capacidad, y no crecen al abrir.
++// El scatter VS 3518fc8 se dibuja DIRECTO: su vertexCount = cantidad de
++// candidatos generados ese frame. Comparado con la capacidad del instance
++// buffer (g_gc_instances_res) distingue A de B. SOLO LECTURA.
++static void triple_medir_pasto_scatter(UINT64 vs, UINT total_candidatos)
++{
++	if (vs != 0x3518fc8325dc58fbULL)
++		return;
++	static volatile LONG v = 0;
++	LONG n = InterlockedIncrement(&v);
++	if (n > 6)
++		return;
++	UINT cap = 0, capbytes = 0;
++	if (g_gc_instances_res) {
++		D3D11_BUFFER_DESC bd;
++		if (triple_buffer_desc(g_gc_instances_res, &bd) && bd.StructureByteStride) {
++			cap = bd.ByteWidth / bd.StructureByteStride;
++			capbytes = bd.ByteWidth;
++		}
++	}
++	LogInfo("PASTOMED scatter #%d: candidatos=%u | instance buffer=%u instancias "
++		"(%u bytes) | %s\n", (int)n, total_candidatos, cap, capbytes,
++		(cap && total_candidatos > cap) ? "CANDIDATOS > CAPACIDAD -> se desborda (caso A)"
++		: (cap ? "cabe -> los bloques NO son desborde (caso B: generacion por zona)"
++		       : "capacidad desconocida"));
++}
++
++static bool triple_is_camera_cb_candidate(ID3D11Resource *res, UINT *out_size)
++{
++	D3D11_BUFFER_DESC d;
++	if (!triple_buffer_desc(res, &d))
++		return false;
++	if (!(d.BindFlags & D3D11_BIND_CONSTANT_BUFFER))
++		return false;
++	if (d.ByteWidth < 256 || d.ByteWidth > 320)
++		return false;
++	*out_size = d.ByteWidth;
++	return true;
++}
++
+ STDMETHODIMP HackerContext::Map(THIS_
+ 	/* [annotation] */
+ 	__in  ID3D11Resource *pResource,
+@@ -1307,6 +1885,116 @@ STDMETHODIMP HackerContext::Map(THIS_
+ 
+ 	TrackAndDivertMap(hr, pResource, Subresource, MapType, MapFlags, pMappedResource);
+ 
++	if (SUCCEEDED(hr) && pMappedResource && pMappedResource->pData &&
++	    (MapType == D3D11_MAP_WRITE_DISCARD || MapType == D3D11_MAP_WRITE)) {
++		UINT sz = 0;
++		if (triple_is_camera_cb_candidate(pResource, &sz)) {
++			tls_triple_map_res = pResource;
++			tls_triple_map_ptr = pMappedResource->pData;
++			tls_triple_map_size = sz;
++		}
++		// v1.47: identificar el buffer de instancias del pasto por su FIRMA, no
++		// por quien lo bindea. El VS del pasto lo declara como
++		// `dcl_resource_structured t1, 112`: un structured buffer de stride 112
++		// es rarisimo y no hace falta nada mas para reconocerlo.
++		//
++		// El intento anterior (recordar el t1 del VS y esperar al draw) nunca
++		// llego a identificarlo: entre el binding y el draw hay decenas de
++		// otros draws que pisan el slot, asi que el estado trackeado ya no era
++		// el del pasto. La firma por stride no depende del orden de nada.
++		// v1.48: si el handler pidio pasar a la fase 2, este es el lugar seguro
++		// para re-armar (fuera del manejador de excepciones).
++		bp_repostear_si_toca();
++
++		// Censo de structured buffers mapeados: si el del pasto no aparece,
++		// esto dice que SI se sube y con que forma. Sin esto, un silencio no
++		// distingue "no se mapea" de "no lo estoy mirando bien".
++		{
++			D3D11_BUFFER_DESC cd;
++			if (triple_buffer_desc(pResource, &cd) && cd.StructureByteStride) {
++				static UINT vistos[48];
++				static int nv = 0;
++				static volatile LONG lk = 0;
++				while (InterlockedCompareExchange(&lk, 1, 0) != 0)
++					YieldProcessor();
++				bool nuevo = true;
++				for (int i = 0; i < nv; i++)
++					if (vistos[i] == cd.StructureByteStride) { nuevo = false; break; }
++				if (nuevo && nv < 48) {
++					vistos[nv++] = cd.StructureByteStride;
++					LogInfo("CULLBP censo: structured buffer mapeado stride=%u "
++						"(%u bytes, %u elementos)\n", cd.StructureByteStride,
++						cd.ByteWidth, cd.ByteWidth / cd.StructureByteStride);
++				}
++				InterlockedExchange(&lk, 0);
++			}
++		}
++
++		// v1.54: la tabla de mallas del pasto, si es esta.
++		if (pResource && pResource == g_gc_meshinfo_res) {
++			D3D11_BUFFER_DESC md;
++			if (triple_buffer_desc(pResource, &md)) {
++				tls_gc_meshinfo_ptr = pMappedResource->pData;
++				tls_gc_meshinfo_size = md.ByteWidth;
++			}
++		}
++
++		// v1.51: volcar una muestra de CADA structured buffer distinto.
++		//
++		// La v1.50 apunto solo al stride 112 (como lo declara el VS del pasto)
++		// y salio la TABLA DE TIPOS de vegetacion, no las instancias: 6 filas
++		// con cantidades (15000, 4000, 2250...) y cajas de tamano donde ancho
++		// == profundidad (7/3/7, 16/9/16). Util, pero no es lo que buscamos:
++		// hay mas de un buffer con ese stride y agarramos el primero.
++		//
++		// Asi que ahora se muestrean todos y se busca cual tiene coordenadas de
++		// mundo. Candidato fuerte del censo anterior: stride 12 (3 floats =
++		// una posicion) con 1.020.980 elementos.
++		if (pResource) {
++			D3D11_BUFFER_DESC gd;
++			if (triple_buffer_desc(pResource, &gd) && gd.StructureByteStride >= 8 &&
++			    gd.ByteWidth >= gd.StructureByteStride) {
++				static UINT vistos[64];
++				static int nv = 0;
++				static volatile LONG lk = 0;
++				bool nuevo = false;
++				// clave = stride + tamano: distingue dos buffers del mismo
++				// stride, que es exactamente lo que nos confundio en la v1.50
++				UINT clave = gd.StructureByteStride * 31 + gd.ByteWidth;
++				while (InterlockedCompareExchange(&lk, 1, 0) != 0)
++					YieldProcessor();
++				nuevo = true;
++				for (int i = 0; i < nv; i++)
++					if (vistos[i] == clave) { nuevo = false; break; }
++				if (nuevo && nv < 64)
++					vistos[nv++] = clave;
++				else
++					nuevo = false;
++				InterlockedExchange(&lk, 0);
++
++				if (nuevo) {
++					tls_triple_dump_gc = true;
++					tls_triple_dump_gc_res = pResource;
++					tls_triple_dump_gc_ptr = pMappedResource->pData;
++					tls_triple_dump_gc_size = gd.ByteWidth;
++					tls_triple_dump_gc_stride = gd.StructureByteStride;
++				}
++			}
++		}
++
++		// v1.39: apuntar cualquier buffer que por tamano pueda traer un juego
++		// de 6 planos; el escaneo real (barato, con quick-reject) va en Unmap.
++		D3D11_BUFFER_DESC bd;
++		if (tls_sniff_n < TRIPLE_SNIFF_MAX && triple_buffer_desc(pResource, &bd) &&
++		    bd.ByteWidth >= 96 && bd.ByteWidth <= 65536) {
++			tls_sniff_res[tls_sniff_n] = pResource;
++			tls_sniff_ptr[tls_sniff_n] = pMappedResource->pData;
++			tls_sniff_size[tls_sniff_n] = bd.ByteWidth;
++			tls_sniff_bind[tls_sniff_n] = bd.BindFlags;
++			tls_sniff_n++;
++		}
++	}
++
+ 	return hr;
+ }
+ 
+@@ -1316,7 +2004,104 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
+ 	/* [annotation] */
+ 	__in  UINT Subresource)
+ {
++	// v1.50: LEER el pasto en vez de perseguir a quien lo escribe.
++	//
++	// Las trampas de hardware se agotaron: la fase 1 cayo en un memcpy que
++	// copiaba ~1400 bytes (no los 7168 del pasto), y la fase 2 sobre el origen
++	// no disparo nunca. Con WRITE_DISCARD el driver recicla direcciones de un
++	// pool, asi que una trampa fija atrapa a cualquier buffer que caiga ahi:
++	// ese hit probablemente no era del pasto.
++	//
++	// Esto es directo: el buffer mapeado TIENE las instancias que el juego
++	// decidio dibujar. Volcarlas y compararlas con la posicion del coche
++	// responde la pregunta de fondo —¿que criterio las descarta?— sin depender
++	// de atrapar a nadie. Una sola vez por sesion.
++	// v1.54: LA TABLA DE MALLAS del pasto, como ENTEROS (verla como float no
++	// dice nada: son indices y cantidades). Si sus campos cambian entre frames,
++	// esta tabla ES el culling — y se reescribe facil.
++	if (tls_gc_meshinfo_ptr && pResource == g_gc_meshinfo_res) {
++		const unsigned *u = (const unsigned *)tls_gc_meshinfo_ptr;
++		unsigned n = tls_gc_meshinfo_size / 16;
++		tls_gc_meshinfo_ptr = NULL;
++		static volatile LONG veces = 0;
++		LONG v = InterlockedIncrement(&veces);
++		if (v <= 6) {
++			char linea[512];
++			int p = _snprintf_s(linea, sizeof(linea), _TRUNCATE,
++				"GCMESH #%d (%u mallas):", (int)v, n);
++			for (unsigned i = 0; i < n && i < 8; i++)
++				p += _snprintf_s(linea + p, sizeof(linea) - p, _TRUNCATE,
++					" [%u: cnt=%u off=%u max=%u]", i,
++					u[i * 4], u[i * 4 + 1], u[i * 4 + 2]);
++			LogInfo("%s\n", linea);
++		}
++	}
++
++	if (tls_triple_dump_gc && pResource == tls_triple_dump_gc_res) {
++		tls_triple_dump_gc = false;
++		const float *f = (const float *)tls_triple_dump_gc_ptr;
++		unsigned stride = tls_triple_dump_gc_stride;
++		unsigned nfloats = stride / 4;
++		if (nfloats > 28)
++			nfloats = 28;
++		unsigned n = tls_triple_dump_gc_size / stride;
++		if (n > 6)
++			n = 6;
++		float campos[3] = { 0, 0, 0 };
++		int haycam = TripleGetCameraPos(campos);
++		LogInfo("GCDUMP stride=%u (%u elementos). camara=%.2f %.2f %.2f%s\n",
++			stride, tls_triple_dump_gc_size / stride,
++			campos[0], campos[1], campos[2],
++			haycam ? "" : " (sin camara aun)");
++		char linea[600];
++		for (unsigned i = 0; i < n; i++) {
++			const float *v = f + (size_t)i * (stride / 4);
++			int p = _snprintf_s(linea, sizeof(linea), _TRUNCATE,
++				"GCDUMP  s%u[%02u]", stride, i);
++			for (unsigned k = 0; k < nfloats; k++) {
++				float x = v[k];
++				if (x > -1e9f && x < 1e9f)
++					p += _snprintf_s(linea + p, sizeof(linea) - p, _TRUNCATE,
++						" %.2f", x);
++				else
++					p += _snprintf_s(linea + p, sizeof(linea) - p, _TRUNCATE,
++						" 0x%08X", *(const unsigned *)&x);
++			}
++			LogInfo("%s\n", linea);
++		}
++	}
++
++	// v1.39: escanear (y con el bit 4 de $cull_widen, parchear) los buffers
++	// apuntados en Map, ANTES del divert y del Unmap real: el puntero sigue
++	// vivo y la GPU todavia no vio los datos.
++	if (tls_sniff_n > 0) {
++		for (int i = 0; i < tls_sniff_n; i++) {
++			if (tls_sniff_res[i] == pResource) {
++				TripleScanPlanesInCB(tls_sniff_ptr[i], tls_sniff_size[i],
++					(void *)pResource, tls_sniff_bind[i], 1);
++				// v1.63 M1: snapshot del contenido si es constant buffer, para
++				// leer el fovH de cb3/cb0 en el draw de la siembra.
++				if (tls_sniff_bind[i] & D3D11_BIND_CONSTANT_BUFFER)
++					cb_snap_store(pResource, tls_sniff_ptr[i], tls_sniff_size[i]);
++				tls_sniff_n--;
++				tls_sniff_res[i] = tls_sniff_res[tls_sniff_n];
++				tls_sniff_ptr[i] = tls_sniff_ptr[tls_sniff_n];
++				tls_sniff_size[i] = tls_sniff_size[tls_sniff_n];
++				tls_sniff_bind[i] = tls_sniff_bind[tls_sniff_n];
++				break;
++			}
++		}
++	}
++
+ 	TrackAndDivertUnmap(pResource, Subresource);
++
++	// Triple-monitor: snoop the camera cb the game just wrote (see Map above).
++	if (pResource == tls_triple_map_res && tls_triple_map_ptr) {
++		TripleCaptureCameraCB(tls_triple_map_ptr, tls_triple_map_size);
++		tls_triple_map_res = NULL;
++		tls_triple_map_ptr = NULL;
++	}
++
+ 	mOrigContext1->Unmap(pResource, Subresource);
+ }
+ 
+@@ -1328,6 +2113,14 @@ STDMETHODIMP_(void) HackerContext::PSSetConstantBuffers(THIS_
+ 	/* [annotation] */
+ 	__in_ecount(NumBuffers) ID3D11Buffer *const *ppConstantBuffers)
+ {
++	// v1.63 M1: sombrear el buffer del PS slot 0 (cb0/$Globals). Se usa para
++	// medir el fovH del test de frustum del PS de siembra del pasto.
++	if (ppConstantBuffers && StartSlot == 0 && NumBuffers > 0)
++		tls_ps_cb0 = ppConstantBuffers[0];
++	// v1.70: slot 5 = cb5=ShadowParameters (cascadas de sombra).
++	if (ppConstantBuffers && StartSlot <= 5 && StartSlot + NumBuffers > 5)
++		tls_ps_cb5 = ppConstantBuffers[5 - StartSlot];
++
+ 	 mOrigContext1->PSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+ }
+ 
+@@ -1551,6 +2344,176 @@ void HackerContext::AfterDispatch(DispatchContext *context)
+ 		RunCommandList(mHackerDevice, this, context->post_commands, &context->call_info, true);
+ }
+ 
++// v1.42: censo de compute shaders. Abrir el frustum trajo objetos pero NO el
++// pasto, y ningun otro juego de planos en memoria esta vivo: queda un filtro
++// aguas abajo del frustum. El exe nombra sus etapas —HZBOcclusionGenerateHZB,
++// HZBOcclusionProcessQueries, "%5.1f%% of scene visible"— asi que el culling
++// por oclusion existe y corre en compute. Este censo lista cada CS distinto con
++// su hash y sus thread groups; el generador de la piramide HZB se delata solo
++// (serie de dispatches que se van reduciendo a la mitad). Con el hash, apagarlo
++// es una seccion [ShaderOverride] en el ini, sin tocar C++.
++// v1.53: los 9 vertex shaders cuyo volcado menciona clutter/grass. El pasto no
++// siempre usa el mismo (varia por tipo de vegetacion y por pista), asi que
++// apuntar a uno solo —como hacia la v1.52— deja el volcado sin disparar.
++static bool es_vs_clutter(UINT64 h)
++{
++	static const UINT64 lista[] = {
++		0xe607507692aaa09eULL, 0x1b9c62ffa1f4c6bbULL, 0xf0ad90fed798641bULL,
++		0xabfaf1657f01416cULL, 0x62ee9bd9071402e5ULL, 0xa36e45bb333b43e9ULL,
++		0xb70e609a4e36aca0ULL, 0xf5ebad284a8bd772ULL, 0x51c4c0874c6cda5bULL,
++	};
++	for (int i = 0; i < 9; i++)
++		if (lista[i] == h)
++			return true;
++	return false;
++}
++
++// Vuelca los recursos que el draw del pasto tiene en la mano. El structured
++// buffer con stride 112 es g_gcInstanceBuffer (las instancias); el de stride 16
++// es g_gcMeshNumIndicesBuffer, cuyos campos {elementCount, instanceOffset,
++// maxInstances} definen QUE RANGO se dibuja — el filtro que buscamos.
++static void triple_volcar_srv_clutter(UINT64 vs_hash)
++{
++	if (!es_vs_clutter(vs_hash))
++		return;
++	static volatile LONG hechos = 0;
++	if (InterlockedIncrement(&hechos) > 3)
++		return;
++	LogInfo("GCSRV: === recursos del draw de CLUTTER vs=%016llX ===\n", vs_hash);
++	for (int s = 0; s < 8; s++) {
++		if (!tls_vs_srv[s]) {
++			LogInfo("GCSRV  t%d = (vacio)\n", s);
++			continue;
++		}
++		D3D11_BUFFER_DESC bd;
++		if (triple_buffer_desc(tls_vs_srv[s], &bd)) {
++			LogInfo("GCSRV  t%d = %p buffer stride=%u bytes=%u (%u elementos)\n",
++				s, (void *)tls_vs_srv[s], bd.StructureByteStride, bd.ByteWidth,
++				bd.StructureByteStride ? bd.ByteWidth / bd.StructureByteStride : 0);
++			if (!g_gc_instances_res && bd.StructureByteStride == 112)
++				g_gc_instances_res = tls_vs_srv[s];
++			// v1.54: t0 (stride 16) es g_gcMeshNumIndicesBuffer. Sus campos
++			// {elementCount, instanceOffset, maxInstances} deciden QUE TRAMO
++			// del millon de instancias se dibuja. Si eso cambia por frame,
++			// AHI esta el culling del pasto — y es un buffer de 128 bytes que
++			// podemos reescribir en el Unmap.
++			if (!g_gc_meshinfo_res && bd.StructureByteStride == 16 &&
++			    bd.ByteWidth <= 4096)
++				g_gc_meshinfo_res = tls_vs_srv[s];
++		} else {
++			LogInfo("GCSRV  t%d = %p (no es buffer: textura)\n",
++				s, (void *)tls_vs_srv[s]);
++		}
++	}
++}
++
++// ===== v1.57: dibujar los TRAMOS de pasto que el juego se saltea ============
++//
++// Estado del caso: el buffer de instancias es estatico y tiene el pasto de toda
++// la pista (118.536 matas). El juego emite un draw indirecto por cada tramo que
++// quiere dibujar; cada tramo son 5 uints (20 bytes) dentro del buffer de
++// argumentos que arma el CS 15bb7321c81952a4 (8 grupos x 32 hilos = hasta 256
++// tramos).
++//
++// Probado y descartado: subir el CONTEO. Duplicarlo trajo matas de otras zonas
++// —flotando, sobre la pista, hasta en el garage— pero **la linea de corte
++// lateral quedo intacta**. O sea que las matas laterales no estan a
++// continuacion del tramo que se dibuja: viven en OTRO tramo, uno que el juego
++// decidio no emitir.
++//
++// Asi que en vez de pedir mas cantidad, se repite el draw apuntando a los otros
++// tramos del mismo buffer de argumentos. Si el pasto lateral existe en alguno,
++// aparece. Controlado por $gc_tramos (tecla F2): 0 = off.
++static thread_local int tls_gc_repitiendo = 0;
++
++static void triple_gc_repetir_tramos(HackerContext *ctx, ID3D11Buffer *args,
++	UINT offset, UINT64 vs_hash, bool indexado)
++{
++	if (tls_gc_repitiendo || !es_vs_clutter(vs_hash) || !args)
++		return;
++
++	static CommandListVariable *var = NULL;
++	static volatile LONG init = 0;
++	if (!init) {
++		auto it = command_list_globals.find(L"$gc_tramos");
++		if (it != command_list_globals.end())
++			var = &it->second;
++		InterlockedExchange(&init, 1);
++	}
++	int n = var ? (int)var->fval : 0;
++	if (n <= 0)
++		return;
++	if (n > 64)
++		n = 64;
++
++	// Reentra por el WRAPPER (no por mOrigContext1) a proposito: asi cada draw
++	// extra pasa por la maquinaria del triple y se redibuja por region. Yendo
++	// directo al contexto original apareceria solo con la proyeccion del juego,
++	// que es justo el bug que estamos tratando de compensar.
++	tls_gc_repitiendo = 1;
++	for (int k = 1; k <= n; k++) {
++		UINT off = offset + (UINT)k * 20;
++		if (indexado)
++			ctx->DrawIndexedInstancedIndirect(args, off);
++		else
++			ctx->DrawInstancedIndirect(args, off);
++	}
++	tls_gc_repitiendo = 0;
++}
++
++static void triple_censo_draw_indirecto(UINT64 vs_hash)
++{
++	static UINT64 vistos[32];
++	static int n = 0;
++	static volatile LONG lock = 0;
++	while (InterlockedCompareExchange(&lock, 1, 0) != 0)
++		YieldProcessor();
++	for (int i = 0; i < n; i++) {
++		if (vistos[i] == vs_hash) {
++			InterlockedExchange(&lock, 0);
++			return;
++		}
++	}
++	if (n < 32) {
++		vistos[n++] = vs_hash;
++		LogInfo("CSCENSO: draw INDIRECTO con vs=%016llX (geometria generada en "
++			"GPU: el conteo de instancias lo decide un compute shader)\n",
++			vs_hash);
++	}
++	InterlockedExchange(&lock, 0);
++}
++
++static void triple_censo_cs(UINT64 hash, UINT x, UINT y, UINT z)
++{
++	if (!hash)
++		return;
++	static UINT64 vistos[64];
++	static UINT conteo[64];
++	static int n = 0;
++	static volatile LONG lock = 0;
++
++	while (InterlockedCompareExchange(&lock, 1, 0) != 0)
++		YieldProcessor();
++	for (int i = 0; i < n; i++) {
++		if (vistos[i] == hash) {
++			// relogear cada 600 dispatches para ver como varian los grupos
++			if (++conteo[i] % 600 == 0)
++				LogInfo("CSCENSO: %016llX otra vez, grupos=%ux%ux%u (n=%u)\n",
++					hash, x, y, z, conteo[i]);
++			InterlockedExchange(&lock, 0);
++			return;
++		}
++	}
++	if (n < 64) {
++		vistos[n] = hash;
++		conteo[n] = 1;
++		n++;
++		LogInfo("CSCENSO: compute shader NUEVO %016llX grupos=%ux%ux%u\n",
++			hash, x, y, z);
++	}
++	InterlockedExchange(&lock, 0);
++}
++
+ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
+ 	/* [annotation] */
+ 	__in  UINT ThreadGroupCountX,
+@@ -1561,6 +2524,22 @@ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
+ {
+ 	DispatchContext context{ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
+ 
++
++	// v1.44: 15bb7321c81952a4 es el CS que arma el draw indirecto del pasto.
++	// Su t1 es g_gcMeshCountsBuffer: el conteo que dejo el culler. Guardamos su
++	// identidad para reconocerlo cuando la CPU lo mapee.
++	if (mCurrentComputeShader == 0x15bb7321c81952a4ULL && tls_cs_srv[1] &&
++	    !g_gc_counts_res) {
++		g_gc_counts_res = tls_cs_srv[1];
++		LogInfo("CULLBP: identificado g_gcMeshCountsBuffer = %p (t1 del CS del "
++			"pasto).\n", (void *)g_gc_counts_res);
++	}
++
++	// v1.45: si el contador esta bindeado como UAV, ESTE dispatch lo escribe:
++	// es el culler del pasto que veniamos buscando.
++	if (tls_gc_counts_uav_slot >= 0)
++		gc_reportar("un COMPUTE SHADER (UAV)", mCurrentComputeShader);
++
+ 	if (BeforeDispatch(&context))
+ 		mOrigContext1->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+ 	else
+@@ -1577,6 +2556,8 @@ STDMETHODIMP_(void) HackerContext::DispatchIndirect(THIS_
+ {
+ 	DispatchContext context{&pBufferForArgs, AlignedByteOffsetForArgs};
+ 
++	// indirecto: los grupos los decide la GPU, se marcan con 0 para distinguirlo
++
+ 	if (BeforeDispatch(&context))
+ 		mOrigContext1->DispatchIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
+ 	else
+@@ -1607,6 +2588,19 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
+ 	/* [annotation] */
+ 	__in_ecount_opt(NumRects)  const D3D11_RECT *pRects)
+ {
++	// TRIPLE v1.26: SHADOW-TRACKING de los scissor rects del JUEGO.
++	// Los Get* son ilegales/no fiables en contextos diferidos (leccion v1.5b),
++	// asi que para poder RESTAURAR el rect del juego tras nuestros 3 redibujos
++	// lo registramos aca, al pasar. Sin esto, los paneles de la UI que confian
++	// en un rect que setearon antes (listas de menus, recortes de paneles) se
++	// recortaban con nuestro rect neutro de 16384 -> menus rotos.
++	if (pRects && NumRects <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
++		memcpy(mTripleScissorShadow, pRects, NumRects * sizeof(D3D11_RECT));
++		mTripleScissorShadowCount = NumRects;
++	} else {
++		mTripleScissorShadowCount = 0;
++	}
++
+ 	 mOrigContext1->RSSetScissorRects(NumRects, pRects);
+ }
+ 
+@@ -1681,6 +2675,9 @@ STDMETHODIMP_(void) HackerContext::CopySubresourceRegion(THIS_
+ 	D3D11_BOX replaceSrcBox;
+ 	UINT replaceDstX = DstX;
+ 
++	if (pDstResource && (pDstResource == g_gc_counts_res || pDstResource == g_gc_instances_res))
++		gc_reportar("CopySubresourceRegion", 0);
++
+ 	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
+ 		MarkResourceHashContaminated(pDstResource, DstSubresource, pSrcResource, SrcSubresource, 'S', DstX, DstY, DstZ, pSrcBox);
+ 	}
+@@ -1707,6 +2704,9 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
+ 	/* [annotation] */
+ 	__in  ID3D11Resource *pSrcResource)
+ {
++	if (pDstResource && (pDstResource == g_gc_counts_res || pDstResource == g_gc_instances_res))
++		gc_reportar("CopyResource desde otro buffer", 0);
++
+ 	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
+ 		MarkResourceHashContaminated(pDstResource, 0, pSrcResource, 0, 'C', 0, 0, 0, NULL);
+ 	}
+@@ -1735,9 +2735,54 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
+ 		MarkResourceHashContaminated(pDstResource, DstSubresource, NULL, 0, 'U', 0, 0, 0, NULL);
+ 	}
+ 
+-	 mOrigContext1->UpdateSubresource(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch,
++	// v1.39: los planos de culling tambien pueden subir por aca. Deteccion
++	// barata sobre los datos del juego; solo si aparecen planos Y el parcheo
++	// esta pedido (bit 4 de $cull_widen) se copia y se reenvia lo nuestro.
++	// v1.44/46: los buffers del pasto tambien pueden subir por aca. En ese caso
++	// pSrcData es memoria PROPIA del juego —donde el culler escribio— y es
++	// mejor objetivo que un buffer mapeado: persiste entre frames.
++	if (pDstResource && g_bp_estado == 0 && pSrcData) {
++		D3D11_BUFFER_DESC gd;
++		if (triple_buffer_desc(pDstResource, &gd) &&
++		    (gd.StructureByteStride == 112 || pDstResource == g_gc_counts_res)) {
++			if (gd.StructureByteStride == 112 && !g_gc_instances_res)
++				g_gc_instances_res = pDstResource;
++			LogInfo("CULLBP: UpdateSubresource sobre el buffer del pasto "
++				"(stride=%u, %u bytes) -> trampa en la memoria FUENTE %p "
++				"(persiste entre frames)\n", gd.StructureByteStride,
++				gd.ByteWidth, (void *)pSrcData);
++			bp_intentar((void *)pSrcData);
++		}
++	}
++
++	const void *triple_src = pSrcData;
++	void *triple_tmp = NULL;
++	if (pSrcData && !pDstBox) {
++		D3D11_BUFFER_DESC bd;
++		if (triple_buffer_desc(pDstResource, &bd) &&
++		    bd.ByteWidth >= 96 && bd.ByteWidth <= 65536) {
++			// v1.63 M1: snapshot de constant buffers actualizados por esta via.
++			if (bd.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
++				cb_snap_store(pDstResource, pSrcData, bd.ByteWidth);
++			if (TripleScanPlanesInCB((void *)pSrcData, bd.ByteWidth,
++					(void *)pDstResource, bd.BindFlags, 0) == 1) {
++				triple_tmp = malloc(bd.ByteWidth);
++				if (triple_tmp) {
++					memcpy(triple_tmp, pSrcData, bd.ByteWidth);
++					if (TripleScanPlanesInCB(triple_tmp, bd.ByteWidth,
++							(void *)pDstResource, bd.BindFlags, 1) == 2)
++						triple_src = triple_tmp;
++				}
++			}
++		}
++	}
++
++	 mOrigContext1->UpdateSubresource(pDstResource, DstSubresource, pDstBox, triple_src, SrcRowPitch,
+ 		SrcDepthPitch);
+ 
++	if (triple_tmp)
++		free(triple_tmp);
++
+ 	// We only update the destination resource hash when the entire
+ 	// subresource 0 is updated and pDstBox is NULL. We could check if the
+ 	// pDstBox fills the entire resource, but if the game is using pDstBox
+@@ -1756,6 +2801,14 @@ STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
+ 	/* [annotation] */
+ 	__in  ID3D11UnorderedAccessView *pSrcView)
+ {
++	// v1.45: CopyStructureCount es LA via clasica para publicar "cuantos
++	// elementos agrego un append buffer". Si el destino es el contador del
++	// pasto, el culling es un append en GPU y el productor es el CS que tenia
++	// ese UAV bindeado.
++	if (pDstBuffer && ((ID3D11Resource *)pDstBuffer == g_gc_counts_res ||
++	                   (ID3D11Resource *)pDstBuffer == g_gc_instances_res))
++		gc_reportar("CopyStructureCount (append buffer en GPU)", 0);
++
+ 	 mOrigContext1->CopyStructureCount(pDstBuffer, DstAlignedByteOffset, pSrcView);
+ }
+ 
+@@ -1849,6 +2902,8 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
+ 		// need to rebind the 3DMigoto resources now. See also
+ 		// FinishCommandList's RestoreDeferredContextState:
+ 		Bind3DMigotoResources();
++		// TRIPLE: y el estado por defecto tampoco tiene scissor rects.
++		mTripleScissorShadowCount = 0;
+ 	}
+ }
+ 
+@@ -1956,6 +3011,23 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
+ 	/* [annotation] */
+ 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
+ {
++	// v1.44: recordar que recursos van a los slots t0/t1 del compute. En el
++	// Dispatch del shader del pasto esos dos son g_gcMeshNumIndicesBuffer y
++	// g_gcMeshCountsBuffer — y el segundo ES el resultado del culling. Se
++	// trackea aca en vez de leerlo con CSGetShaderResources porque los Get* no
++	// son fiables en contextos diferidos (regla 3 de CLAUDE.md).
++	for (UINT i = 0; i < NumViews && i < 2; i++) {
++		UINT slot = StartSlot + i;
++		if (slot > 1 || !ppShaderResourceViews)
++			continue;
++		ID3D11Resource *res = NULL;
++		if (ppShaderResourceViews[i])
++			ppShaderResourceViews[i]->GetResource(&res);
++		tls_cs_srv[slot] = res;
++		if (res)
++			res->Release();	// solo guardamos el puntero como identidad
++	}
++
+ 	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+ }
+ 
+@@ -1969,6 +3041,25 @@ STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
+ 	/* [annotation] */
+ 	__in_ecount(NumUAVs)  const UINT *pUAVInitialCounts)
+ {
++	// v1.45: ¿alguien esta por ESCRIBIR el contador del pasto como UAV? Se
++	// marca por hilo y el Dispatch dice que compute shader fue. Es la via que
++	// queda: la CPU nunca lo mapea (el breakpoint de la v1.44 nunca disparo),
++	// asi que el conteo lo produce la GPU.
++	tls_gc_counts_uav_slot = -1;
++	if (ppUnorderedAccessViews && (g_gc_counts_res || g_gc_instances_res)) {
++		for (UINT i = 0; i < NumUAVs; ++i) {
++			if (!ppUnorderedAccessViews[i])
++				continue;
++			ID3D11Resource *r = NULL;
++			ppUnorderedAccessViews[i]->GetResource(&r);
++			if (r) {
++				if (r == g_gc_counts_res || r == g_gc_instances_res)
++					tls_gc_counts_uav_slot = (int)(StartSlot + i);
++				r->Release();
++			}
++		}
++	}
++
+ 	if (ppUnorderedAccessViews) {
+ 		// TODO: Record stats on unordered access view usage
+ 		for (UINT i = 0; i < NumUAVs; ++i) {
+@@ -2522,6 +3613,9 @@ STDMETHODIMP_(void) HackerContext::ClearState(THIS)
+ {
+ 	 mOrigContext1->ClearState();
+ 
++	 // TRIPLE: ClearState desbindea tambien los scissor rects del juego.
++	 mTripleScissorShadowCount = 0;
++
+ 	 // ClearState() will unbind StereoParams and IniParams, so we need to
+ 	 // rebind them now:
+ 	 Bind3DMigotoResources();
+@@ -2549,6 +3643,11 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
+ {
+ 	BOOL ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
+ 
++	// TRIPLE: al cerrar la lista, el contexto diferido vuelve al estado por
++	// defecto -> el rect del juego ya no esta puesto.
++	if (!RestoreDeferredContextState)
++		mTripleScissorShadowCount = 0;
++
+ 	if (!RestoreDeferredContextState) {
+ 		// This is equivalent to calling ClearState() afterwards, so we
+ 		// need to rebind the 3DMigoto resources now. See also
+@@ -2821,6 +3920,11 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
+ {
+ 	mOrigContext1->IASetIndexBuffer(pIndexBuffer, Format, Offset);
+ 
++	// Sin gate de hunting: se usa para identificar el auto por su malla en juego
++	// normal. El hash sale de un mapa poblado al crear el recurso, asi que esto
++	// es una busqueda y nada mas.
++	mTripleIB = pIndexBuffer ? GetResourceHash(pIndexBuffer) : 0;
++
+ 	// This is only used for index buffer hunting nowadays since the
+ 	// command list checks the hash on demand only when it is needed
+ 	mCurrentIndexBuffer = 0;
+@@ -2882,6 +3986,25 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
+ 	/* [annotation] */
+ 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
+ {
++	// v1.52: sombra de los 8 primeros slots de SRV del vertex shader. Antes se
++	// guardaba solo el slot 1 y no alcanzaba: hay varios buffers con el mismo
++	// stride, y adivinar cual es el del pasto por su contenido lleva a
++	// confundirlo con los del spline de la pista (que tambien son posiciones).
++	// Con la sombra completa, el draw del pasto dice EXACTAMENTE que usa.
++	if (ppShaderResourceViews) {
++		for (UINT i = 0; i < NumViews; i++) {
++			UINT slot = StartSlot + i;
++			if (slot >= 8)
++				break;
++			ID3D11Resource *res = NULL;
++			if (ppShaderResourceViews[i])
++				ppShaderResourceViews[i]->GetResource(&res);
++			tls_vs_srv[slot] = res;
++			if (res)
++				res->Release();
++		}
++	}
++
+ 	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+ }
+ 
+@@ -2994,6 +4117,12 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstancedIndirect(THIS_
+ 	/* [annotation] */
+ 	__in  UINT AlignedByteOffsetForArgs)
+ {
++	// v1.42: si el pasto se generara en GPU, se dibujaria por aca (el conteo de
++	// instancias lo escribe un compute shader). Censar el VS de estos draws
++	// dice si esa via existe en este juego — y si no aparece ninguno, el pasto
++	// se siembra en CPU y hay que buscar el filtro alli.
++
++
+ 	DrawContext c = DrawContext(DrawCall::DrawIndexedInstancedIndirect, 0, 0, 0, 0, 0, 0, &pBufferForArgs, AlignedByteOffsetForArgs);
+ 	BeforeDraw(c);
+ 
+@@ -3008,6 +4137,8 @@ STDMETHODIMP_(void) HackerContext::DrawInstancedIndirect(THIS_
+ 	/* [annotation] */
+ 	__in  UINT AlignedByteOffsetForArgs)
+ {
++	// v1.53: el pasto puede venir por CUALQUIERA de los dos draws indirectos.
++
+ 	DrawContext c = DrawContext(DrawCall::DrawInstancedIndirect, 0, 0, 0, 0, 0, 0, &pBufferForArgs, AlignedByteOffsetForArgs);
+ 	BeforeDraw(c);
+ 
+diff --git a/DirectX11/HackerContext.h b/DirectX11/HackerContext.h
+index 33c26e1..7ae1a9d 100644
+--- a/DirectX11/HackerContext.h
++++ b/DirectX11/HackerContext.h
+@@ -119,6 +119,11 @@ private:
+ 	// These are per-context, moved from globals.h:
+ 	uint32_t mCurrentVertexBuffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+ 	uint32_t mCurrentIndexBuffer; // Only valid while hunting=1
++	// Igual que el de arriba pero SIN depender del modo de analisis: se necesita
++	// en juego normal para identificar el auto por su malla (ver
++	// TripleTrackCarMesh en CommandList.cpp). GetResourceHash() sale de un mapa
++	// que se llena al CREAR el recurso, asi que leerlo aca no cuesta nada.
++	uint32_t mTripleIB;
+ 	std::vector<ID3D11Resource *> mCurrentRenderTargets;
+ 	ID3D11Resource *mCurrentDepthTarget;
+ 	UINT mCurrentPSUAVStartSlot;
+@@ -201,6 +206,14 @@ protected:
+ 	// until it has been further decoupled from HackerContext. Be wary of
+ 	// relying on these - they will be zero in release mode with no
+ 	// ShaderOverrides / ShaderRegex:
++public:
++	// TRIPLE: copia sombra de los scissor rects que el JUEGO seteo en este
++	// contexto (los Get* no son fiables en contextos diferidos). Publica para
++	// que TripleRegionCommand pueda restaurarlos tras los redibujos.
++	D3D11_RECT mTripleScissorShadow[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++	UINT mTripleScissorShadowCount;
++protected:
++
+ 	UINT64 mCurrentVertexShader;
+ 	UINT64 mCurrentHullShader;
+ 	UINT64 mCurrentDomainShader;
+diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
+index 2c88983..87a7e87 100644
+--- a/DirectX11/IniHandler.cpp
++++ b/DirectX11/IniHandler.cpp
+@@ -21,10 +21,8 @@
+ #include "shellscalingapi.h"
+ 
+ #include <filesystem>
+-// TODO: We probably don't need this <filesystem> header
+-// TODO: Remove this #define after we switch to C++17 and remove 'experimental'
+-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
+-#include <experimental/filesystem>
++// NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
++// The experimental namespace was unused here, so the include was dropped.
+ 
+ #define INI_FILENAME L"d3dx.ini"
+ 
+@@ -1345,7 +1343,7 @@ static void RegisterPresetKeyBindings()
+ {
+ 	KeyOverrideType type;
+ 	shared_ptr<KeyOverrideBase> preset;
+-	int delay, release_delay;
++	int delay, release_delay, repeat;
+ 	IniSections::iterator lower, upper, i;
+ 	vector<wstring> keys;
+ 	vector<wstring> back;
+@@ -1370,12 +1368,29 @@ static void RegisterPresetKeyBindings()
+ 		delay = GetIniInt(id, L"delay", 0, NULL);
+ 		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
+ 
++		// TrueTriple: auto-repeticion al mantener la tecla apretada.
++		//
++		// La infraestructura ya existia (RepeatingInputAction, con la tasa en
++		// repeticiones por segundo), pero las secciones [Key] la registraban
++		// con 0 fijo, o sea que mantener apretado hacia UN solo paso. Para un
++		// control de posicion recorrido con `type = cycle` eso obliga a elegir
++		// entre pasos finos o poder llegar lejos, porque cada paso es una
++		// pulsacion fisica.
++		//
++		// Con `repeat = N` en la seccion, mantener apretado avanza N pasos por
++		// segundo y desaparece esa disyuntiva: se puede tener grilla fina Y
++		// recorrido largo.
++		//
++		// Default 0 = comportamiento historico exacto para toda seccion que no
++		// lo pida.
++		repeat = GetIniInt(id, L"repeat", 0, NULL);
++
+ 		if (type == KeyOverrideType::CYCLE) {
+ 			shared_ptr<KeyOverrideCycle> cycle_preset = make_shared<KeyOverrideCycle>();
+ 			shared_ptr<KeyOverrideCycleBack> cycle_back = make_shared<KeyOverrideCycleBack>(cycle_preset);
+ 			preset = cycle_preset;
+ 			for (wstring key : back)
+-				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, 0, delay, release_delay);
++				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, repeat, delay, release_delay);
+ 		} else {
+ 			preset = make_shared<KeyOverride>(type);
+ 		}
+@@ -1383,7 +1398,7 @@ static void RegisterPresetKeyBindings()
+ 		preset->ParseIniSection(id);
+ 
+ 		for (wstring key : keys)
+-			RegisterKeyBinding(L"Key", key.c_str(), preset, 0, delay, release_delay);
++			RegisterKeyBinding(L"Key", key.c_str(), preset, repeat, delay, release_delay);
+ 	}
+ }
+ 
+diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
+index 994124c..3e6b6c1 100644
+--- a/DirectX11/Overlay.cpp
++++ b/DirectX11/Overlay.cpp
+@@ -16,6 +16,7 @@
+ //#include "nvapi.h"
+ #include "Globals.h"
+ #include "profiling.h"
++#include "CommandList.h"
+ 
+ #include "HackerDevice.h"
+ #include "HackerContext.h"
+@@ -776,12 +777,627 @@ static void CreateStereoInfoString(StereoHandle stereoHandle, wchar_t *info)
+ 		swprintf_s(info, maxstring, L"Stereo disabled");
+ }
+ 
++// ===========================================================================
++// MENU FLOTANTE DE TrueTriple
++//
++// Por que aca y no una ventana propia: 3Dmigoto ya trae el motor de overlay
++// (SpriteFont + SpriteBatch) y, sobre todo, ya resuelve lo unico verdaderamente
++// dificil — SaveState()/RestoreState() alrededor del dibujo. Esa es la regla 1
++// del proyecto ("el estado del pipeline es global y sobrevive al draw"), la que
++// nos mordio cinco veces. Reusarlo es gratis y ya esta probado en este juego.
++//
++// De donde sale lo que muestra:
++//   - IniParams: w3 = m11 de la camara, w7 = su near, x8 = huella del auto,
++//     y8 = "mostrar el menu" (lo publica [Present]).
++//   - command_list_globals: las variables del ini por nombre. El mod ya guarda
++//     ahi el slot activo y la postura, asi que el menu no calcula nada por su
++//     cuenta: muestra exactamente lo que el sistema esta usando.
++//
++// El menu NO tiene entrada propia todavia: las teclas siguen siendo las de
++// siempre y el panel las lista. Se dibuja centrado en el monitor del medio,
++// porque en un triple el centro de la pantalla completa es justo donde mira el
++// usuario.
++// ===========================================================================
++// TIENEN QUE COINCIDIR con tools/gen_presets_asiento.py (N_SLOTS y N_PRE). Si el
++// generador crece y esto no, el menu deja de ver los ultimos slots — y como el
++// resto sigue funcionando, el sintoma seria "un preset que guarde no aparece en
++// la lista", que es de los que cuesta atribuir. verificar_ini.py lo comprueba.
++#define TT_SLOTS   40
++#define TT_PRESETS 9
++
++static float tt_global(const wchar_t *nombre, float por_defecto)
++{
++	CommandListVariables::iterator i = command_list_globals.find(nombre);
++	if (i == command_list_globals.end())
++		return por_defecto;
++	return i->second.fval;
++}
++
++// ---------------------------------------------------------------------------
++// LOS TEXTOS DEL CARTEL SALEN DE UN ARCHIVO, NO DEL C++
++//
++// Contrato completo en docs/CONTRATO-MENU-F3.md (CERRADO). Resumen de por que:
++// el C++ no puede saber ni el idioma del usuario ni sus binds — el que arma el
++// d3dx.ini (la app, o el lanzador PS1) sabe los dos, asi que escribe
++// TrueTriple.menu.txt al lado del ini, ya traducido y con los %KEY_*% resueltos.
++// Aca solo se parsea y se resuelven los marcadores de ESTADO VIVO (%FWD%, etc).
++//
++// Formato de cada fila:  tipo|cond|color|centrado|aire|escala|texto
++// Lineas vacias y las que empiezan con # se ignoran. UTF-8 sin BOM.
++//
++// Regla que manda sobre todas: NUNCA abortar el dibujado por un archivo mal
++// formado. Fila mala -> se descarta y se sigue. Archivo ausente o ilegible ->
++// cartel de respaldo embebido en ingles. Un cartel que no aparece se lee como
++// "el mod no anda", que es el peor diagnostico posible.
++// ---------------------------------------------------------------------------
++#define TT_MAX_FILAS 32
++#define TT_MAX_TXT   192
++#define TT_MENU_ARCHIVO L"TrueTriple.menu.txt"
++#define TT_MAX_BYTES   (256 * 1024)
++
++enum TtCol { TT_ORO, TT_VERDE, TT_NARANJA, TT_BLANCO, TT_CIELO, TT_PLATA, TT_CREMA };
++enum TtCond { TT_SIEMPRE, TT_CON_PRESET, TT_SIN_PRESET, TT_CON_AUTO, TT_SIN_AUTO };
++
++struct TtFilaDef {
++	std::wstring texto;   // plantilla, con los marcadores todavia sin resolver
++	TtCol  color;
++	TtCond cond;
++	bool   centrado;
++	bool   separador;
++	float  antes;         // aire por encima, en renglones
++	float  escala;        // 1.0 = cuerpo normal de la fuente
++};
++
++static std::vector<TtFilaDef> tt_filas;
++static bool     tt_filas_listas = false;
++static bool     tt_desde_archivo = false;
++static FILETIME tt_ft_visto = { 0, 0 };
++static ULONGLONG tt_tam_visto = 0;
++static DWORD    tt_ultimo_chequeo = 0;
++
++// Parser de float propio a proposito: wcstod depende del locale del CRT y un
++// juego puede dejarlo en uno donde el separador decimal es la coma. Un "0.70"
++// leido como 0 no rompe nada visible, solo aplasta el aire del cartel, o sea
++// que fallaria en silencio. Acepta las dos formas.
++static float tt_afloat(const wchar_t *s)
++{
++	while (*s == L' ' || *s == L'\t')
++		s++;
++	float signo = 1.0f;
++	if (*s == L'-') { signo = -1.0f; s++; }
++	else if (*s == L'+') { s++; }
++	float ent = 0.0f;
++	while (*s >= L'0' && *s <= L'9')
++		ent = ent * 10.0f + (float)(*s++ - L'0');
++	if (*s == L'.' || *s == L',') {
++		s++;
++		float div = 1.0f;
++		while (*s >= L'0' && *s <= L'9') {
++			div *= 10.0f;
++			ent += (float)(*s++ - L'0') / div;
++		}
++	}
++	return signo * ent;
++}
++
++static void tt_recortar(std::wstring *s)
++{
++	size_t a = s->find_first_not_of(L" \t\r\n");
++	if (a == std::wstring::npos) { s->clear(); return; }
++	size_t b = s->find_last_not_of(L" \t\r\n");
++	*s = s->substr(a, b - a + 1);
++}
++
++static TtCol tt_color_de(const std::wstring &s)
++{
++	if (!_wcsicmp(s.c_str(), L"ORO"))     return TT_ORO;
++	if (!_wcsicmp(s.c_str(), L"VERDE"))   return TT_VERDE;
++	if (!_wcsicmp(s.c_str(), L"NARANJA")) return TT_NARANJA;
++	if (!_wcsicmp(s.c_str(), L"CIELO"))   return TT_CIELO;
++	if (!_wcsicmp(s.c_str(), L"PLATA"))   return TT_PLATA;
++	if (!_wcsicmp(s.c_str(), L"CREMA"))   return TT_CREMA;
++	return TT_BLANCO;  // desconocido: blanco, no descartar la fila
++}
++
++static bool tt_cond_de(const std::wstring &s, TtCond *out)
++{
++	if (s.empty())                           { *out = TT_SIEMPRE;     return true; }
++	if (!_wcsicmp(s.c_str(), L"PRESET"))     { *out = TT_CON_PRESET;  return true; }
++	if (!_wcsicmp(s.c_str(), L"NOPRESET"))   { *out = TT_SIN_PRESET;  return true; }
++	if (!_wcsicmp(s.c_str(), L"AUTO"))       { *out = TT_CON_AUTO;    return true; }
++	if (!_wcsicmp(s.c_str(), L"NOAUTO"))     { *out = TT_SIN_AUTO;    return true; }
++	return false;  // condicion desconocida: fila descartada
++}
++
++// Una linea -> una fila. Devuelve false si hay que descartarla (comentario,
++// vacia, mal formada). Los primeros seis campos se recortan; el texto NO, que
++// sus espacios son la alineacion en columnas del cartel.
++static bool tt_parsear_linea(const std::wstring &linea_cruda, TtFilaDef *out)
++{
++	std::wstring linea = linea_cruda;
++	while (!linea.empty() && (linea[linea.size() - 1] == L'\r' || linea[linea.size() - 1] == L'\n'))
++		linea.erase(linea.size() - 1);
++
++	std::wstring probe = linea;
++	tt_recortar(&probe);
++	if (probe.empty() || probe[0] == L'#')
++		return false;
++
++	std::wstring campo[7];
++	int c = 0;
++	size_t ini = 0;
++	while (c < 6) {
++		size_t bar = linea.find(L'|', ini);
++		if (bar == std::wstring::npos)
++			return false;   // faltan campos
++		campo[c++] = linea.substr(ini, bar - ini);
++		ini = bar + 1;
++	}
++	campo[6] = linea.substr(ini);   // el resto entero es el texto
++
++	for (int i = 0; i < 6; i++)
++		tt_recortar(&campo[i]);
++
++	if (!_wcsicmp(campo[0].c_str(), L"S"))
++		out->separador = true;
++	else if (!_wcsicmp(campo[0].c_str(), L"T"))
++		out->separador = false;
++	else
++		return false;
++
++	if (!tt_cond_de(campo[1], &out->cond))
++		return false;
++
++	out->color    = tt_color_de(campo[2]);
++	out->centrado = (campo[3] == L"1");
++	out->antes    = tt_afloat(campo[4].c_str());
++	out->escala   = tt_afloat(campo[5].c_str());
++	if (out->escala <= 0.01f)
++		out->escala = 1.0f;
++	out->texto    = out->separador ? std::wstring() : campo[6];
++
++	// El limite de 192 es sobre el texto YA resuelto, pero si la plantilla sola
++	// ya lo supera no hay resolucion que la salve.
++	if (out->texto.size() >= TT_MAX_TXT)
++		return false;
++
++	return true;
++}
++
++static void tt_parsear_todo(const wchar_t *contenido, size_t largo)
++{
++	tt_filas.clear();
++	size_t i = 0;
++	while (i < largo && tt_filas.size() < TT_MAX_FILAS) {
++		size_t fin = i;
++		while (fin < largo && contenido[fin] != L'\n')
++			fin++;
++		TtFilaDef f;
++		if (tt_parsear_linea(std::wstring(contenido + i, fin - i), &f))
++			tt_filas.push_back(f);
++		i = fin + 1;
++	}
++}
++
++// El cartel de respaldo. Va en el MISMO formato que el archivo y pasa por el
++// MISMO parser: asi no hay dos caminos de codigo que puedan divergir, y probar
++// el parser prueba tambien el fallback. En ingles y con los binds de fabrica,
++// porque si el archivo falta tampoco sabemos que idioma ni que teclas usa.
++static const wchar_t *tt_menu_embebido =
++	L"T||ORO|1|0.00|1.00|TrueTriple   DiRT Rally 2\n"
++	L"T||BLANCO|1|0.70|0.88|SAVE UP TO NINE CAMERA POSITIONS\n"
++	L"T||BLANCO|1|0.02|0.88|FOR EACH CAR\n"
++	L"S||PLATA|0|0.85|1.00|\n"
++	L"T||BLANCO|0|0.60|1.00|Forward   %FWD% m        Height       %UP% m\n"
++	L"T||BLANCO|0|0.15|1.00|Lateral   %RIGHT% m        Pitch        %PITCH% degrees\n"
++	L"T|PRESET|VERDE|1|0.70|0.80|POSITION %PRESET%          saved:  %GUARDADAS%\n"
++	L"T|NOPRESET|CREMA|1|0.70|0.74|NOTHING SAVED YET:  GET COMFORTABLE AND PRESS CTRL + 1\n"
++	L"S||PLATA|0|0.85|1.00|\n"
++	L"T||CIELO|0|0.60|1.00|Home / End          Move closer to or away from the wheel\n"
++	L"T||CIELO|0|0.18|1.00|PgUp / PgDn         Raise or lower your head\n"
++	L"T||CIELO|0|0.18|1.00|Insert / Delete     Move to the right or to the left\n"
++	L"T||CIELO|0|0.18|1.00|Numpad 8 / 2        Tilt your view up or down\n"
++	L"T||CIELO|0|0.18|1.00|Ctrl + Home         Back to zero\n"
++	L"T||ORO|0|0.45|1.00|Ctrl + 1 to 9       Save this position under that number\n"
++	L"T||ORO|0|0.18|1.00|1 to 9              Go back to a saved position\n"
++	L"T||ORO|0|0.18|1.00|0                   Jump to the next saved one\n"
++	L"T||CIELO|0|0.45|1.00|F7 / F3             Show or hide this menu\n"
++	L"T|AUTO|PLATA|1|0.70|0.62|car recognised\n"
++	L"T|NOAUTO|NARANJA|1|0.70|0.80|LOOKING FOR THE CAR:  ENTER THE COCKPIT VIEW ONCE\n";
++
++static void tt_cargar_embebido(void)
++{
++	tt_parsear_todo(tt_menu_embebido, wcslen(tt_menu_embebido));
++	tt_desde_archivo = false;
++}
++
++// El archivo va al lado del d3dx.ini, y el d3dx.ini lo busca 3Dmigoto en su
++// propia carpeta (la del d3d11.dll), no en el cwd — que un juego puede cambiar.
++// Se prueba primero ahi y despues junto al exe, que es el mismo lugar salvo en
++// instalaciones raras.
++static bool tt_ruta_junto_a(HMODULE mod, wchar_t *ruta)
++{
++	if (!GetModuleFileName(mod, ruta, MAX_PATH))
++		return false;
++	wchar_t *barra = wcsrchr(ruta, L'\\');
++	if (!barra)
++		return false;
++	barra[1] = 0;
++	// wcsncat_s con _TRUNCATE y no wcscat_s: el segundo mata el proceso si no
++	// entra, y un cartel no vale un crash.
++	return wcsncat_s(ruta, MAX_PATH, TT_MENU_ARCHIVO, _TRUNCATE) == 0;
++}
++
++static bool tt_ubicar_archivo(wchar_t *ruta, WIN32_FILE_ATTRIBUTE_DATA *fad)
++{
++	if (tt_ruta_junto_a(migoto_handle, ruta)
++			&& GetFileAttributesEx(ruta, GetFileExInfoStandard, fad))
++		return true;
++	if (tt_ruta_junto_a(NULL, ruta)
++			&& GetFileAttributesEx(ruta, GetFileExInfoStandard, fad))
++		return true;
++	return false;
++}
++
++static bool tt_leer_archivo(const wchar_t *ruta)
++{
++	HANDLE h = CreateFile(ruta, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
++			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++	if (h == INVALID_HANDLE_VALUE)
++		return false;
++
++	DWORD tam = GetFileSize(h, NULL);
++	if (tam == INVALID_FILE_SIZE || tam == 0 || tam > TT_MAX_BYTES) {
++		CloseHandle(h);
++		return false;
++	}
++
++	std::vector<char> buf(tam + 1);
++	DWORD leido = 0;
++	BOOL ok = ReadFile(h, &buf[0], tam, &leido, NULL);
++	CloseHandle(h);
++	if (!ok || leido == 0)
++		return false;
++	buf[leido] = 0;
++
++	// El contrato pide UTF-8 SIN BOM, pero si aparece uno se lo saltea: un
++	// editor de texto lo agrega solo y el sintoma seria la primera fila
++	// desaparecida, que no apunta a la causa.
++	const char *inicio = &buf[0];
++	int largo_a = (int)leido;
++	if (largo_a >= 3 && (unsigned char)inicio[0] == 0xEF
++			&& (unsigned char)inicio[1] == 0xBB && (unsigned char)inicio[2] == 0xBF) {
++		inicio += 3;
++		largo_a -= 3;
++	}
++	if (largo_a <= 0)
++		return false;
++
++	int largo_w = MultiByteToWideChar(CP_UTF8, 0, inicio, largo_a, NULL, 0);
++	if (largo_w <= 0)
++		return false;
++	std::vector<wchar_t> wbuf(largo_w + 1);
++	MultiByteToWideChar(CP_UTF8, 0, inicio, largo_a, &wbuf[0], largo_w);
++	wbuf[largo_w] = 0;
++
++	tt_parsear_todo(&wbuf[0], (size_t)largo_w);
++	if (tt_filas.empty())
++		return false;   // archivo ilegible en la practica: mejor el embebido
++
++	tt_desde_archivo = true;
++	return true;
++}
++
++// Se carga UNA vez, no por frame (esto se dibuja en cada Present con el menu
++// abierto). La recarga en caliente se hace mirando fecha y tamano del archivo
++// como mucho una vez por segundo: el lanzador y la app reescriben el .menu.txt
++// junto con el d3dx.ini, y 3Dmigoto no expone un gancho de "config recargada"
++// al que podamos colgarnos desde aca sin tocar IniHandler.cpp.
++static void tt_asegurar_menu(void)
++{
++	DWORD ahora = GetTickCount();
++	if (tt_filas_listas && (ahora - tt_ultimo_chequeo) < 1000)
++		return;
++	tt_ultimo_chequeo = ahora;
++
++	wchar_t ruta[MAX_PATH];
++	WIN32_FILE_ATTRIBUTE_DATA fad;
++
++	if (!tt_ubicar_archivo(ruta, &fad)) {
++		// Si el archivo desaparecio y antes lo teniamos, hay que volver al
++		// embebido; si ya estabamos en el embebido no se rehace nada.
++		if (!tt_filas_listas || tt_desde_archivo) {
++			tt_cargar_embebido();
++			tt_ft_visto.dwLowDateTime = tt_ft_visto.dwHighDateTime = 0;
++			tt_tam_visto = 0;
++			tt_filas_listas = true;
++			LogInfo("TrueTriple: %S no encontrado, cartel de respaldo embebido\n", TT_MENU_ARCHIVO);
++		}
++		return;
++	}
++
++	ULONGLONG tam = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
++	if (tt_filas_listas && tt_desde_archivo
++			&& tam == tt_tam_visto
++			&& fad.ftLastWriteTime.dwLowDateTime == tt_ft_visto.dwLowDateTime
++			&& fad.ftLastWriteTime.dwHighDateTime == tt_ft_visto.dwHighDateTime)
++		return;
++
++	if (tt_leer_archivo(ruta)) {
++		tt_ft_visto = fad.ftLastWriteTime;
++		tt_tam_visto = tam;
++		LogInfo("TrueTriple: cartel leido de %S (%Iu filas)\n", ruta, tt_filas.size());
++	} else {
++		tt_cargar_embebido();
++		tt_ft_visto = fad.ftLastWriteTime;
++		tt_tam_visto = tam;
++		LogInfo("TrueTriple: %S ilegible o vacio, cartel de respaldo embebido\n", ruta);
++	}
++	tt_filas_listas = true;
++}
++
++// Estado vivo que el C++ (y solo el C++) puede resolver. Los %KEY_*% ya vienen
++// sustituidos por quien genero el archivo.
++struct TtEstado {
++	float fwd, up, right, pitch;
++	int   activo;
++	const wchar_t *guardadas;
++	bool  hay_auto;
++	bool  hay_preset;
++};
++
++// Devuelve false si el resultado no entra en TT_MAX_TXT (fila descartada). Un
++// %...% que no conocemos se copia tal cual, para que un archivo mas nuevo que
++// el dll se vea feo pero no rompa.
++static bool tt_resolver(const std::wstring &plantilla, const TtEstado &st, wchar_t *salida)
++{
++	std::wstring out;
++	wchar_t num[64];
++
++	for (size_t i = 0; i < plantilla.size(); ) {
++		if (plantilla[i] != L'%') {
++			out += plantilla[i++];
++			continue;
++		}
++		size_t cierre = plantilla.find(L'%', i + 1);
++		if (cierre == std::wstring::npos) {
++			out += plantilla[i++];
++			continue;
++		}
++		std::wstring nombre = plantilla.substr(i + 1, cierre - i - 1);
++		const wchar_t *n = nombre.c_str();
++
++		if (!_wcsicmp(n, L"FWD"))
++			swprintf_s(num, L"%+.2f", st.fwd);
++		else if (!_wcsicmp(n, L"UP"))
++			swprintf_s(num, L"%+.2f", st.up);
++		else if (!_wcsicmp(n, L"RIGHT"))
++			swprintf_s(num, L"%+.2f", st.right);
++		else if (!_wcsicmp(n, L"PITCH"))
++			swprintf_s(num, L"%+.1f", st.pitch);
++		else if (!_wcsicmp(n, L"PRESET")) {
++			if (st.activo >= 1 && st.activo <= TT_PRESETS)
++				swprintf_s(num, L"%d", st.activo);
++			else
++				wcscpy_s(num, L"-");   // hay guardadas pero ninguna puesta
++		} else if (!_wcsicmp(n, L"GUARDADAS")) {
++			out += st.guardadas;
++			i = cierre + 1;
++			continue;
++		} else {
++			// desconocido: se deja el marcador entero, incluidos los %
++			out += plantilla.substr(i, cierre - i + 1);
++			i = cierre + 1;
++			continue;
++		}
++
++		out += num;
++		i = cierre + 1;
++	}
++
++	if (out.size() >= TT_MAX_TXT)
++		return false;
++	wcscpy_s(salida, TT_MAX_TXT, out.c_str());
++	return true;
++}
++
++static bool tt_cond_se_cumple(TtCond cond, const TtEstado &st)
++{
++	switch (cond) {
++	case TT_CON_PRESET: return st.hay_preset;
++	case TT_SIN_PRESET: return !st.hay_preset;
++	case TT_CON_AUTO:   return st.hay_auto;
++	case TT_SIN_AUTO:   return !st.hay_auto;
++	default:            return true;
++	}
++}
++
++void Overlay::DrawTripleMenu(void)
++{
++	// Se arma TODO el contenido primero y recien despues se dibuja: el fondo
++	// tiene que medir lo que mide el texto, y eso no se sabe hasta haberlo
++	// compuesto. La primera version fijaba un ancho a ojo y el texto se salia
++	// de la caja — MeasureString existe justamente para no adivinar.
++	//
++	// QUE SE MUESTRA Y QUE NO: la huella del auto y el numero de perfil son
++	// identificadores INTERNOS (un hash y un indice que se asigna solo). Al
++	// usuario no le dicen nada y no puede crearlos ni nombrarlos, asi que no van
++	// en pantalla. Pero tampoco se ocultan del todo: si el reconocimiento falla,
++	// sin ninguna senal el usuario no tendria como enterarse. Queda un renglon
++	// chico al pie que en el caso normal casi no se ve, y que se pone naranja y
++	// explicito solo cuando algo NO se reconocio.
++	//
++	// La ESCALA por fila es lo que permite jerarquia tipografica: la fuente del
++	// overlay viene de un recurso incrustado a un tamano fijo, asi que sin
++	// escalar todo tendria el mismo cuerpo.
++	struct Fila {
++		wchar_t txt[TT_MAX_TXT];
++		TtCol color;
++		bool titulo;      // centrado
++		bool separador;   // linea horizontal en vez de texto
++		float antes;      // aire por encima, en renglones
++		float escala;     // 1.0 = tamano normal de la fuente
++	};
++	Fila fila[TT_MAX_FILAS];
++	int n = 0;
++
++	float huella = (G->iniParams.size() >= 9) ? G->iniParams[8].x : 0.0f;
++	bool hay_auto = (huella > 0.5f);
++	int activo = (int)tt_global(L"$pre_actual", 0.0f);
++
++	// Que presets tiene guardados ESTE auto. Un solo barrido de los slots en vez
++	// de preguntar por cada numero: cada tt_global es una busqueda por nombre en
++	// un mapa, y esto se dibuja en cada frame con el menu abierto.
++	bool tiene[TT_PRESETS + 1] = { false };
++	int cuantos = 0;
++	for (int i = 0; i < TT_SLOTS; i++) {
++		wchar_t nombre[32];
++		swprintf_s(nombre, L"$pre_car_%d", i);
++		float car = tt_global(nombre, 0.0f);
++		// La comparacion va por DIFERENCIA, no por ventana absoluta: la huella
++		// supera 2^23 y ahi float32 no tiene medios — (huella - 0.5f) se
++		// redondea a huella y el borde queda del lado equivocado. Fue el bug
++		// que hacia que el ini no encontrara los presets mientras este panel
++		// (con el borde redondeado para el otro lado) SI los mostraba.
++		float dcar = car - huella;
++		if (dcar < -0.5f || dcar > 0.5f)
++			continue;
++		swprintf_s(nombre, L"$pre_num_%d", i);
++		int num = (int)tt_global(nombre, 0.0f);
++		if (num >= 1 && num <= TT_PRESETS && !tiene[num]) {
++			tiene[num] = true;
++			cuantos++;
++		}
++	}
++
++	// La lista de numeros guardados se arma una sola vez y se le pasa al
++	// resolvedor como %GUARDADAS%.
++	wchar_t usados[64];
++	usados[0] = 0;
++	{
++		int k = 0;
++		for (int p = 1; p <= TT_PRESETS; p++) {
++			if (!tiene[p])
++				continue;
++			k += swprintf_s(usados + k, 64 - k, (k ? L" %d" : L"%d"), p);
++		}
++	}
++
++	TtEstado st;
++	st.fwd        = tt_global(L"$seat_fwd", 0.0f);
++	st.up         = tt_global(L"$seat_up", 0.0f);
++	st.right      = tt_global(L"$seat_right", 0.0f);
++	st.pitch      = tt_global(L"$seat_pitch", 0.0f);
++	st.activo     = activo;
++	st.guardadas  = usados;
++	st.hay_auto   = hay_auto;
++	// PRESET/NOPRESET conservan la semantica que ya tenia el cartel horneado: la
++	// pregunta que le importa al usuario es "¿tengo algo guardado para este
++	// auto?", que es la que decide entre el renglon de estado y el de "todavia no
++	// guardaste ninguna". Cual esta PUESTA lo dice %PRESET%, que vale "-" si hay
++	// guardadas pero ninguna cargada.
++	st.hay_preset = (cuantos > 0);
++
++	tt_asegurar_menu();
++
++	for (size_t i = 0; i < tt_filas.size() && n < TT_MAX_FILAS; i++) {
++		const TtFilaDef &d = tt_filas[i];
++		if (!tt_cond_se_cumple(d.cond, st))
++			continue;
++		if (d.separador)
++			fila[n].txt[0] = 0;
++		else if (!tt_resolver(d.texto, st, fila[n].txt))
++			continue;   // no entra en 192: se descarta la fila y se sigue
++		fila[n].color     = d.color;
++		fila[n].titulo    = d.centrado;
++		fila[n].separador = d.separador;
++		fila[n].antes     = d.antes;
++		fila[n].escala    = d.escala;
++		n++;
++	}
++
++	// Sin ninguna fila no hay nada que medir ni que encuadrar (dibujar la caja
++	// vacia seria un rectangulo negro sin explicacion).
++	if (n == 0)
++		return;
++
++	// --- medir ---
++	const float RENGLON = mFont->GetLineSpacing();
++	const float MARGEN = RENGLON * 1.0f;
++	float ancho = 0.0f, alto = 0.0f;
++	for (int i = 0; i < n; i++) {
++		alto += RENGLON * fila[i].antes;
++		if (fila[i].separador) {
++			alto += RENGLON * 0.25f;
++			continue;
++		}
++		Vector2 m = mFont->MeasureString(fila[i].txt);
++		if (m.x * fila[i].escala > ancho)
++			ancho = m.x * fila[i].escala;
++		alto += RENGLON * fila[i].escala;
++	}
++
++	// --- ubicar: centrado en el monitor del MEDIO de los tres ---
++	float x0 = (float)mResolution.x / 2.0f - ancho / 2.0f;
++	float y0 = RENGLON * 2.0f + MARGEN;
++
++	DrawRectangle(x0 - MARGEN, y0 - MARGEN,
++		ancho + MARGEN * 2.0f, alto + MARGEN * 2.0f, 0.0f, 0.0f, 0.0f, 0.80f);
++
++	// --- dibujar ---
++	float y = y0;
++	for (int i = 0; i < n; i++) {
++		y += RENGLON * fila[i].antes;
++		if (fila[i].separador) {
++			DrawRectangle(x0, y + RENGLON * 0.10f, ancho, 1.0f,
++				1.0f, 1.0f, 1.0f, 0.22f);
++			y += RENGLON * 0.25f;
++			continue;
++		}
++		DirectX::XMVECTOR c;
++		switch (fila[i].color) {
++		case TT_ORO:     c = DirectX::Colors::Gold; break;
++		case TT_VERDE:   c = DirectX::Colors::LimeGreen; break;
++		case TT_NARANJA: c = DirectX::Colors::Orange; break;
++		case TT_CIELO:   c = DirectX::Colors::LightSkyBlue; break;
++		case TT_PLATA:   c = DirectX::Colors::Silver; break;
++		case TT_CREMA:   c = DirectX::Colors::Khaki; break;
++		default:      c = DirectX::Colors::White; break;
++		}
++		float esc = fila[i].escala;
++		Vector2 m = mFont->MeasureString(fila[i].txt);
++		float x = fila[i].titulo ? x0 + (ancho - m.x * esc) / 2.0f : x0;
++
++		// Mismo contorno negro que DrawOutlinedString, pero con escala. El
++		// contorno se deja en 1 px a cualquier escala: es lo que hace legible
++		// el texto sobre cualquier imagen del juego.
++		static const Vector2 borde[4] = {
++			Vector2(-1, 0), Vector2(1, 0), Vector2(0, -1), Vector2(0, 1)
++		};
++		for (int k = 0; k < 4; k++) {
++			mFont->DrawString(mSpriteBatch.get(), fila[i].txt,
++				Vector2(x, y) + borde[k], DirectX::Colors::Black,
++				0.0f, Vector2(0, 0), esc);
++		}
++		mFont->DrawString(mSpriteBatch.get(), fila[i].txt, Vector2(x, y), c,
++			0.0f, Vector2(0, 0), esc);
++
++		y += RENGLON * esc;
++	}
++}
++
+ void Overlay::DrawOverlay(void)
+ {
+ 	Profiling::State profiling_state;
+ 	HRESULT hr;
+ 
+-	if (G->hunting != HUNTING_MODE_ENABLED && !has_notice && Profiling::mode == Profiling::Mode::NONE)
++	// TrueTriple: el menu tambien abre el overlay. y8 lo publica [Present]
++	// (triple activo Y menu no oculto). Sin esto el overlay solo se dibuja
++	// cazando, con un aviso pendiente o midiendo rendimiento.
++	bool triple_menu = (G->iniParams.size() >= 9 && G->iniParams[8].y > 0.5f);
++
++	if (G->hunting != HUNTING_MODE_ENABLED && !has_notice && !triple_menu
++			&& Profiling::mode == Profiling::Mode::NONE)
+ 		return;
+ 
+ 	if (Profiling::mode == Profiling::Mode::SUMMARY)
+@@ -825,6 +1441,9 @@ void Overlay::DrawOverlay(void)
+ 
+ 			if (Profiling::mode != Profiling::Mode::NONE)
+ 				DrawProfiling(&y);
++
++			if (triple_menu)
++				DrawTripleMenu();
+ 		}
+ 		mSpriteBatch->End();
+ 	}
+diff --git a/DirectX11/Overlay.h b/DirectX11/Overlay.h
+index e261940..2e03899 100644
+--- a/DirectX11/Overlay.h
++++ b/DirectX11/Overlay.h
+@@ -103,6 +103,7 @@ private:
+ 	void DrawShaderInfoLines(float *y);
+ 	void DrawNotices(float *y);
+ 	void DrawProfiling(float *y);
++	void DrawTripleMenu(void);
+ 	void DrawRectangle(float x, float y, float w, float h, float r, float g, float b, float opacity);
+ 	void DrawOutlinedString(DirectX::SpriteFont *font, wchar_t const *text, DirectX::XMFLOAT2 const &position, DirectX::FXMVECTOR color);
+ 
+diff --git a/DirectX11/profiling.cpp b/DirectX11/profiling.cpp
+index 1e28262..56c46fc 100644
+--- a/DirectX11/profiling.cpp
++++ b/DirectX11/profiling.cpp
+@@ -434,6 +434,13 @@ void Profiling::update_txt()
+ 				update_txt_cto_warning();
+ 				break;
+ 		}
++
++		// TRIPLE: volcar el mismo texto al d3d11_log.txt. El monitor solo se
++		// dibujaba en pantalla, y leer esos numeros de una foto es inviable.
++		// Teniendolos en texto se puede analizar exactamente donde se va el
++		// tiempo en vez de estimarlo.
++		LogInfo("\n===== PERFORMANCE MONITOR =====\n%S\n===== FIN =====\n",
++			Profiling::text.c_str());
+ 	}
+ 
+ 	// Restart profiling for the next time interval:
