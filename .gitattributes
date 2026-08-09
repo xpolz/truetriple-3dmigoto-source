@@ -1,0 +1,4 @@
+# El parche viaja tal cual: con CRLF, git apply lo rechaza.
+*.patch -text
+*.cpp  -text
+*.h    -text
