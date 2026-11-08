@@ -11,10 +11,20 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 ## Mods
 
-| Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido |
-|---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.2 (dll del 8/10/2026, fuente publicada el 8/11/2026) | `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421` |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally | pendiente | pendiente |
+| Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
+|---|---|---|---|---|
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.2 (dll del 8/10/2026) | `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally | pendiente | pendiente | pendiente |
+
+**La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
+avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
+hasta hoy:
+
+| SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
+|---|---|---|
+| `d07fc901…9421` | app 1.7.2 (instaladores del 8/10 y 24/10/2026) y paquetes del launcher 1.8.2 en adelante | etiqueta `dr2-dll-d07fc901` |
+| `69d760b0…5017` | paquetes del launcher 1.8.0 y 1.8.1 (retirados el 8/11/2026) | etiqueta `dr2-dll-69d760b0` |
+| anteriores a 1.7.0 | instaladores 1.5.x y 1.6.x | pendiente de ubicar (se agregan acá a medida que se encuentran) |
 
 Cada carpeta trae:
 
@@ -40,7 +50,7 @@ git apply <este-repo>/dirt-rally2/truetriple.patch
 ```
 
 O a mano: copiar `dirt-rally2/DirectX11/*` sobre `DirectX11/` del clon en ese commit
-(`Profiling.cpp` reemplaza a `profiling.cpp`; en Windows es el mismo archivo).
+(los nombres son los mismos que en 3Dmigoto, `profiling.cpp` incluido).
 
 Después, en la raíz del clon:
 
