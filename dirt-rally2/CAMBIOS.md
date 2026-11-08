@@ -6,7 +6,7 @@ Fuente del `d3d11.dll` de TrueTriple para DiRT Rally 2.0, versión 1.7.2 (la dll
 SHA-256 del dll `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421`.
 
 Generado con un diff contra el commit base; `truetriple.patch` es ese diff y aplica limpio
-con `git apply`. En total: 20 archivos, 11 modificados y 9 nuevos, 8329 líneas agregadas
+con `git apply`. En total: 20 archivos, 11 modificados y 9 nuevos, 8330 líneas agregadas
 y 20 quitadas (11 de esas son espacios al final de línea que el editor limpió en
 `D3D11Wrapper.cpp`).
 
