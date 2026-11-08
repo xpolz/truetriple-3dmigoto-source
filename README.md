@@ -1,74 +1,79 @@
-# TrueTriple for DiRT Rally 2.0 — GPLv3 Corresponding Source
+# Fuente modificada de 3Dmigoto para los mods TrueTriple
 
-TrueTriple ships a `d3d11.dll` that is a **modified build of [3Dmigoto](https://github.com/bo3b/3Dmigoto)**
-(bo3b, DarkStarSword, Flugan and contributors), which is licensed under the GNU General Public
-License v3. This folder is the corresponding source for that binary, provided under the same
-license.
+Los mods TrueTriple que funcionan con 3Dmigoto distribuyen un `d3d11.dll` que es
+**[3Dmigoto](https://github.com/bo3b/3Dmigoto)** (bo3b, DarkStarSword, Flugan y
+colaboradores) compilado desde fuente **modificada**. 3Dmigoto se publica bajo la
+**GNU GPL v3**, así que esa fuente modificada se publica acá, bajo la misma licencia.
 
-## What the modifications do
+Este repo contiene **solo eso**: los archivos de 3Dmigoto que se modificaron o se
+agregaron, uno por mod. La app de configuración, los `.ini` y los `ShaderFixes/` no
+están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
-3Dmigoto on its own cannot render three independent camera frustums. These changes add that:
-they read the game's camera matrix out of its constant buffers, rebuild an off-axis projection
-per monitor, and redraw the scene once per region. They also add the in-game overlay used to
-show and save seat positions.
+## Mods
 
-## Base version
+| Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido |
+|---|---|---|---|
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.0 (fuente al 8/11/2026) | `69d760b041f8171f93c22927205ab851eb89bf93e68bb988bbb2e22531e45017` |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally | pendiente | pendiente |
 
-Everything here is a diff against **[bo3b/3Dmigoto](https://github.com/bo3b/3Dmigoto) at commit
-`4ce5f2f72b2777223d2e809dcdafec514ac98295`**. Eight files under `DirectX11/` are modified;
-nothing else in the upstream tree is touched. In total: 3977 lines added, 9 removed.
+Cada carpeta trae:
 
-| File | What was changed |
-|---|---|
-| `CommandList.cpp` / `.h` | The new `.ini` commands that do the triple-frustum math, per-region scissor, and camera-matrix patching |
-| `HackerContext.cpp` / `.h` | Captures the game's camera matrix and index buffers; tracks the scissor rects the game sets, so shadow passes can be corrected per region |
-| `Overlay.cpp` / `.h` | The on-screen panel: reads its text from an external file so it can be translated and show the user's real key binds |
-| `IniHandler.cpp` | Build fix for modern toolsets — the original relies on a header that newer MSVC no longer pulls in transitively |
-| `profiling.cpp` | Dumps 3Dmigoto's internal performance counters to the log, to measure the cost of drawing three times |
+- `DirectX11/...`: los archivos completos, en la misma ruta relativa que en 3Dmigoto.
+- `truetriple.patch`: el mismo cambio como parche contra el commit base.
+- `CAMBIOS.md`: qué archivo se tocó y para qué.
 
-## How to build
+## Commit base
 
-Two equivalent routes. The patch is the reliable one.
+Todo es un cambio sobre **[bo3b/3Dmigoto](https://github.com/bo3b/3Dmigoto) en el commit
+`4ce5f2f72b2777223d2e809dcdafec514ac98295`** ("CI Build - 1.4.9", 19/2/2026). El resto
+del árbol de 3Dmigoto no se modifica.
 
-**With the patch:**
+## Cómo compilar
+
+Hace falta Windows con Visual Studio (toolset **v145**) y el SDK **10.0.22621.0**.
 
 ```
-git clone https://github.com/bo3b/3Dmigoto.git
+git clone -c core.autocrlf=false https://github.com/bo3b/3Dmigoto.git
 cd 3Dmigoto
 git checkout 4ce5f2f72b2777223d2e809dcdafec514ac98295
-git apply /path/to/truetriple.patch
+git apply <este-repo>/dirt-rally2/truetriple.patch
 ```
 
-**Or by hand:** copy the files from `src/DirectX11/` over `DirectX11/` in a clone at that commit.
+O a mano: copiar `dirt-rally2/DirectX11/*` sobre `DirectX11/` del clon en ese commit
+(`Profiling.cpp` reemplaza a `profiling.cpp`; en Windows es el mismo archivo).
 
-Then build `StereovisionHacks.sln` in **Release x64**, toolset **v145**, SDK **10.0.22621.0**:
+Después, en la raíz del clon:
 
 ```
 MSBuild.exe "StereovisionHacks.sln" /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v145 /p:WindowsTargetPlatformVersion=10.0.22621.0 /m
 ```
 
-Two things that will otherwise cost you an hour:
+- **Release, no Debug.** La build Debug exige la capa de depuración de D3D11; sin ella
+  el juego no arranca con ese dll.
+- **Si la ruta del clon tiene espacios, falla el paso de post-build** (es del script de
+  3Dmigoto). El dll se genera igual; copialo a mano desde la carpeta de salida.
+- No hace falta tocar el `.vcxproj`: los `.cpp` nuevos se incluyen desde
+  `D3D11Wrapper.cpp`.
 
-- **Build Release, not Debug.** A Debug build requires the D3D11 debug layer; without it
-  installed the game will not start at all with that DLL.
-- **The post-build step fails if the project path contains spaces.** This is a known quirk of
-  3Dmigoto's own post-build script, not of these changes. It is harmless — the DLL is produced
-  anyway, only the automatic copy step fails. Copy the `.dll` out of the output folder yourself.
+Si falta algo para compilar un dll que funcione, avisá: sería una falta de cumplimiento
+y se corrige.
 
-## What is not in this folder
+## Licencia
 
-- **The upstream 3Dmigoto tree** — it is public, and pinning the exact commit above is what makes
-  this diff reproducible. Nothing about it was modified beyond the eight files here.
-- **The configuration and shader patches** (`d3dx.ini` template, `ShaderFixes/`) — these are data
-  files that 3Dmigoto reads at runtime. They are not linked into the DLL and are not derived from
-  3Dmigoto's source, so the GPL does not reach them.
-- **The configuration app** — a separate Rust/SolidJS program that writes those data files and
-  launches the game. It does not link against 3Dmigoto and shares no code with it.
+GPL v3, texto completo en [`LICENSE`](LICENSE) (igual a `LICENSE.GPL.txt` de 3Dmigoto).
+[`COPYING.txt`](COPYING.txt) es el aviso original de 3Dmigoto y
+[`AUTHORS-3Dmigoto.txt`](AUTHORS-3Dmigoto.txt) sus autores. Las modificaciones son del
+autor de TrueTriple.
 
-If you think something here is missing to build a working DLL, say so — that would be a
-compliance gap and it would get fixed.
+---
 
-## License
+## English
 
-GPLv3, full text in [`LICENSE`](LICENSE). Upstream authorship in
-[`AUTHORS-3Dmigoto.txt`](AUTHORS-3Dmigoto.txt); the modifications are by the TrueTriple author.
+Modified [3Dmigoto](https://github.com/bo3b/3Dmigoto) source (GPLv3) used by the
+TrueTriple mods that run on 3Dmigoto. Each folder holds the files changed or added for
+one mod, plus a patch against upstream commit `4ce5f2f72b2777223d2e809dcdafec514ac98295`
+and a `CAMBIOS.md` (changelog). The table above maps each folder to the SHA-256 of the
+`d3d11.dll` that was shipped. To build: clone bo3b/3Dmigoto, check out that commit,
+`git apply` the folder's `truetriple.patch`, and build `StereovisionHacks.sln` in
+Release x64 (toolset v145, SDK 10.0.22621.0). The configuration app, the `.ini` files
+and `ShaderFixes/` are separate programs or data and are not part of this repo.
