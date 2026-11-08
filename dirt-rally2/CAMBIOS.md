@@ -6,13 +6,18 @@ Fuente del `d3d11.dll` de TrueTriple para DiRT Rally 2.0, versión 1.7.2 (la dll
 SHA-256 del dll `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421`.
 
 Generado con un diff contra el commit base; `truetriple.patch` es ese diff y aplica limpio
-con `git apply`. En total: 20 archivos, 11 modificados y 9 nuevos, 8317 líneas agregadas
+con `git apply`. En total: 20 archivos, 11 modificados y 9 nuevos, 8329 líneas agregadas
 y 20 quitadas (11 de esas son espacios al final de línea que el editor limpió en
 `D3D11Wrapper.cpp`).
 
 Nota: la versión anterior de esta carpeta (publicada como "1.7.0") traía el eco del `.ini` al log
 con `LogDebug` en `IniHandler.cpp` (cambio del 10/10/2026). Esa dll no es la que se distribuye;
 la 1.7.2 de arriba conserva `LogInfo` ahí.
+
+Nota 2 (8/11/2026): en `CommandList.cpp`, la carpeta de las capturas de la corrida automática
+de culling (`TripleAutoCapturaTick`) pasó de una ruta fija de la PC del autor a
+`%LOCALAPPDATA%\TrueTriple\capturas-auto`. Es el único cambio respecto de la fuente con que se
+compiló la dll D07FC901; la próxima dll que se compile de esta fuente ya lo trae.
 
 ## Archivos modificados
 

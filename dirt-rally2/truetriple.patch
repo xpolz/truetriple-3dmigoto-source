@@ -1,5 +1,5 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f1..a1c2adaa 100644
+index 6758d9f1..d2f84edb 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
 @@ -17,8 +17,14 @@
@@ -118,7 +118,7 @@ index 6758d9f1..a1c2adaa 100644
  	if (!wcscmp(key, L"clear"))
  		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -1345,6 +1438,3819 @@ void AbortCommand::run(CommandListState *state)
+@@ -1345,6 +1438,3832 @@ void AbortCommand::run(CommandListState *state)
  	state->aborted = true;
  }
  
@@ -2674,10 +2674,23 @@ index 6758d9f1..a1c2adaa 100644
 +		if (estado == 2) return;      // termino y la variable sigue en 1: esperar a que baje
 +		// arrancar
 +		SYSTEMTIME st; GetLocalTime(&st);
-+		CreateDirectoryW(L"E:\\Nueva carpeta\\TrueTriple-Culling-Test\\capturas-auto", NULL);
++		// Las capturas van a %LOCALAPPDATA%\TrueTriple\capturas-auto, nunca a una
++		// ruta fija de la PC del autor (8/11/2026: la anterior era privada y
++		// quedaba en el dll publicado). Sin LOCALAPPDATA no se arranca.
++		wchar_t base[MAX_PATH] = L"";
++		DWORD nb = GetEnvironmentVariableW(L"LOCALAPPDATA", base, _countof(base));
++		if (nb == 0 || nb >= _countof(base)) {
++			LogInfo("AUTO: sin LOCALAPPDATA; no hay donde guardar las capturas, no se arranca.\n");
++			return;
++		}
++		wchar_t raiz[MAX_PATH] = L"";
++		_snwprintf_s(raiz, _countof(raiz), _TRUNCATE, L"%s\\TrueTriple", base);
++		CreateDirectoryW(raiz, NULL);
++		_snwprintf_s(raiz, _countof(raiz), _TRUNCATE, L"%s\\TrueTriple\\capturas-auto", base);
++		CreateDirectoryW(raiz, NULL);
 +		_snwprintf_s(g_auto_dir, _countof(g_auto_dir), _TRUNCATE,
-+			L"E:\\Nueva carpeta\\TrueTriple-Culling-Test\\capturas-auto\\%04d-%02d-%02d_%02d%02d%02d",
-+			st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
++			L"%s\\%04d-%02d-%02d_%02d%02d%02d",
++			raiz, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 +		CreateDirectoryW(g_auto_dir, NULL);
 +		g_auto_paso = 0; g_auto_t0 = ahora; g_auto_aviso_hasta = 0;
 +		g_auto_guardadas = 0; g_auto_fallidas = 0;
