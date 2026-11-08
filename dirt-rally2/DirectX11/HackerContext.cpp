@@ -2654,15 +2654,7 @@ static void triple_gc_repetir_tramos(HackerContext *ctx, ID3D11Buffer *args,
 	if (tls_gc_repitiendo || !es_vs_clutter(vs_hash) || !args)
 		return;
 
-	static CommandListVariable *var = NULL;
-	static volatile LONG init = 0;
-	if (!init) {
-		auto it = command_list_globals.find(L"$gc_tramos");
-		if (it != command_list_globals.end())
-			var = &it->second;
-		InterlockedExchange(&init, 1);
-	}
-	int n = var ? (int)var->fval : 0;
+	int n = (int)TripleReadIniGlobal(L"$gc_tramos").fval;
 	if (n <= 0)
 		return;
 	if (n > 64)
@@ -2840,8 +2832,7 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
                 if (desc.Width == desc.Height && desc.Width >= 1024 && desc.Width <= 4096 &&
                     desc.ArraySize >= 3 && desc.ArraySize <= 4 && desc.SampleDesc.Count == 1 &&
                     (desc.Format == DXGI_FORMAT_R32_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT)) {
-                    auto site = command_list_globals.find(L"$cull_site");
-                    bool open = site != command_list_globals.end() && site->second.fval == 100.0f;
+                    bool open = TripleReadIniGlobal(L"$cull_site").fval == 100.0f;
                     static LONG reports = 0;
                     if (InterlockedIncrement(&reports) <= 24) {
                         D3D11_DEPTH_STENCIL_VIEW_DESC viewDesc = {};

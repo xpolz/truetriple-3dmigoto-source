@@ -13,7 +13,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido |
 |---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.0 (fuente al 8/11/2026) | `69d760b041f8171f93c22927205ab851eb89bf93e68bb988bbb2e22531e45017` |
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.2 (dll del 8/10/2026, fuente publicada el 8/11/2026) | `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421` |
 | [`dirt-rally1/`](dirt-rally1/) | DiRT Rally | pendiente | pendiente |
 
 Cada carpeta trae:

@@ -23,6 +23,8 @@
 #include <TlHelp32.h>      // parche atomico de los call sites con los otros hilos pausados
 
 #include <D3DCompiler.h>
+#include "TrueTripleHudLayout.h"
+#include "TrueTripleShadowFit.h"
 
 CustomResources customResources;
 CustomShaders customShaders;
@@ -33,6 +35,46 @@ std::vector<CommandList*> registered_command_lists;
 std::unordered_set<CommandList*> command_lists_profiling;
 std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
 std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
+
+TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
+{
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	auto it = command_list_globals.find(name);
+	TripleIniSnapshot value = { it != command_list_globals.end(), fallback };
+	if (value.found) value.fval = it->second.fval;
+	LeaveCriticalSection(&G->mCriticalSection);
+	return value;
+}
+
+void TripleWriteIniGlobal(const wchar_t *name, float value)
+{
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	auto it = command_list_globals.find(name);
+	if (it != command_list_globals.end()) it->second.fval = value;
+	LeaveCriticalSection(&G->mCriticalSection);
+}
+
+static bool TripleHudLayoutEnabled()
+{
+	if (!G || TripleReadIniGlobal(L"$triple_on").fval < 0.5f) return false;
+	// Older templates preserve the selective trial; v65 exposes the saved switch.
+	if (TripleReadIniGlobal(L"$hud_center", 1.0f).fval < 0.5f) return false;
+	float panel = TripleReadIniGlobal(L"$mon_px").fval;
+	// A normal single-monitor window must keep the native full-width HUD.
+	if (panel <= 0 || G->mResolutionInfo.width < panel * 2.5f) return false;
+	static volatile LONG notified = 0;
+	if (InterlockedCompareExchange(&notified, 1, 0) == 0)
+		LogInfo("TTHUD: centrado selectivo OSD activo; menus y Eyefinity global intactos.\n");
+	return true;
+}
+
+void TripleInstallHudLayout()
+{
+	if (!TripleReadIniGlobal(L"$mon_px")) return;
+	bool ok = TrueTripleHudLayout::Install(&TripleHudLayoutEnabled);
+	LogInfo("TTHUD: consulta osd_scale %s; solo layout de indicadores.\n",
+		ok ? "instalada" : "sin modificar (firma o instalacion incompatible)");
+}
 
 
 // Adds consistent "3DMigoto" prefix to frame analysis log with appropriate
@@ -1757,8 +1799,7 @@ static bool cull_planos6(const float *g, float dot_h, float dot_v,
 // `$cull_widen` distinto de 0, leido del ini en el momento.
 //
 // Se usa para no arrancar el escaneo de memoria cuando el usuario lo tiene
-// apagado. Lectura directa del `unordered_map`, como en el resto del archivo:
-// despues de cargar el ini no se agregan claves, asi que el iterador es estable.
+// apagado. Las lecturas copian el valor bajo el lock de recarga del ini.
 // El detector de replay actualiza este flag desde TripleCaptureCameraCB. Vive
 // separado de `$en_replay` para que los caminos C++ que escriben planos puedan
 // apagarse en el MISMO frame, sin esperar al [Present] del ini.
@@ -1771,10 +1812,7 @@ static bool tt_replay_activo()
 
 static bool tt_cull_widen_prendido()
 {
-	auto it = command_list_globals.find(L"$cull_widen");
-	if (it == command_list_globals.end())
-		return false;   // sin la variable no hay nada que ensanchar
-	int modo = (int)it->second.fval;
+	int modo = (int)TripleReadIniGlobal(L"$cull_widen").fval;
 	// El bit 16 usa el hook determinista de call sites y NO necesita el viejo
 	// escaneo RAM-A. Evita gastar un core y tocar candidatos irrelevantes.
 	return !tt_replay_activo() && (modo & 15) != 0;
@@ -1972,14 +2010,7 @@ static int cull_widen_one(PlaneSet *s, bool todo)
 
 static DWORD WINAPI cull_widen_thread(LPVOID)
 {
-	// Lectura directa de la variable del ini (los punteros a valores de un
-	// unordered_map sobreviven; despues de cargar el ini no se agregan claves).
-	CommandListVariable *var = NULL;
-	{
-		auto it = command_list_globals.find(L"$cull_widen");
-		if (it != command_list_globals.end())
-			var = &it->second;
-	}
+	auto var = TripleReadIniGlobal(L"$cull_widen");
 	LogInfo("CULLWIDEN: variable $cull_widen %s | %d juego(s) de planos "
 		"registrados\n", var ? "encontrada" : "NO ENCONTRADA -> inerte",
 		g_cull_nsets);
@@ -1994,7 +2025,7 @@ static DWORD WINAPI cull_widen_thread(LPVOID)
 		// Durante un replay el mod entero queda en passthrough. El engine
 		// reconstruye estos planos por frame, asi que dejar de escribir alcanza
 		// para recuperar el frustum original sin restaurar memoria a mano.
-		int modo = tt_replay_activo() ? 0 : (int)var->fval;
+		int modo = tt_replay_activo() ? 0 : (int)TripleReadIniGlobal(L"$cull_widen").fval;
 
 		if (modo != ultimo_modo) {
 			ultimo_modo = modo;
@@ -2008,11 +2039,7 @@ static DWORD WINAPI cull_widen_thread(LPVOID)
 			}
 			LogInfo("CULLWIDEN: modo=%d (bits: 1=camara 4=cbufferGPU 8=TODOS los "
 				"frustums vivos) | sets escribibles=%d\n", modo, na + nb);
-			LogOverlay(LOG_WARNING, "Culling: %s%s%s%s\n",
-				modo == 0 ? "original" : "abierto:",
-				(modo & 1) ? " camara" : "",
-				(modo & 4) ? " GPU-cb" : "",
-				(modo & 8) ? " TODOS-los-frustums" : "");
+			// Modo normal: el detalle tecnico queda en d3d11_log.txt.
 		}
 
 		// los bits 1/2/8 (RAM) los aplica este hilo; el bit 4 lo aplica el
@@ -2102,17 +2129,8 @@ int TripleScanPlanesInCB(void *data, unsigned size, void *res_id,
 	float dot_h = -cosf(2.0f * atanf(1.0f / m00));
 	float dot_v = -cosf(2.0f * atanf(1.0f / m11));
 
-	// bit 4 de $cull_widen = parchear los cbs. Lectura directa del ini, como
-	// el resto; el puntero al valor del unordered_map es estable tras la carga.
-	static CommandListVariable *var = NULL;
-	static volatile LONG var_init = 0;
-	if (!var_init) {
-		auto it = command_list_globals.find(L"$cull_widen");
-		if (it != command_list_globals.end())
-			var = &it->second;
-		InterlockedExchange(&var_init, 1);
-	}
-	bool patch = allow_patch && var && (((int)var->fval) & 4);
+	// Value copy survives a config reload; an unordered_map pointer does not.
+	bool patch = allow_patch && (((int)TripleReadIniGlobal(L"$cull_widen").fval) & 4);
 
 	// presupuesto de log compartido entre hilos (contextos diferidos)
 	static volatile LONG logged = 0;
@@ -2473,10 +2491,9 @@ static DWORD WINAPI cull_scan_thread(LPVOID)
 // "Error opening d3dx.ini", asi que sale en naranja y dura unos segundos.
 static volatile LONG g_hud_state = 0;
 
-static CommandListVariable *cl_global(const wchar_t *nombre)
+static TripleIniSnapshot cl_global(const wchar_t *nombre)
 {
-	auto it = command_list_globals.find(nombre);
-	return (it != command_list_globals.end()) ? &it->second : NULL;
+	return TripleReadIniGlobal(nombre);
 }
 
 // ===== Detector de replay / sonda del flujo (2026-09-04) ====================
@@ -2507,9 +2524,6 @@ static unsigned char **g_tt_services_slot = NULL;
 static int *g_tt_flow_index = NULL;
 static int *g_tt_results_index = NULL;
 static int *g_tt_replay_index = NULL;
-static CommandListVariable *g_tt_replay_ini = NULL;
-static CommandListVariable *g_tt_replay_auto_ini = NULL;
-static CommandListVariable *g_tt_replay_force_ini = NULL;
 
 struct TTReplayProbe {
 	int full;
@@ -2593,15 +2607,6 @@ static bool tt_replay_init()
 	g_tt_flow_index = (int *)(exe + 0x1693FA4);
 	g_tt_results_index = (int *)(exe + 0x1693FDC);
 	g_tt_replay_index = (int *)(exe + 0x1694090);
-	g_tt_replay_ini = cl_global(L"$en_replay");
-	g_tt_replay_auto_ini = cl_global(L"$replay_auto_off");
-	g_tt_replay_force_ini = cl_global(L"$replay_force");
-	if (!g_tt_replay_ini || !g_tt_replay_auto_ini || !g_tt_replay_force_ini) {
-		LogInfo("TTREPLAY: faltan globals de replay en el ini; "
-			"detector inerte.\n");
-		InterlockedExchange(&g_tt_replay_probe_state, -1);
-		return false;
-	}
 
 	LogInfo("TTREPLAY: detector v3 listo; replay completo=FlowService+0x43929; "
 		"replay de fondo=ReplayService+0x248 en {1,2}; sondas extra solo lectura.\n");
@@ -2611,6 +2616,15 @@ static bool tt_replay_init()
 
 static void tt_replay_update()
 {
+	// Reacquire by name every frame. The old cached writer could corrupt newly
+	// allocated command objects after ParseConstants freed its map entry.
+	auto replay_ini = cl_global(L"$en_replay");
+	auto replay_auto = cl_global(L"$replay_auto_off");
+	auto replay_force = cl_global(L"$replay_force");
+	if (!replay_ini || !replay_auto || !replay_force) {
+		InterlockedExchange(&g_tt_replay_active, 0);
+		return;
+	}
 	if (InterlockedCompareExchange(&g_tt_replay_probe_state, 0, 0) != 1 &&
 		!tt_replay_init())
 		return;
@@ -2645,7 +2659,7 @@ static void tt_replay_update()
 		// Nunca conservar un 1 viejo si la estructura dejo de ser legible: eso
 		// apagaria el mod manejando. El fallo seguro es volver a activo.
 		InterlockedExchange(&g_tt_replay_active, 0);
-		g_tt_replay_ini->fval = 0.0f;
+		TripleWriteIniGlobal(L"$en_replay", 0.0f);
 		if (InterlockedCompareExchange(&g_tt_replay_read_fault, 1, 0) == 0)
 			LogInfo("TTREPLAY: fallo leyendo el contexto; mod activo (fail-open).\n");
 		return;
@@ -2664,15 +2678,15 @@ static void tt_replay_update()
 	// `full` se conserva como autoridad independiente para que una futura variante
 	// del servicio no pueda encender el mod dentro de la pantalla con controles.
 	bool replay_servicio = probe.replay248 == 1 || probe.replay248 == 2;
-	bool pausa_habilitada = g_tt_replay_auto_ini->fval >= 0.5f;
+	bool pausa_habilitada = replay_auto.fval >= 0.5f;
 	bool replay_detectado = pausa_habilitada && (probe.full || replay_servicio);
-	bool forzado = g_tt_replay_force_ini->fval >= 0.5f;
+	bool forzado = replay_force.fval >= 0.5f;
 	LONG activo = (replay_detectado && !forzado) ? 1 : 0;
 	InterlockedExchange(&g_tt_replay_active, activo);
 	// `$en_replay` es la señal CRUDA para que [Present] conserve el override
 	// hasta que termine la repeticion. `activo` es la pausa EFECTIVA: esa es la
 	// que cierra culling inmediatamente y la que genera los carteles.
-	g_tt_replay_ini->fval = replay_detectado ? 1.0f : 0.0f;
+	TripleWriteIniGlobal(L"$en_replay", replay_detectado ? 1.0f : 0.0f);
 
 	LONG anterior = InterlockedExchange(&g_tt_replay_last, activo);
 	if (anterior != activo) {
@@ -2688,10 +2702,10 @@ static void tt_replay_update()
 
 static DWORD WINAPI eye_hud_thread(LPVOID)
 {
-	CommandListVariable *v_eye = cl_global(L"$eye_d");
-	CommandListVariable *v_pw  = cl_global(L"$panel_w");
-	CommandListVariable *v_sa  = cl_global(L"$side_sa");
-	CommandListVariable *v_ca  = cl_global(L"$side_ca");
+	auto v_eye = cl_global(L"$eye_d");
+	auto v_pw  = cl_global(L"$panel_w");
+	auto v_sa  = cl_global(L"$side_sa");
+	auto v_ca  = cl_global(L"$side_ca");
 	if (!v_eye || !v_pw || !v_sa || !v_ca) {
 		LogInfo("EYEHUD: faltan variables del ini; no se muestra el aviso.\n");
 		return 0;
@@ -2709,11 +2723,13 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 	// tiene `hide_in_release` y fuera del modo hunting no se dibujaría nunca.
 	//
 	// Si la variable no existe (plantilla anterior a la v23) simplemente no se
-	// avisa nada: `cl_global` devuelve NULL y el bloque se saltea. No es motivo
+	// avisa nada: `cl_global` devuelve found=false y el bloque se saltea. No es motivo
 	// para no mostrar el del ojo, que es de otra función.
-	CommandListVariable *v_pasto = cl_global(L"$pasto_k");
-	CommandListVariable *v_tipo  = cl_global(L"$pasto_tipo");
-	CommandListVariable *v_ralea = cl_global(L"$pasto_ralea");
+	auto v_pasto = cl_global(L"$pasto_k");
+	auto v_tipo  = cl_global(L"$pasto_tipo");
+	auto v_ralea = cl_global(L"$pasto_ralea");
+	auto v_triple = cl_global(L"$triple_on");
+	auto v_variante = cl_global(L"$cull_variante");
 
 	float ultimo = -12345.0f;
 	bool primer_aviso_ojo = true;
@@ -2742,15 +2758,31 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 	// y el bloque no podia dispararse. Codigo muerto con un comentario que
 	// promete una funcion inexistente es como quedo `$no_shadows` durante nueve
 	// versiones; no se repite.
-	float ultimo_pasto = v_pasto ? v_pasto->fval : 0.0f;
-	float ultimo_tipo  = v_tipo  ? v_tipo->fval  : 0.0f;
-	float ultimo_ralea = v_ralea ? v_ralea->fval : 0.0f;
+	float ultimo_pasto = v_pasto ? v_pasto.fval : 0.0f;
+	float ultimo_tipo  = v_tipo  ? v_tipo.fval  : 0.0f;
+	float ultimo_ralea = v_ralea ? v_ralea.fval : 0.0f;
+	float ultimo_triple = v_triple ? v_triple.fval : 1.0f;
+	float ultima_variante = v_variante ? v_variante.fval : 0.0f;
 	while (true) {
+		v_eye = cl_global(L"$eye_d");
+		v_pw = cl_global(L"$panel_w");
+		v_sa = cl_global(L"$side_sa");
+		v_ca = cl_global(L"$side_ca");
+		v_pasto = cl_global(L"$pasto_k");
+		v_tipo = cl_global(L"$pasto_tipo");
+		v_ralea = cl_global(L"$pasto_ralea");
+		v_triple = cl_global(L"$triple_on");
+		v_variante = cl_global(L"$cull_variante");
+		if (!v_eye || !v_pw || !v_sa || !v_ca) { Sleep(120); continue; }
+		if (v_triple && v_triple.fval != ultimo_triple) {
+			ultimo_triple = v_triple.fval;
+			LogOverlay(LOG_WARNING, "TrueTriple %s\n", ultimo_triple >= 0.5f ? "ON" : "OFF");
+		}
 		// El raleo estable (Ctrl+Shift+F8). Es la palanca que ataca la causa:
 		// sube el umbral de densidad del propio motor, que descarta la mata
 		// ANTES del atomico del presupuesto.
-		if (v_ralea && v_ralea->fval != ultimo_ralea) {
-			ultimo_ralea = v_ralea->fval;
+		if (v_ralea && v_ralea.fval != ultimo_ralea) {
+			ultimo_ralea = v_ralea.fval;
 			if (ultimo_ralea < 0.000001f) {
 				LogOverlay(LOG_WARNING, "Pasto: densidad al MAXIMO"
 					"  |  Ctrl+Shift+F8 lo hace menos denso\n");
@@ -2764,8 +2796,8 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 		}
 
 		// El bucket aislado. Callado en 0, que es lo normal.
-		if (v_tipo && v_tipo->fval != ultimo_tipo) {
-			ultimo_tipo = v_tipo->fval;
+		if (v_tipo && v_tipo.fval != ultimo_tipo) {
+			ultimo_tipo = v_tipo.fval;
 			int n = (int)(ultimo_tipo + 0.5f);
 			if (n <= 0) {
 				LogOverlay(LOG_WARNING, "Pasto: sin aislar ningun tipo"
@@ -2777,8 +2809,25 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 			}
 		}
 
-		if (v_pasto && v_pasto->fval != ultimo_pasto) {
-			ultimo_pasto = v_pasto->fval;
+		// 2026-10-08: la variante del terreno lejano (Ctrl+Alt+Shift+Insert). Callado
+		// hasta que el usuario la cambia, como las perillas del pasto.
+		if (v_variante && v_variante.fval != ultima_variante) {
+			ultima_variante = v_variante.fval;
+			int n = (int)(ultima_variante + 0.5f);
+			bool prendido = (TripleReadIniGlobal(L"$cull_widen").fval >= 0.0f) &&
+				(((int)TripleReadIniGlobal(L"$cull_widen").fval & 1024) != 0);
+			const char *que = n == 1 ? "media caja (sin lo de atras), alcance completo"
+				: n == 2 ? "media caja, alcance 6000"
+				: n == 3 ? "media caja, alcance 3000"
+				: n == 4 ? "media caja, alcance 1500"
+				: n == 5 ? "media caja 3000 con el plano cercano ORIGINAL (prueba del pasto)"
+				: "cubo completo (como antes)";
+			LogOverlay(LOG_WARNING, "Terreno lejano: %s%s  |  Ctrl+Alt+Shift+Insert\n", que,
+				prendido ? "" : "  (la casilla esta APAGADA: no tiene efecto)");
+		}
+
+		if (v_pasto && v_pasto.fval != ultimo_pasto) {
+			ultimo_pasto = v_pasto.fval;
 			if (ultimo_pasto < 0.000001f) {
 				LogOverlay(LOG_WARNING, "Pasto lateral: SIN RECORTE "
 					"(k=0, lo maximo)  |  Ctrl+Alt+Shift+F1\n");
@@ -2793,7 +2842,7 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 			}
 		}
 
-		float e = v_eye->fval;
+		float e = v_eye.fval;
 		if (e != ultimo) {
 			ultimo = e;
 			// Al arrancar, el usuario solo necesita confirmar el estado global.
@@ -2801,13 +2850,13 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 			// con F5/F6, que es cuando esos numeros realmente son utiles.
 			if (primer_aviso_ojo) {
 				primer_aviso_ojo = false;
-				LogOverlay(LOG_WARNING, "TrueTriple ON\n");
+				LogOverlay(LOG_WARNING, "TrueTriple %s\n", ultimo_triple >= 0.5f ? "ON" : "OFF");
 				Sleep(120);
 				continue;
 			}
 			// Esquina externa del panel lateral, vista desde arriba, con el
 			// centro sobre el eje X y el ojo por delante.
-			float pw = v_pw->fval, sa = v_sa->fval, ca = v_ca->fval;
+			float pw = v_pw.fval, sa = v_sa.fval, ca = v_ca.fval;
 			float xc = pw * 0.5f + pw * ca;
 			float yc = pw * sa;
 			// atan2 y no atan: con el ojo por delante de la esquina el angulo
@@ -2852,8 +2901,7 @@ static DWORD WINAPI eye_hud_thread(LPVOID)
 
 typedef void *(__fastcall *BuildFrustum_t)(void *dst, const float *viewProj);
 static BuildFrustum_t g_bf_orig = NULL;
-static CommandListVariable *g_bf_var = NULL;
-static volatile LONG g_bf_var_init = 0;
+
 static volatile LONG g_bf_hooked = 0;
 static uintptr_t g_bf_exe_base = 0;
 static volatile LONG g_bf_matched_sites = 0;
@@ -2988,6 +3036,138 @@ static bool bf_caja_local(float *p, bool conservar_alcance = false, float *radio
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ===== 2026-10-08: TERRENO LEJANO SIN INUNDAR EL PASTO ======================
+// El cubo de bf_caja_local (bit 1024) arregla el terreno de fondo de los
+// laterales, pero es un cubo alineado al MUNDO de ~60 000 unidades de medio
+// lado alrededor del auto: TODO el tramo pasa el culling de CS10, tambien lo
+// que esta detras, y el pasto entra tarde y en bloques (A/B del 23/09; el
+// autor lo vio de nuevo el 08/10). Esta variante es la MITAD DE ADELANTE de
+// ese volumen, orientada con la camara: detras del ojo solo entra una franja de
+// `margen`. `tope` > 0 acorta ademas el alcance. Las 8 esquinas se reemplazan
+// en el orden del motor, igual que en bf_caja_local.
+//
+// Si el puesto ve MAS de 180 grados (el del autor ve 182: ojo 60, panel 70.84,
+// laterales a 60), el borde externo de los laterales mira un poco hacia atras:
+// el corte se corre hacia atras lo justo para que ese borde entre hasta el
+// alcance (+2 grados de resguardo). Pasado 175 grados de medio angulo devuelve
+// false y el llamador usa el cubo de siempre.
+//
+// `near_original` (variante 5, prueba del pasto 08/10): deja el plano cercano
+// TAL CUAL lo armo el motor en vez de correrlo atras del ojo. El autor vio el
+// pasto igual de mal con el cubo y con alcances cortos, asi que no es cantidad;
+// la sospecha es que el motor mida distancias de detalle contra ese plano. Con
+// esto se pierde la franja de 1-2 grados del borde externo que mira atras.
+static bool bf_media_caja(float *p, float tope, float medio_angulo, float *radio_out, bool near_original=false)
+{
+    __try {
+        if (!(medio_angulo > 1.0f && medio_angulo < 175.0f)) return false;
+        const float *a=p+8, *b=p+12, *c=p+16;
+        double bc[3]={b[1]*c[2]-b[2]*c[1], b[2]*c[0]-b[0]*c[2], b[0]*c[1]-b[1]*c[0]};
+        double ca[3]={c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]};
+        double ab[3]={a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
+        double det=a[0]*bc[0]+a[1]*bc[1]+a[2]*bc[2];
+        if (!(fabs(det)>1e-6)) return false;
+        double eye[3];
+        for (int k=0;k<3;k++) {
+            eye[k]=(-a[3]*bc[k]-b[3]*ca[k]-c[3]*ab[k])/det;
+            if (!(fabs(eye[k])<1e7)) return false;
+        }
+        // Ejes de la camara desde los planos originales: el near mira adelante,
+        // izquierdo menos derecho apunta a la derecha, abajo menos arriba
+        // apunta arriba. Gram-Schmidt para que queden ortonormales.
+        double f[3], r[3], u[3];
+        for (int k=0;k<3;k++) { f[k]=p[k]; r[k]=(double)p[8+k]-p[12+k]; u[k]=(double)p[16+k]-p[20+k]; }
+        double lf=sqrt(f[0]*f[0]+f[1]*f[1]+f[2]*f[2]);
+        if (!(lf>1e-9)) return false;
+        for (int k=0;k<3;k++) f[k]/=lf;
+        double rf=r[0]*f[0]+r[1]*f[1]+r[2]*f[2];
+        for (int k=0;k<3;k++) r[k]-=rf*f[k];
+        double lr=sqrt(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]);
+        if (!(lr>1e-9)) return false;
+        for (int k=0;k<3;k++) r[k]/=lr;
+        double uf=u[0]*f[0]+u[1]*f[1]+u[2]*f[2], ur=u[0]*r[0]+u[1]*r[1]+u[2]*r[2];
+        for (int k=0;k<3;k++) u[k]-=uf*f[k]+ur*r[k];
+        double lu=sqrt(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
+        if (!(lu>1e-9)) return false;
+        for (int k=0;k<3;k++) u[k]/=lu;
+        // Alcance: el mismo que el cubo (la esquina original mas lejana), y la
+        // clasificacion de cada esquina original (izq/der, abajo/arriba,
+        // cerca/lejos) para reponerlas en el mismo orden.
+        double max_dist2=0;
+        bool lo[8][3]={};
+        for (int i=0;i<8;i++) {
+            const float *pt=p+24+i*4;
+            double d2=0;
+            for (int k=0;k<3;k++) { double d=(double)pt[k]-eye[k]; d2+=d*d; }
+            if (!(d2>=0 && d2<1e14)) return false;
+            if (d2>max_dist2) max_dist2=d2;
+            const int pares[3]={8,16,0}; // izq/der, abajo/arriba, cerca/lejos
+            for (int e=0;e<3;e++) {
+                int o=pares[e];
+                double dlo=p[o+3], dhi=p[o+7];
+                for (int k=0;k<3;k++) { dlo+=(double)p[o+k]*pt[k]; dhi+=(double)p[o+4+k]*pt[k]; }
+                lo[i][e]=fabs(dlo)<=fabs(dhi);
+            }
+        }
+        if (!(max_dist2>1.0)) return false;
+        double radio=sqrt(max_dist2)*1.001+1.0;
+        if (tope>1.0f && radio>tope) radio=tope;
+        double atras=-cos((medio_angulo+2.0)*0.0174532925)*radio;
+        const double margen=25.0+(atras>0.0?atras:0.0);
+        double fe=f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2];
+        double re=r[0]*eye[0]+r[1]*eye[1]+r[2]*eye[2];
+        double ue=u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2];
+        float plano[24];
+        for (int k=0;k<3;k++) {
+            plano[k]=(float)f[k];     plano[4+k]=(float)-f[k];
+            plano[8+k]=(float)r[k];   plano[12+k]=(float)-r[k];
+            plano[16+k]=(float)u[k];  plano[20+k]=(float)-u[k];
+        }
+        plano[3]=(float)(-fe+margen); plano[7]=(float)(fe+radio);
+        double t_near=-margen;
+        if (near_original) {
+            for (int k=0;k<4;k++) plano[k]=p[k];
+            t_near=-fe-(double)p[3]/lf;
+        }
+        plano[11]=(float)(-re+radio); plano[15]=(float)(re+radio);
+        plano[19]=(float)(-ue+radio); plano[23]=(float)(ue+radio);
+        for (int i=0;i<8;i++) {
+            double sr=lo[i][0]?-radio:radio, su=lo[i][1]?-radio:radio, sf=lo[i][2]?t_near:radio;
+            for (int k=0;k<3;k++) p[24+i*4+k]=(float)(eye[k]+sf*f[k]+sr*r[k]+su*u[k]);
+            p[24+i*4+3]=1.0f;
+        }
+        memcpy(p,plano,sizeof(plano));
+        if (radio_out) *radio_out=(float)radio;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Medio angulo horizontal que ve el puesto (grados), con la MISMA cuenta que el
+// cartel de F5/F6 (eye_hud_thread): esquina externa del panel lateral vista
+// desde el ojo. Con monitores distintos, la mitad del central es la suya.
+// -1 si faltan variables.
+static float bf_medio_angulo_triple()
+{
+    TripleIniSnapshot e=TripleReadIniGlobal(L"$eye_d"), pw=TripleReadIniGlobal(L"$panel_w");
+    TripleIniSnapshot sa=TripleReadIniGlobal(L"$side_sa"), ca=TripleReadIniGlobal(L"$side_ca");
+    if (!e.found || !pw.found || !sa.found || !ca.found) return -1.0f;
+    float mitad=pw.fval*0.5f;
+    if (TripleReadIniGlobal(L"$mixto").fval>=0.5f) {
+        float wc=TripleReadIniGlobal(L"$panel_wc").fval;
+        if (wc>1.0f) mitad=wc*0.5f;
+    }
+    float xc=mitad+pw.fval*ca.fval, yc=pw.fval*sa.fval;
+    return atan2f(xc, e.fval-yc)*57.29578f;
+}
+
+// $cull_variante (Ctrl+Alt+Shift+Insert) elige el volumen del terreno lejano:
+// 0 = cubo completo (el de siempre), 1 = media caja con el mismo alcance,
+// 2/3/4 = media caja con alcance topeado a 6000/3000/1500 unidades (3 es el
+// default desde el 08/10: el autor vio el terreno completo y cuesta menos),
+// 5 = la 3 con el plano cercano original (prueba del pasto).
+static const float g_bf_topes_variante[6]={0.0f,0.0f,6000.0f,3000.0f,1500.0f,3000.0f};
+static volatile LONG g_bf_ultima_variante=-1;
+
 static bool bf_es_camara_principal(const float *p, float *fovh_out,
 	float *fovv_out)
 {
@@ -3056,40 +3236,24 @@ static ULONGLONG g_bf_ultimo_reporte = 0;
 // el call site numero N (1..32, numeracion de g_bf_call_rvas + 1); 99 = todos los que se
 // llamen; 0 = solo CS10. Es la forma de encontrar EN VIVO que sitio cullea el terreno y la
 // vegetacion, sin gastar una corrida por candidato. El log BFSTAT muestra aperturas por sitio.
-static CommandListVariable *g_bf_site_var = NULL;
-static volatile LONG g_bf_site_var_init = 0;
+
 static volatile LONG g_bf_last_site = -1;
 static float g_bf_box_radius = 0.0f;
 
 static int bf_leer_site_var()
 {
-	if (!g_bf_site_var_init) {
-		auto it = command_list_globals.find(L"$cull_site");
-		if (it != command_list_globals.end()) {
-			g_bf_site_var = &it->second;
-			InterlockedExchange(&g_bf_site_var_init, 1);
-		}
-	}
-	return g_bf_site_var ? (int)g_bf_site_var->fval : 0;
+	return (int)TripleReadIniGlobal(L"$cull_site").fval;
 }
 
 // Shared UI toggle: controls CPU shadow coverage and receiver depth checks.
 static bool bf_sombras_activas()
 {
-    auto it = command_list_globals.find(L"$shadow_practice014");
-    return it != command_list_globals.end() && it->second.fval >= 0.5f;
+    return TripleReadIniGlobal(L"$shadow_practice014").fval >= 0.5f;
 }
 
 static int bf_leer_modo_var()
 {
-	if (!g_bf_var_init) {
-		auto it = command_list_globals.find(L"$cull_widen");
-		if (it != command_list_globals.end()) {
-			g_bf_var = &it->second;
-			InterlockedExchange(&g_bf_var_init, 1);
-		}
-	}
-	return g_bf_var ? (int)g_bf_var->fval : 0;
+	return (int)TripleReadIniGlobal(L"$cull_widen").fval;
 }
 
 // Bit 16: abre todo sitio cuyo FOV coincida con la camara capturada (experimento del
@@ -3164,7 +3328,7 @@ static void *__fastcall Hooked_BuildFrustum(void *dst, const float *viewProj)
 		char que[128];
 		bf_describir_modo(modo, que, sizeof(que));
 		LogInfo("BFCALL: modo CPU cambio a %d (%s).\n", modo, que);
-		LogOverlay(LOG_WARNING, "Culling CPU: %s\n", que);
+		// Estado normal, no advertencia para el jugador. Sigue en d3d11_log.txt.
 	}
 	if (tt_replay_activo())
 		return result;
@@ -3186,20 +3350,29 @@ static void *__fastcall Hooked_BuildFrustum(void *dst, const float *viewProj)
         bf_probe_ortho032((float *)dst, sitio, extra);
 		LONG site_ant = InterlockedExchange(&g_bf_last_site, extra);
 		if (site_ant != extra) {
-			if (extra == 99)
-				LogOverlay(LOG_WARNING, "Culling CPU: CS10 + TODOS los sitios\n");
-			else if (extra >= 1 && extra <= (int)_countof(g_bf_call_rvas))
-				LogOverlay(LOG_WARNING, "Culling CPU: CS10 + CS%02d (exe+0x%X)\n", extra, g_bf_call_rvas[extra - 1]);
-			else
-				LogOverlay(LOG_WARNING, "Culling CPU: solo CS10\n");
 			LogInfo("BFCALL: sitio extra = %d.\n", extra);
 		}
 		bool abrir = (sitio == BF_SITIO_CS10) ||
 			(sitio >= 0 && (extra == 99 || extra == sitio + 1));
         if (abrir) {
             bool changed;
-            if ((modo & 1024) && sitio == BF_SITIO_CS10)
-                changed = bf_caja_local((float *)dst, true, &g_bf_box_radius);
+            if ((modo & 1024) && sitio == BF_SITIO_CS10) {
+                int variante=(int)(TripleReadIniGlobal(L"$cull_variante").fval+0.5f);
+                if (variante<0 || variante>5) variante=3;
+                changed=false;
+                float medio=-1.0f;
+                if (variante>=1) {
+                    medio=bf_medio_angulo_triple();
+                    changed=bf_media_caja((float *)dst, g_bf_topes_variante[variante], medio, &g_bf_box_radius, variante==5);
+                }
+                bool cubo=!changed;
+                if (cubo) changed=bf_caja_local((float *)dst, true, &g_bf_box_radius);
+                LONG clave=variante*2+(cubo?1:0);
+                if (InterlockedExchange(&g_bf_ultima_variante, clave)!=clave)
+                    LogInfo("TERRENO: variante %d (%s), medio angulo %.1f, radio %.1f\n", variante,
+                        cubo ? (variante>=1 ? "cubo: el puesto ve 350 grados o mas" : "cubo completo") : "media caja",
+                        medio, g_bf_box_radius);
+            }
             else if ((modo & 512) && sitio == BF_SITIO_CS10)
                 changed = bf_caja_local((float *)dst);
             else {
@@ -3388,8 +3561,7 @@ static float g_m00_ancho_pendiente = 0.0f, g_m00_orig_pendiente = 0.0f;
 // un cambio real que el modo 0 no hace).
 static float g_fe0_pre = 0.0f, g_fe0_post = 0.0f;
 static volatile LONG g_fe0_dif = 0, g_fe0_dif_log = 0;
-static CommandListVariable *g_hfov_var = NULL;
-static volatile LONG g_hfov_var_init = 0;
+
 static volatile LONG g_cam_log_una_vez = 0;
 
 static volatile LONG g_hfov_ultimo_x10 = -99999;
@@ -3401,19 +3573,12 @@ static void tt_hfov_anunciar_cambio()
 	if (antes == ahora || antes == -99999)
 		return;
 	LogInfo("BFCALL: $cull_hfov cambio a %.1f (frame %u).\n", ahora / 10.0f, G ? G->frame_no : 0u);
-	LogOverlay(LOG_WARNING, "Culling CPU: ancho de matriz -> %.0f\n", ahora / 10.0f);
+	// El cambio ya quedo registrado en el log; no es un fallo en pantalla.
 }
 
 static float tt_hfov_objetivo()
 {
-	if (!g_hfov_var_init) {
-		auto it = command_list_globals.find(L"$cull_hfov");
-		if (it != command_list_globals.end()) {
-			g_hfov_var = &it->second;
-			InterlockedExchange(&g_hfov_var_init, 1);
-		}
-	}
-	float h = g_hfov_var ? g_hfov_var->fval : 172.0f;
+	float h = TripleReadIniGlobal(L"$cull_hfov", 172.0f).fval;
 	if (h < -2.5f) return -3.0f;                 // -3 = pasante puro (marco propio, sin relleno)
 	if (h < -1.5f) return -2.0f;                 // -2 = pasante + rellena su marco con 0xFF
 	if (h < -0.5f) return -1.0f;                 // -1 = pasante + rellena su marco con 0x00
@@ -3529,6 +3694,9 @@ static void tt_cam_restaurar_mult(intptr_t ctx, intptr_t cam, float mult)
 
 static void *__fastcall Hooked_CamUpdate(intptr_t ctx, intptr_t cam, intptr_t params, float f, unsigned n)
 {
+	// Invalidate first: disabled/replay/failing constructors must not reuse a
+	// previous widened-camera pair. This never writes to the game's camera.
+	TrueTripleShadowFit::Publish((void *)cam, 0, 0);
 	InterlockedIncrement(&g_cam_llamadas);
 	tt_hfov_anunciar_cambio();
 	int modo = bf_leer_modo_var();
@@ -3561,6 +3729,7 @@ static void *__fastcall Hooked_CamUpdate(intptr_t ctx, intptr_t cam, intptr_t pa
 		InterlockedIncrement(&g_cam_saltadas);
 		return r;
 	}
+	float native_shadow_aspect = TrueTripleShadowFit::NativeAspect(ctx);
 	float mult_nuevo = 0.0f;
 	float mult_orig = tt_cam_ensanchar(ctx, &mult_nuevo);
 	if (mult_orig == 0.0f) {
@@ -3569,6 +3738,8 @@ static void *__fastcall Hooked_CamUpdate(intptr_t ctx, intptr_t cam, intptr_t pa
 	}
 	void *r = g_cam_orig(ctx, cam, params, f, n);
 	tt_cam_restaurar_mult(ctx, cam, mult_orig);
+	if (g_m00_ancho > 0.0f)
+		TrueTripleShadowFit::PublishConstructed((void *)cam, native_shadow_aspect);
 	InterlockedIncrement(&g_cam_ensanchadas);
 	return r;
 }
@@ -3642,13 +3813,23 @@ static void tt_cam_instalar()
 
 // Se instala SOLO si el usuario pidio un modo de call sites (bit 16 o 32 de
 // $cull_widen). Con 0 no se toca un byte del exe. Un solo intento, un solo parche.
+static bool tt_shadow_fit_enabled()
+{
+	return (bf_leer_modo_var() & 64) && tt_hfov_objetivo() > 0.0f && !tt_replay_activo();
+}
+
 static void bf_instalar_si_pedido()
 {
 	if (g_bf_hooked && g_cam_hooked)
 		return;
 	int modo = bf_leer_modo_var();
-	if (modo & 64)
+	if (modo & 64) {
 		tt_cam_instalar();
+		if (!TrueTripleShadowFit::install_state) {
+			bool ok = TrueTripleShadowFit::Install(&tt_shadow_fit_enabled);
+			LogInfo("TTSHADOWFIT: native-aspect snapshot for solar fitting: %s; object camera stays wide.\n", ok ? "installed" : "FAILED validation/patch");
+		}
+	}
 	if ((modo & (16 | 32)) == 0 && !bf_sombras_activas())
 		return;
 	triple_install_buildfrustum_hook();
@@ -3665,8 +3846,11 @@ static void bf_reportar()
 	if (g_bf_ultimo_reporte && ahora - g_bf_ultimo_reporte < 2000)
 		return;
 	g_bf_ultimo_reporte = ahora;
-	CommandListVariable *grass = cl_global(L"$pasto_frustum_mode");
-	LogInfo("GRASSSTAT: frustum_mode=%.0f\n", grass ? grass->fval : -1.0f);
+	LogInfo("TTSHADOWFIT: corrected=%ld passthrough=%ld\n",
+		InterlockedExchange(&TrueTripleShadowFit::corrections,0),
+		InterlockedExchange(&TrueTripleShadowFit::misses,0));
+	auto grass = cl_global(L"$pasto_frustum_mode");
+	LogInfo("GRASSSTAT: frustum_mode=%.0f\n", grass ? grass.fval : -1.0f);
 	if(bf_leer_modo_var() & 1024) LogInfo("CULLRANGE: CS10 box half extent %.1f world units\n", g_bf_box_radius);
 	LONG cam_llam = InterlockedExchange(&g_cam_llamadas, 0);
 	LONG cam_ens = InterlockedExchange(&g_cam_ensanchadas, 0);
@@ -3709,13 +3893,16 @@ static void bf_reportar()
 void TripleCullingOSD(wchar_t *buf, size_t n)
 {
 	buf[0] = 0;
+	// La linea de telemetria solo sirve durante la caza, no en uso normal.
+	if (!G || G->hunting != HUNTING_MODE_ENABLED)
+		return;
 	int modo = bf_leer_modo_var();
-	if (!g_bf_var && !g_bf_hooked && !g_cam_hooked)
+	if (!TripleReadIniGlobal(L"$cull_widen") && !g_bf_hooked && !g_cam_hooked)
 		return;
 	char que[128];
 	bf_describir_modo(modo, que, sizeof(que));
-	CommandListVariable *grass = cl_global(L"$pasto_frustum_mode");
-	int k = _snwprintf_s(buf, n, _TRUNCATE, L"CULLING modo %d = %S | grass %.0f", modo, que, grass ? grass->fval : -1.0f);
+	auto grass = cl_global(L"$pasto_frustum_mode");
+	int k = _snwprintf_s(buf, n, _TRUNCATE, L"CULLING modo %d = %S | grass %.0f", modo, que, grass ? grass.fval : -1.0f);
 	if (k < 0) return;
 	if (modo & 32) {
 		int extra = bf_leer_site_var();
@@ -3754,25 +3941,17 @@ static int g_auto_paso = -1;
 static ULONGLONG g_auto_t0 = 0, g_auto_aviso_hasta = 0;
 static wchar_t g_auto_dir[MAX_PATH] = L"";
 static int g_auto_guardadas = 0, g_auto_fallidas = 0;
-static CommandListVariable *g_auto_var = NULL;
-static volatile LONG g_auto_var_init = 0;
+
 
 static float tt_auto_leer_var()
 {
-	if (!g_auto_var_init) {
-		auto it = command_list_globals.find(L"$cull_auto");
-		if (it != command_list_globals.end())
-			g_auto_var = &it->second;
-		InterlockedExchange(&g_auto_var_init, 1);
-	}
-	return g_auto_var ? g_auto_var->fval : 0.0f;
+	return TripleReadIniGlobal(L"$cull_auto").fval;
 }
 
 static void tt_auto_poner_estado(int modo, float hfov)
 {
-	bf_leer_modo_var(); tt_hfov_objetivo();       // aseguran los punteros a las variables
-	if (g_bf_var) g_bf_var->fval = (float)modo;
-	if (g_hfov_var) g_hfov_var->fval = hfov;
+	TripleWriteIniGlobal(L"$cull_widen", (float)modo);
+	TripleWriteIniGlobal(L"$cull_hfov", hfov);
 }
 
 static void tt_auto_capturar(IDXGISwapChain *sc, ID3D11DeviceContext *ctx, const char *nombre, int idx)
@@ -3840,7 +4019,7 @@ void TripleAutoCapturaTick(IDXGISwapChain *sc, ID3D11Device *dev, ID3D11DeviceCo
 	g_auto_aviso_hasta = ahora + 4000;
 	if (g_auto_paso >= (int)_countof(g_auto_pasos)) {
 		InterlockedExchange(&g_auto_estado, 2);
-		if (g_auto_var) g_auto_var->fval = 0.0f;
+		TripleWriteIniGlobal(L"$cull_auto", 0.0f);
 		LogInfo("AUTO: corrida automatica TERMINADA: %d guardadas, %d fallidas, en %S\n",
 			g_auto_guardadas, g_auto_fallidas, g_auto_dir);
 		LogOverlay(LOG_WARNING, "AUTO: LISTO. %d capturas guardadas. Ya podes salir.\n", g_auto_guardadas);
@@ -3869,8 +4048,6 @@ void TripleAutoCapturaOSD(wchar_t *buf, size_t n)
 	} else if (estado == 2) {
 		_snwprintf_s(buf, n, _TRUNCATE, L"AUTO LISTO: %d capturas guardadas (%d fallidas). Ya podes salir.",
 			g_auto_guardadas, g_auto_fallidas);
-	} else if (tt_auto_leer_var() >= 0.0f && g_auto_var) {
-		_snwprintf_s(buf, n, _TRUNCATE, L"AUTO: ubicate, quedate quieto y apreta la tecla de corrida automatica");
 	}
 }
 
@@ -4072,20 +4249,28 @@ static void TripleCaducarHuellaAuto(void)
 
 // LISTA NEGRA de camaras del motor (v1.41). Los tres m11 de las camaras que NO
 // deben recibir el triple: menu principal, menu del garage y la orbita del
-// garage. Son CONSTANTES del juego, bit-exactas en toda sesion — a diferencia
+// garage. El FOV animado de largada cruza el segundo valor; para ese se exige
+// tambien el near del frontend (-0.08). Los valores estaticos se distinguen
 // del rango de "camaras de conduccion" que se uso antes, que en realidad media
 // el slider de FOV del usuario (m11 = 1/tan(fovV/2), ajustable POR CAMARA en
-// DiRT) y por eso se rompio dos veces. La tolerancia 0.01 en espacio m11 es
-// generosa para constantes exactas y chica frente a la camara real mas cercana
-// medida (cockpit 3.732 vs menu2 3.546: distancia 0.186).
-// El ASM de los shaders hace la misma comparacion por su cuenta (fila 5 de
+// DiRT) y por eso se rompio dos veces. La tolerancia 0.01 en m11 NO bastaba
+// para separar la animacion: se midieron seis cuadros consecutivos dentro de
+// ella con near=-0.400019, frente al near=-0.08 del menu alternativo.
+// El ASM de los shaders aplica la misma pareja de comparaciones (fila 5 de
 // IniParams, publicada por [Present]); esta copia es para los flags x3/x9.
-static inline bool tt_es_camara_de_menu(float m11)
+static inline bool tt_es_camara_de_menu(float m11, float m23)
 {
 	const float negras[3] = { 4.272611f, 3.545733f, 1.000000f };
 	for (int i = 0; i < 3; i++) {
 		float d = m11 - negras[i];
 		if (d < 0) d = -d;
+		// El FOV animado de la largada cruza m11=3.545733 durante seis frames.
+		// El frontend real tiene near=-0.08; la camara de largada, -0.4.
+		if (i == 1) {
+			float dn = m23 + 0.08f;
+			if (dn < 0) dn = -dn;
+			if (dn >= 0.01f) continue;
+		}
 		if (d < 0.01f)
 			return true;
 	}
@@ -4150,7 +4335,7 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 			// contaba como "menu". Se pasa al mismo criterio que el resto: la
 			// LISTA NEGRA de camaras del motor (constantes bit-exactas que el
 			// usuario no puede tocar). Ver tt_es_camara_de_menu().
-			if (tt_es_camara_de_menu(f[5])) {
+		if (tt_es_camara_de_menu(f[5], f[14])) {
 				// v1.86: la RACHA de frames seguidos con el frontend en
 				// pantalla. Si paso un frame ENTERO sin ninguna camara de la
 				// lista negra, la racha se corto y vuelve a empezar. Que la
@@ -4269,7 +4454,7 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 		//
 		// La condicion es la ya probada: no es camara de menu y es perspectiva
 		// real (m22 < -0.9, para descartar una ortografica que se cuela).
-		if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f && G->iniParams.size() >= 10) {
+		if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f && G->iniParams.size() >= 10) {
 			G->iniParams[9].z = f[33];
 			// Y el CABECEO de la camara respecto del mundo.
 			//
@@ -4425,7 +4610,7 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 		// siguen leyendo son `TriplePcl` y `TriplePclM` (las particulas), que no
 		// tienen volcado propio que permita afirmar lo mismo — para ellas esta
 		// publicacion sigue siendo necesaria.
-		if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f) {
+		if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f) {
 			if (G->iniParams.size() >= 9) {
 				// UNA linea, la primera vez que publicamos una camara que el
 				// gate viejo (`m11 <= 3.0`) habria descartado. Es la prueba de
@@ -4480,7 +4665,7 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 			// por el gate de captura (m22 == m00, near -1209) y con lista negra
 			// en vez de rango habria contado como "de conduccion".
 			static unsigned g_frame_conduccion = 0x80000000;
-			if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f)
+			if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f)
 				g_frame_conduccion = G->frame_no;
 			if (G->iniParams.size() >= 10)
 				G->iniParams[9].x =
@@ -4508,7 +4693,7 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 			if (dm11 <= 0.02f && dm23 <= 0.05f) { ya_vista = true; break; }
 		}
 		if (!ya_vista && triple_logcount < 96) {
-			bool negra = tt_es_camara_de_menu(f[5]);
+			bool negra = tt_es_camara_de_menu(f[5], f[14]);
 			// las camaras interiores (cockpit/capo/piso) se distinguen por el
 			// near chico; marcarlas hace el log legible de un vistazo
 			bool interior = (f[14] > -0.30f && f[14] < -0.02f);

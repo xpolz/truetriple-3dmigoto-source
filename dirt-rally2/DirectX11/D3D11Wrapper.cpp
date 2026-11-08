@@ -107,23 +107,31 @@ static bool InitializeDLL()
 		return false;
 	}
 
-    // This is before the first native D3D11CreateDevice and the renderer
-    // constructors. Never install/remove these patches from config hot reload.
-    auto aa = command_list_globals.find(L"$force_native_aa");
-    if (aa != command_list_globals.end() && aa->second.fval >= 0.5f) {
+    TripleInstallHudLayout();
+
+    bool taa_installed_here = false;
+    auto taa_gate = command_list_globals.find(L"$force_taa_off");
+    if (taa_gate != command_list_globals.end() && taa_gate->second.fval >= 0.5f) {
         auto taa = TrueTripleTaaLock::Install();
-        LogInfo("NATIVEAA042 TAA: %ls\n", TrueTripleTaaLock::Describe(taa));
+        LogInfo("NATIVEAA047 TAA off: %ls\n", TrueTripleTaaLock::Describe(taa));
         if (taa != TrueTripleTaaLock::Result::Installed &&
             taa != TrueTripleTaaLock::Result::AlreadyInstalled) {
             if (LogFile) fflush(LogFile);
             FatalAppExitA(0, "TrueTriple: no se pudo bloquear TAA. Consulte d3d11_log.txt.");
         }
+        taa_installed_here = taa == TrueTripleTaaLock::Result::Installed;
+    }
+
+    auto cmaa_gate = command_list_globals.find(L"$force_cmaa_on");
+    if (cmaa_gate != command_list_globals.end() && cmaa_gate->second.fval >= 0.5f) {
         auto cmaa = TrueTripleCmaaLock::Install();
-        LogInfo("NATIVEAA042 CMAA: %ls\n", TrueTripleCmaaLock::Describe(cmaa));
+        LogInfo("NATIVEAA047 CMAA on: %ls\n", TrueTripleCmaaLock::Describe(cmaa));
         if (cmaa != TrueTripleCmaaLock::Result::Installed &&
             cmaa != TrueTripleCmaaLock::Result::AlreadyInstalled) {
-            auto rollback = TrueTripleTaaLock::Remove();
-            LogInfo("NATIVEAA042 TAA rollback: %ls\n", TrueTripleTaaLock::Describe(rollback));
+            if (taa_installed_here) {
+                auto rollback = TrueTripleTaaLock::Remove();
+                LogInfo("NATIVEAA047 TAA rollback: %ls\n", TrueTripleTaaLock::Describe(rollback));
+            }
             if (LogFile) fflush(LogFile);
             FatalAppExitA(0, "TrueTriple: no se pudo forzar CMAA. Consulte d3d11_log.txt.");
         }

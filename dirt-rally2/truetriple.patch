@@ -1,8 +1,8 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f..3472fff 100644
+index 6758d9f1..a1c2adaa 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
-@@ -17,6 +17,10 @@
+@@ -17,8 +17,14 @@
  #include "profiling.h"
  #include "Hunting.h"
  #include "cursor.h"
@@ -12,8 +12,59 @@ index 6758d9f..3472fff 100644
 +#include <TlHelp32.h>      // parche atomico de los call sites con los otros hilos pausados
  
  #include <D3DCompiler.h>
++#include "TrueTripleHudLayout.h"
++#include "TrueTripleShadowFit.h"
  
-@@ -926,6 +930,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+ CustomResources customResources;
+ CustomShaders customShaders;
+@@ -30,6 +36,46 @@ std::unordered_set<CommandList*> command_lists_profiling;
+ std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
+ std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
+ 
++TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
++{
++	EnterCriticalSectionPretty(&G->mCriticalSection);
++	auto it = command_list_globals.find(name);
++	TripleIniSnapshot value = { it != command_list_globals.end(), fallback };
++	if (value.found) value.fval = it->second.fval;
++	LeaveCriticalSection(&G->mCriticalSection);
++	return value;
++}
++
++void TripleWriteIniGlobal(const wchar_t *name, float value)
++{
++	EnterCriticalSectionPretty(&G->mCriticalSection);
++	auto it = command_list_globals.find(name);
++	if (it != command_list_globals.end()) it->second.fval = value;
++	LeaveCriticalSection(&G->mCriticalSection);
++}
++
++static bool TripleHudLayoutEnabled()
++{
++	if (!G || TripleReadIniGlobal(L"$triple_on").fval < 0.5f) return false;
++	// Older templates preserve the selective trial; v65 exposes the saved switch.
++	if (TripleReadIniGlobal(L"$hud_center", 1.0f).fval < 0.5f) return false;
++	float panel = TripleReadIniGlobal(L"$mon_px").fval;
++	// A normal single-monitor window must keep the native full-width HUD.
++	if (panel <= 0 || G->mResolutionInfo.width < panel * 2.5f) return false;
++	static volatile LONG notified = 0;
++	if (InterlockedCompareExchange(&notified, 1, 0) == 0)
++		LogInfo("TTHUD: centrado selectivo OSD activo; menus y Eyefinity global intactos.\n");
++	return true;
++}
++
++void TripleInstallHudLayout()
++{
++	if (!TripleReadIniGlobal(L"$mon_px")) return;
++	bool ok = TrueTripleHudLayout::Install(&TripleHudLayoutEnabled);
++	LogInfo("TTHUD: consulta osd_scale %s; solo layout de indicadores.\n",
++		ok ? "instalada" : "sin modificar (firma o instalacion incompatible)");
++}
++
+ 
+ // Adds consistent "3DMigoto" prefix to frame analysis log with appropriate
+ // level of indentation for the current recursion level. Using a
+@@ -926,6 +972,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
  	if (!wcscmp(key, L"reset_per_frame_limits"))
  		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
@@ -67,7 +118,7 @@ index 6758d9f..3472fff 100644
  	if (!wcscmp(key, L"clear"))
  		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -1345,6 +1396,3676 @@ void AbortCommand::run(CommandListState *state)
+@@ -1345,6 +1438,3819 @@ void AbortCommand::run(CommandListState *state)
  	state->aborted = true;
  }
  
@@ -432,8 +483,7 @@ index 6758d9f..3472fff 100644
 +// `$cull_widen` distinto de 0, leido del ini en el momento.
 +//
 +// Se usa para no arrancar el escaneo de memoria cuando el usuario lo tiene
-+// apagado. Lectura directa del `unordered_map`, como en el resto del archivo:
-+// despues de cargar el ini no se agregan claves, asi que el iterador es estable.
++// apagado. Las lecturas copian el valor bajo el lock de recarga del ini.
 +// El detector de replay actualiza este flag desde TripleCaptureCameraCB. Vive
 +// separado de `$en_replay` para que los caminos C++ que escriben planos puedan
 +// apagarse en el MISMO frame, sin esperar al [Present] del ini.
@@ -446,10 +496,7 @@ index 6758d9f..3472fff 100644
 +
 +static bool tt_cull_widen_prendido()
 +{
-+	auto it = command_list_globals.find(L"$cull_widen");
-+	if (it == command_list_globals.end())
-+		return false;   // sin la variable no hay nada que ensanchar
-+	int modo = (int)it->second.fval;
++	int modo = (int)TripleReadIniGlobal(L"$cull_widen").fval;
 +	// El bit 16 usa el hook determinista de call sites y NO necesita el viejo
 +	// escaneo RAM-A. Evita gastar un core y tocar candidatos irrelevantes.
 +	return !tt_replay_activo() && (modo & 15) != 0;
@@ -647,14 +694,7 @@ index 6758d9f..3472fff 100644
 +
 +static DWORD WINAPI cull_widen_thread(LPVOID)
 +{
-+	// Lectura directa de la variable del ini (los punteros a valores de un
-+	// unordered_map sobreviven; despues de cargar el ini no se agregan claves).
-+	CommandListVariable *var = NULL;
-+	{
-+		auto it = command_list_globals.find(L"$cull_widen");
-+		if (it != command_list_globals.end())
-+			var = &it->second;
-+	}
++	auto var = TripleReadIniGlobal(L"$cull_widen");
 +	LogInfo("CULLWIDEN: variable $cull_widen %s | %d juego(s) de planos "
 +		"registrados\n", var ? "encontrada" : "NO ENCONTRADA -> inerte",
 +		g_cull_nsets);
@@ -669,7 +709,7 @@ index 6758d9f..3472fff 100644
 +		// Durante un replay el mod entero queda en passthrough. El engine
 +		// reconstruye estos planos por frame, asi que dejar de escribir alcanza
 +		// para recuperar el frustum original sin restaurar memoria a mano.
-+		int modo = tt_replay_activo() ? 0 : (int)var->fval;
++		int modo = tt_replay_activo() ? 0 : (int)TripleReadIniGlobal(L"$cull_widen").fval;
 +
 +		if (modo != ultimo_modo) {
 +			ultimo_modo = modo;
@@ -683,11 +723,7 @@ index 6758d9f..3472fff 100644
 +			}
 +			LogInfo("CULLWIDEN: modo=%d (bits: 1=camara 4=cbufferGPU 8=TODOS los "
 +				"frustums vivos) | sets escribibles=%d\n", modo, na + nb);
-+			LogOverlay(LOG_WARNING, "Culling: %s%s%s%s\n",
-+				modo == 0 ? "original" : "abierto:",
-+				(modo & 1) ? " camara" : "",
-+				(modo & 4) ? " GPU-cb" : "",
-+				(modo & 8) ? " TODOS-los-frustums" : "");
++			// Modo normal: el detalle tecnico queda en d3d11_log.txt.
 +		}
 +
 +		// los bits 1/2/8 (RAM) los aplica este hilo; el bit 4 lo aplica el
@@ -777,17 +813,8 @@ index 6758d9f..3472fff 100644
 +	float dot_h = -cosf(2.0f * atanf(1.0f / m00));
 +	float dot_v = -cosf(2.0f * atanf(1.0f / m11));
 +
-+	// bit 4 de $cull_widen = parchear los cbs. Lectura directa del ini, como
-+	// el resto; el puntero al valor del unordered_map es estable tras la carga.
-+	static CommandListVariable *var = NULL;
-+	static volatile LONG var_init = 0;
-+	if (!var_init) {
-+		auto it = command_list_globals.find(L"$cull_widen");
-+		if (it != command_list_globals.end())
-+			var = &it->second;
-+		InterlockedExchange(&var_init, 1);
-+	}
-+	bool patch = allow_patch && var && (((int)var->fval) & 4);
++	// Value copy survives a config reload; an unordered_map pointer does not.
++	bool patch = allow_patch && (((int)TripleReadIniGlobal(L"$cull_widen").fval) & 4);
 +
 +	// presupuesto de log compartido entre hilos (contextos diferidos)
 +	static volatile LONG logged = 0;
@@ -1148,10 +1175,9 @@ index 6758d9f..3472fff 100644
 +// "Error opening d3dx.ini", asi que sale en naranja y dura unos segundos.
 +static volatile LONG g_hud_state = 0;
 +
-+static CommandListVariable *cl_global(const wchar_t *nombre)
++static TripleIniSnapshot cl_global(const wchar_t *nombre)
 +{
-+	auto it = command_list_globals.find(nombre);
-+	return (it != command_list_globals.end()) ? &it->second : NULL;
++	return TripleReadIniGlobal(nombre);
 +}
 +
 +// ===== Detector de replay / sonda del flujo (2026-09-04) ====================
@@ -1182,9 +1208,6 @@ index 6758d9f..3472fff 100644
 +static int *g_tt_flow_index = NULL;
 +static int *g_tt_results_index = NULL;
 +static int *g_tt_replay_index = NULL;
-+static CommandListVariable *g_tt_replay_ini = NULL;
-+static CommandListVariable *g_tt_replay_auto_ini = NULL;
-+static CommandListVariable *g_tt_replay_force_ini = NULL;
 +
 +struct TTReplayProbe {
 +	int full;
@@ -1268,15 +1291,6 @@ index 6758d9f..3472fff 100644
 +	g_tt_flow_index = (int *)(exe + 0x1693FA4);
 +	g_tt_results_index = (int *)(exe + 0x1693FDC);
 +	g_tt_replay_index = (int *)(exe + 0x1694090);
-+	g_tt_replay_ini = cl_global(L"$en_replay");
-+	g_tt_replay_auto_ini = cl_global(L"$replay_auto_off");
-+	g_tt_replay_force_ini = cl_global(L"$replay_force");
-+	if (!g_tt_replay_ini || !g_tt_replay_auto_ini || !g_tt_replay_force_ini) {
-+		LogInfo("TTREPLAY: faltan globals de replay en el ini; "
-+			"detector inerte.\n");
-+		InterlockedExchange(&g_tt_replay_probe_state, -1);
-+		return false;
-+	}
 +
 +	LogInfo("TTREPLAY: detector v3 listo; replay completo=FlowService+0x43929; "
 +		"replay de fondo=ReplayService+0x248 en {1,2}; sondas extra solo lectura.\n");
@@ -1286,6 +1300,15 @@ index 6758d9f..3472fff 100644
 +
 +static void tt_replay_update()
 +{
++	// Reacquire by name every frame. The old cached writer could corrupt newly
++	// allocated command objects after ParseConstants freed its map entry.
++	auto replay_ini = cl_global(L"$en_replay");
++	auto replay_auto = cl_global(L"$replay_auto_off");
++	auto replay_force = cl_global(L"$replay_force");
++	if (!replay_ini || !replay_auto || !replay_force) {
++		InterlockedExchange(&g_tt_replay_active, 0);
++		return;
++	}
 +	if (InterlockedCompareExchange(&g_tt_replay_probe_state, 0, 0) != 1 &&
 +		!tt_replay_init())
 +		return;
@@ -1320,7 +1343,7 @@ index 6758d9f..3472fff 100644
 +		// Nunca conservar un 1 viejo si la estructura dejo de ser legible: eso
 +		// apagaria el mod manejando. El fallo seguro es volver a activo.
 +		InterlockedExchange(&g_tt_replay_active, 0);
-+		g_tt_replay_ini->fval = 0.0f;
++		TripleWriteIniGlobal(L"$en_replay", 0.0f);
 +		if (InterlockedCompareExchange(&g_tt_replay_read_fault, 1, 0) == 0)
 +			LogInfo("TTREPLAY: fallo leyendo el contexto; mod activo (fail-open).\n");
 +		return;
@@ -1339,15 +1362,15 @@ index 6758d9f..3472fff 100644
 +	// `full` se conserva como autoridad independiente para que una futura variante
 +	// del servicio no pueda encender el mod dentro de la pantalla con controles.
 +	bool replay_servicio = probe.replay248 == 1 || probe.replay248 == 2;
-+	bool pausa_habilitada = g_tt_replay_auto_ini->fval >= 0.5f;
++	bool pausa_habilitada = replay_auto.fval >= 0.5f;
 +	bool replay_detectado = pausa_habilitada && (probe.full || replay_servicio);
-+	bool forzado = g_tt_replay_force_ini->fval >= 0.5f;
++	bool forzado = replay_force.fval >= 0.5f;
 +	LONG activo = (replay_detectado && !forzado) ? 1 : 0;
 +	InterlockedExchange(&g_tt_replay_active, activo);
 +	// `$en_replay` es la señal CRUDA para que [Present] conserve el override
 +	// hasta que termine la repeticion. `activo` es la pausa EFECTIVA: esa es la
 +	// que cierra culling inmediatamente y la que genera los carteles.
-+	g_tt_replay_ini->fval = replay_detectado ? 1.0f : 0.0f;
++	TripleWriteIniGlobal(L"$en_replay", replay_detectado ? 1.0f : 0.0f);
 +
 +	LONG anterior = InterlockedExchange(&g_tt_replay_last, activo);
 +	if (anterior != activo) {
@@ -1363,10 +1386,10 @@ index 6758d9f..3472fff 100644
 +
 +static DWORD WINAPI eye_hud_thread(LPVOID)
 +{
-+	CommandListVariable *v_eye = cl_global(L"$eye_d");
-+	CommandListVariable *v_pw  = cl_global(L"$panel_w");
-+	CommandListVariable *v_sa  = cl_global(L"$side_sa");
-+	CommandListVariable *v_ca  = cl_global(L"$side_ca");
++	auto v_eye = cl_global(L"$eye_d");
++	auto v_pw  = cl_global(L"$panel_w");
++	auto v_sa  = cl_global(L"$side_sa");
++	auto v_ca  = cl_global(L"$side_ca");
 +	if (!v_eye || !v_pw || !v_sa || !v_ca) {
 +		LogInfo("EYEHUD: faltan variables del ini; no se muestra el aviso.\n");
 +		return 0;
@@ -1384,11 +1407,13 @@ index 6758d9f..3472fff 100644
 +	// tiene `hide_in_release` y fuera del modo hunting no se dibujaría nunca.
 +	//
 +	// Si la variable no existe (plantilla anterior a la v23) simplemente no se
-+	// avisa nada: `cl_global` devuelve NULL y el bloque se saltea. No es motivo
++	// avisa nada: `cl_global` devuelve found=false y el bloque se saltea. No es motivo
 +	// para no mostrar el del ojo, que es de otra función.
-+	CommandListVariable *v_pasto = cl_global(L"$pasto_k");
-+	CommandListVariable *v_tipo  = cl_global(L"$pasto_tipo");
-+	CommandListVariable *v_ralea = cl_global(L"$pasto_ralea");
++	auto v_pasto = cl_global(L"$pasto_k");
++	auto v_tipo  = cl_global(L"$pasto_tipo");
++	auto v_ralea = cl_global(L"$pasto_ralea");
++	auto v_triple = cl_global(L"$triple_on");
++	auto v_variante = cl_global(L"$cull_variante");
 +
 +	float ultimo = -12345.0f;
 +	bool primer_aviso_ojo = true;
@@ -1417,15 +1442,31 @@ index 6758d9f..3472fff 100644
 +	// y el bloque no podia dispararse. Codigo muerto con un comentario que
 +	// promete una funcion inexistente es como quedo `$no_shadows` durante nueve
 +	// versiones; no se repite.
-+	float ultimo_pasto = v_pasto ? v_pasto->fval : 0.0f;
-+	float ultimo_tipo  = v_tipo  ? v_tipo->fval  : 0.0f;
-+	float ultimo_ralea = v_ralea ? v_ralea->fval : 0.0f;
++	float ultimo_pasto = v_pasto ? v_pasto.fval : 0.0f;
++	float ultimo_tipo  = v_tipo  ? v_tipo.fval  : 0.0f;
++	float ultimo_ralea = v_ralea ? v_ralea.fval : 0.0f;
++	float ultimo_triple = v_triple ? v_triple.fval : 1.0f;
++	float ultima_variante = v_variante ? v_variante.fval : 0.0f;
 +	while (true) {
++		v_eye = cl_global(L"$eye_d");
++		v_pw = cl_global(L"$panel_w");
++		v_sa = cl_global(L"$side_sa");
++		v_ca = cl_global(L"$side_ca");
++		v_pasto = cl_global(L"$pasto_k");
++		v_tipo = cl_global(L"$pasto_tipo");
++		v_ralea = cl_global(L"$pasto_ralea");
++		v_triple = cl_global(L"$triple_on");
++		v_variante = cl_global(L"$cull_variante");
++		if (!v_eye || !v_pw || !v_sa || !v_ca) { Sleep(120); continue; }
++		if (v_triple && v_triple.fval != ultimo_triple) {
++			ultimo_triple = v_triple.fval;
++			LogOverlay(LOG_WARNING, "TrueTriple %s\n", ultimo_triple >= 0.5f ? "ON" : "OFF");
++		}
 +		// El raleo estable (Ctrl+Shift+F8). Es la palanca que ataca la causa:
 +		// sube el umbral de densidad del propio motor, que descarta la mata
 +		// ANTES del atomico del presupuesto.
-+		if (v_ralea && v_ralea->fval != ultimo_ralea) {
-+			ultimo_ralea = v_ralea->fval;
++		if (v_ralea && v_ralea.fval != ultimo_ralea) {
++			ultimo_ralea = v_ralea.fval;
 +			if (ultimo_ralea < 0.000001f) {
 +				LogOverlay(LOG_WARNING, "Pasto: densidad al MAXIMO"
 +					"  |  Ctrl+Shift+F8 lo hace menos denso\n");
@@ -1439,8 +1480,8 @@ index 6758d9f..3472fff 100644
 +		}
 +
 +		// El bucket aislado. Callado en 0, que es lo normal.
-+		if (v_tipo && v_tipo->fval != ultimo_tipo) {
-+			ultimo_tipo = v_tipo->fval;
++		if (v_tipo && v_tipo.fval != ultimo_tipo) {
++			ultimo_tipo = v_tipo.fval;
 +			int n = (int)(ultimo_tipo + 0.5f);
 +			if (n <= 0) {
 +				LogOverlay(LOG_WARNING, "Pasto: sin aislar ningun tipo"
@@ -1452,8 +1493,25 @@ index 6758d9f..3472fff 100644
 +			}
 +		}
 +
-+		if (v_pasto && v_pasto->fval != ultimo_pasto) {
-+			ultimo_pasto = v_pasto->fval;
++		// 2026-10-08: la variante del terreno lejano (Ctrl+Alt+Shift+Insert). Callado
++		// hasta que el usuario la cambia, como las perillas del pasto.
++		if (v_variante && v_variante.fval != ultima_variante) {
++			ultima_variante = v_variante.fval;
++			int n = (int)(ultima_variante + 0.5f);
++			bool prendido = (TripleReadIniGlobal(L"$cull_widen").fval >= 0.0f) &&
++				(((int)TripleReadIniGlobal(L"$cull_widen").fval & 1024) != 0);
++			const char *que = n == 1 ? "media caja (sin lo de atras), alcance completo"
++				: n == 2 ? "media caja, alcance 6000"
++				: n == 3 ? "media caja, alcance 3000"
++				: n == 4 ? "media caja, alcance 1500"
++				: n == 5 ? "media caja 3000 con el plano cercano ORIGINAL (prueba del pasto)"
++				: "cubo completo (como antes)";
++			LogOverlay(LOG_WARNING, "Terreno lejano: %s%s  |  Ctrl+Alt+Shift+Insert\n", que,
++				prendido ? "" : "  (la casilla esta APAGADA: no tiene efecto)");
++		}
++
++		if (v_pasto && v_pasto.fval != ultimo_pasto) {
++			ultimo_pasto = v_pasto.fval;
 +			if (ultimo_pasto < 0.000001f) {
 +				LogOverlay(LOG_WARNING, "Pasto lateral: SIN RECORTE "
 +					"(k=0, lo maximo)  |  Ctrl+Alt+Shift+F1\n");
@@ -1468,7 +1526,7 @@ index 6758d9f..3472fff 100644
 +			}
 +		}
 +
-+		float e = v_eye->fval;
++		float e = v_eye.fval;
 +		if (e != ultimo) {
 +			ultimo = e;
 +			// Al arrancar, el usuario solo necesita confirmar el estado global.
@@ -1476,13 +1534,13 @@ index 6758d9f..3472fff 100644
 +			// con F5/F6, que es cuando esos numeros realmente son utiles.
 +			if (primer_aviso_ojo) {
 +				primer_aviso_ojo = false;
-+				LogOverlay(LOG_WARNING, "TrueTriple ON\n");
++				LogOverlay(LOG_WARNING, "TrueTriple %s\n", ultimo_triple >= 0.5f ? "ON" : "OFF");
 +				Sleep(120);
 +				continue;
 +			}
 +			// Esquina externa del panel lateral, vista desde arriba, con el
 +			// centro sobre el eje X y el ojo por delante.
-+			float pw = v_pw->fval, sa = v_sa->fval, ca = v_ca->fval;
++			float pw = v_pw.fval, sa = v_sa.fval, ca = v_ca.fval;
 +			float xc = pw * 0.5f + pw * ca;
 +			float yc = pw * sa;
 +			// atan2 y no atan: con el ojo por delante de la esquina el angulo
@@ -1527,8 +1585,7 @@ index 6758d9f..3472fff 100644
 +
 +typedef void *(__fastcall *BuildFrustum_t)(void *dst, const float *viewProj);
 +static BuildFrustum_t g_bf_orig = NULL;
-+static CommandListVariable *g_bf_var = NULL;
-+static volatile LONG g_bf_var_init = 0;
++
 +static volatile LONG g_bf_hooked = 0;
 +static uintptr_t g_bf_exe_base = 0;
 +static volatile LONG g_bf_matched_sites = 0;
@@ -1663,6 +1720,138 @@ index 6758d9f..3472fff 100644
 +    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 +}
 +
++// ===== 2026-10-08: TERRENO LEJANO SIN INUNDAR EL PASTO ======================
++// El cubo de bf_caja_local (bit 1024) arregla el terreno de fondo de los
++// laterales, pero es un cubo alineado al MUNDO de ~60 000 unidades de medio
++// lado alrededor del auto: TODO el tramo pasa el culling de CS10, tambien lo
++// que esta detras, y el pasto entra tarde y en bloques (A/B del 23/09; el
++// autor lo vio de nuevo el 08/10). Esta variante es la MITAD DE ADELANTE de
++// ese volumen, orientada con la camara: detras del ojo solo entra una franja de
++// `margen`. `tope` > 0 acorta ademas el alcance. Las 8 esquinas se reemplazan
++// en el orden del motor, igual que en bf_caja_local.
++//
++// Si el puesto ve MAS de 180 grados (el del autor ve 182: ojo 60, panel 70.84,
++// laterales a 60), el borde externo de los laterales mira un poco hacia atras:
++// el corte se corre hacia atras lo justo para que ese borde entre hasta el
++// alcance (+2 grados de resguardo). Pasado 175 grados de medio angulo devuelve
++// false y el llamador usa el cubo de siempre.
++//
++// `near_original` (variante 5, prueba del pasto 08/10): deja el plano cercano
++// TAL CUAL lo armo el motor en vez de correrlo atras del ojo. El autor vio el
++// pasto igual de mal con el cubo y con alcances cortos, asi que no es cantidad;
++// la sospecha es que el motor mida distancias de detalle contra ese plano. Con
++// esto se pierde la franja de 1-2 grados del borde externo que mira atras.
++static bool bf_media_caja(float *p, float tope, float medio_angulo, float *radio_out, bool near_original=false)
++{
++    __try {
++        if (!(medio_angulo > 1.0f && medio_angulo < 175.0f)) return false;
++        const float *a=p+8, *b=p+12, *c=p+16;
++        double bc[3]={b[1]*c[2]-b[2]*c[1], b[2]*c[0]-b[0]*c[2], b[0]*c[1]-b[1]*c[0]};
++        double ca[3]={c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]};
++        double ab[3]={a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]};
++        double det=a[0]*bc[0]+a[1]*bc[1]+a[2]*bc[2];
++        if (!(fabs(det)>1e-6)) return false;
++        double eye[3];
++        for (int k=0;k<3;k++) {
++            eye[k]=(-a[3]*bc[k]-b[3]*ca[k]-c[3]*ab[k])/det;
++            if (!(fabs(eye[k])<1e7)) return false;
++        }
++        // Ejes de la camara desde los planos originales: el near mira adelante,
++        // izquierdo menos derecho apunta a la derecha, abajo menos arriba
++        // apunta arriba. Gram-Schmidt para que queden ortonormales.
++        double f[3], r[3], u[3];
++        for (int k=0;k<3;k++) { f[k]=p[k]; r[k]=(double)p[8+k]-p[12+k]; u[k]=(double)p[16+k]-p[20+k]; }
++        double lf=sqrt(f[0]*f[0]+f[1]*f[1]+f[2]*f[2]);
++        if (!(lf>1e-9)) return false;
++        for (int k=0;k<3;k++) f[k]/=lf;
++        double rf=r[0]*f[0]+r[1]*f[1]+r[2]*f[2];
++        for (int k=0;k<3;k++) r[k]-=rf*f[k];
++        double lr=sqrt(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]);
++        if (!(lr>1e-9)) return false;
++        for (int k=0;k<3;k++) r[k]/=lr;
++        double uf=u[0]*f[0]+u[1]*f[1]+u[2]*f[2], ur=u[0]*r[0]+u[1]*r[1]+u[2]*r[2];
++        for (int k=0;k<3;k++) u[k]-=uf*f[k]+ur*r[k];
++        double lu=sqrt(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
++        if (!(lu>1e-9)) return false;
++        for (int k=0;k<3;k++) u[k]/=lu;
++        // Alcance: el mismo que el cubo (la esquina original mas lejana), y la
++        // clasificacion de cada esquina original (izq/der, abajo/arriba,
++        // cerca/lejos) para reponerlas en el mismo orden.
++        double max_dist2=0;
++        bool lo[8][3]={};
++        for (int i=0;i<8;i++) {
++            const float *pt=p+24+i*4;
++            double d2=0;
++            for (int k=0;k<3;k++) { double d=(double)pt[k]-eye[k]; d2+=d*d; }
++            if (!(d2>=0 && d2<1e14)) return false;
++            if (d2>max_dist2) max_dist2=d2;
++            const int pares[3]={8,16,0}; // izq/der, abajo/arriba, cerca/lejos
++            for (int e=0;e<3;e++) {
++                int o=pares[e];
++                double dlo=p[o+3], dhi=p[o+7];
++                for (int k=0;k<3;k++) { dlo+=(double)p[o+k]*pt[k]; dhi+=(double)p[o+4+k]*pt[k]; }
++                lo[i][e]=fabs(dlo)<=fabs(dhi);
++            }
++        }
++        if (!(max_dist2>1.0)) return false;
++        double radio=sqrt(max_dist2)*1.001+1.0;
++        if (tope>1.0f && radio>tope) radio=tope;
++        double atras=-cos((medio_angulo+2.0)*0.0174532925)*radio;
++        const double margen=25.0+(atras>0.0?atras:0.0);
++        double fe=f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2];
++        double re=r[0]*eye[0]+r[1]*eye[1]+r[2]*eye[2];
++        double ue=u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2];
++        float plano[24];
++        for (int k=0;k<3;k++) {
++            plano[k]=(float)f[k];     plano[4+k]=(float)-f[k];
++            plano[8+k]=(float)r[k];   plano[12+k]=(float)-r[k];
++            plano[16+k]=(float)u[k];  plano[20+k]=(float)-u[k];
++        }
++        plano[3]=(float)(-fe+margen); plano[7]=(float)(fe+radio);
++        double t_near=-margen;
++        if (near_original) {
++            for (int k=0;k<4;k++) plano[k]=p[k];
++            t_near=-fe-(double)p[3]/lf;
++        }
++        plano[11]=(float)(-re+radio); plano[15]=(float)(re+radio);
++        plano[19]=(float)(-ue+radio); plano[23]=(float)(ue+radio);
++        for (int i=0;i<8;i++) {
++            double sr=lo[i][0]?-radio:radio, su=lo[i][1]?-radio:radio, sf=lo[i][2]?t_near:radio;
++            for (int k=0;k<3;k++) p[24+i*4+k]=(float)(eye[k]+sf*f[k]+sr*r[k]+su*u[k]);
++            p[24+i*4+3]=1.0f;
++        }
++        memcpy(p,plano,sizeof(plano));
++        if (radio_out) *radio_out=(float)radio;
++        return true;
++    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
++}
++
++// Medio angulo horizontal que ve el puesto (grados), con la MISMA cuenta que el
++// cartel de F5/F6 (eye_hud_thread): esquina externa del panel lateral vista
++// desde el ojo. Con monitores distintos, la mitad del central es la suya.
++// -1 si faltan variables.
++static float bf_medio_angulo_triple()
++{
++    TripleIniSnapshot e=TripleReadIniGlobal(L"$eye_d"), pw=TripleReadIniGlobal(L"$panel_w");
++    TripleIniSnapshot sa=TripleReadIniGlobal(L"$side_sa"), ca=TripleReadIniGlobal(L"$side_ca");
++    if (!e.found || !pw.found || !sa.found || !ca.found) return -1.0f;
++    float mitad=pw.fval*0.5f;
++    if (TripleReadIniGlobal(L"$mixto").fval>=0.5f) {
++        float wc=TripleReadIniGlobal(L"$panel_wc").fval;
++        if (wc>1.0f) mitad=wc*0.5f;
++    }
++    float xc=mitad+pw.fval*ca.fval, yc=pw.fval*sa.fval;
++    return atan2f(xc, e.fval-yc)*57.29578f;
++}
++
++// $cull_variante (Ctrl+Alt+Shift+Insert) elige el volumen del terreno lejano:
++// 0 = cubo completo (el de siempre), 1 = media caja con el mismo alcance,
++// 2/3/4 = media caja con alcance topeado a 6000/3000/1500 unidades (3 es el
++// default desde el 08/10: el autor vio el terreno completo y cuesta menos),
++// 5 = la 3 con el plano cercano original (prueba del pasto).
++static const float g_bf_topes_variante[6]={0.0f,0.0f,6000.0f,3000.0f,1500.0f,3000.0f};
++static volatile LONG g_bf_ultima_variante=-1;
++
 +static bool bf_es_camara_principal(const float *p, float *fovh_out,
 +	float *fovv_out)
 +{
@@ -1731,40 +1920,24 @@ index 6758d9f..3472fff 100644
 +// el call site numero N (1..32, numeracion de g_bf_call_rvas + 1); 99 = todos los que se
 +// llamen; 0 = solo CS10. Es la forma de encontrar EN VIVO que sitio cullea el terreno y la
 +// vegetacion, sin gastar una corrida por candidato. El log BFSTAT muestra aperturas por sitio.
-+static CommandListVariable *g_bf_site_var = NULL;
-+static volatile LONG g_bf_site_var_init = 0;
++
 +static volatile LONG g_bf_last_site = -1;
 +static float g_bf_box_radius = 0.0f;
 +
 +static int bf_leer_site_var()
 +{
-+	if (!g_bf_site_var_init) {
-+		auto it = command_list_globals.find(L"$cull_site");
-+		if (it != command_list_globals.end()) {
-+			g_bf_site_var = &it->second;
-+			InterlockedExchange(&g_bf_site_var_init, 1);
-+		}
-+	}
-+	return g_bf_site_var ? (int)g_bf_site_var->fval : 0;
++	return (int)TripleReadIniGlobal(L"$cull_site").fval;
 +}
 +
 +// Shared UI toggle: controls CPU shadow coverage and receiver depth checks.
 +static bool bf_sombras_activas()
 +{
-+    auto it = command_list_globals.find(L"$shadow_practice014");
-+    return it != command_list_globals.end() && it->second.fval >= 0.5f;
++    return TripleReadIniGlobal(L"$shadow_practice014").fval >= 0.5f;
 +}
 +
 +static int bf_leer_modo_var()
 +{
-+	if (!g_bf_var_init) {
-+		auto it = command_list_globals.find(L"$cull_widen");
-+		if (it != command_list_globals.end()) {
-+			g_bf_var = &it->second;
-+			InterlockedExchange(&g_bf_var_init, 1);
-+		}
-+	}
-+	return g_bf_var ? (int)g_bf_var->fval : 0;
++	return (int)TripleReadIniGlobal(L"$cull_widen").fval;
 +}
 +
 +// Bit 16: abre todo sitio cuyo FOV coincida con la camara capturada (experimento del
@@ -1839,7 +2012,7 @@ index 6758d9f..3472fff 100644
 +		char que[128];
 +		bf_describir_modo(modo, que, sizeof(que));
 +		LogInfo("BFCALL: modo CPU cambio a %d (%s).\n", modo, que);
-+		LogOverlay(LOG_WARNING, "Culling CPU: %s\n", que);
++		// Estado normal, no advertencia para el jugador. Sigue en d3d11_log.txt.
 +	}
 +	if (tt_replay_activo())
 +		return result;
@@ -1861,20 +2034,29 @@ index 6758d9f..3472fff 100644
 +        bf_probe_ortho032((float *)dst, sitio, extra);
 +		LONG site_ant = InterlockedExchange(&g_bf_last_site, extra);
 +		if (site_ant != extra) {
-+			if (extra == 99)
-+				LogOverlay(LOG_WARNING, "Culling CPU: CS10 + TODOS los sitios\n");
-+			else if (extra >= 1 && extra <= (int)_countof(g_bf_call_rvas))
-+				LogOverlay(LOG_WARNING, "Culling CPU: CS10 + CS%02d (exe+0x%X)\n", extra, g_bf_call_rvas[extra - 1]);
-+			else
-+				LogOverlay(LOG_WARNING, "Culling CPU: solo CS10\n");
 +			LogInfo("BFCALL: sitio extra = %d.\n", extra);
 +		}
 +		bool abrir = (sitio == BF_SITIO_CS10) ||
 +			(sitio >= 0 && (extra == 99 || extra == sitio + 1));
 +        if (abrir) {
 +            bool changed;
-+            if ((modo & 1024) && sitio == BF_SITIO_CS10)
-+                changed = bf_caja_local((float *)dst, true, &g_bf_box_radius);
++            if ((modo & 1024) && sitio == BF_SITIO_CS10) {
++                int variante=(int)(TripleReadIniGlobal(L"$cull_variante").fval+0.5f);
++                if (variante<0 || variante>5) variante=3;
++                changed=false;
++                float medio=-1.0f;
++                if (variante>=1) {
++                    medio=bf_medio_angulo_triple();
++                    changed=bf_media_caja((float *)dst, g_bf_topes_variante[variante], medio, &g_bf_box_radius, variante==5);
++                }
++                bool cubo=!changed;
++                if (cubo) changed=bf_caja_local((float *)dst, true, &g_bf_box_radius);
++                LONG clave=variante*2+(cubo?1:0);
++                if (InterlockedExchange(&g_bf_ultima_variante, clave)!=clave)
++                    LogInfo("TERRENO: variante %d (%s), medio angulo %.1f, radio %.1f\n", variante,
++                        cubo ? (variante>=1 ? "cubo: el puesto ve 350 grados o mas" : "cubo completo") : "media caja",
++                        medio, g_bf_box_radius);
++            }
 +            else if ((modo & 512) && sitio == BF_SITIO_CS10)
 +                changed = bf_caja_local((float *)dst);
 +            else {
@@ -2063,8 +2245,7 @@ index 6758d9f..3472fff 100644
 +// un cambio real que el modo 0 no hace).
 +static float g_fe0_pre = 0.0f, g_fe0_post = 0.0f;
 +static volatile LONG g_fe0_dif = 0, g_fe0_dif_log = 0;
-+static CommandListVariable *g_hfov_var = NULL;
-+static volatile LONG g_hfov_var_init = 0;
++
 +static volatile LONG g_cam_log_una_vez = 0;
 +
 +static volatile LONG g_hfov_ultimo_x10 = -99999;
@@ -2076,19 +2257,12 @@ index 6758d9f..3472fff 100644
 +	if (antes == ahora || antes == -99999)
 +		return;
 +	LogInfo("BFCALL: $cull_hfov cambio a %.1f (frame %u).\n", ahora / 10.0f, G ? G->frame_no : 0u);
-+	LogOverlay(LOG_WARNING, "Culling CPU: ancho de matriz -> %.0f\n", ahora / 10.0f);
++	// El cambio ya quedo registrado en el log; no es un fallo en pantalla.
 +}
 +
 +static float tt_hfov_objetivo()
 +{
-+	if (!g_hfov_var_init) {
-+		auto it = command_list_globals.find(L"$cull_hfov");
-+		if (it != command_list_globals.end()) {
-+			g_hfov_var = &it->second;
-+			InterlockedExchange(&g_hfov_var_init, 1);
-+		}
-+	}
-+	float h = g_hfov_var ? g_hfov_var->fval : 172.0f;
++	float h = TripleReadIniGlobal(L"$cull_hfov", 172.0f).fval;
 +	if (h < -2.5f) return -3.0f;                 // -3 = pasante puro (marco propio, sin relleno)
 +	if (h < -1.5f) return -2.0f;                 // -2 = pasante + rellena su marco con 0xFF
 +	if (h < -0.5f) return -1.0f;                 // -1 = pasante + rellena su marco con 0x00
@@ -2204,6 +2378,9 @@ index 6758d9f..3472fff 100644
 +
 +static void *__fastcall Hooked_CamUpdate(intptr_t ctx, intptr_t cam, intptr_t params, float f, unsigned n)
 +{
++	// Invalidate first: disabled/replay/failing constructors must not reuse a
++	// previous widened-camera pair. This never writes to the game's camera.
++	TrueTripleShadowFit::Publish((void *)cam, 0, 0);
 +	InterlockedIncrement(&g_cam_llamadas);
 +	tt_hfov_anunciar_cambio();
 +	int modo = bf_leer_modo_var();
@@ -2236,6 +2413,7 @@ index 6758d9f..3472fff 100644
 +		InterlockedIncrement(&g_cam_saltadas);
 +		return r;
 +	}
++	float native_shadow_aspect = TrueTripleShadowFit::NativeAspect(ctx);
 +	float mult_nuevo = 0.0f;
 +	float mult_orig = tt_cam_ensanchar(ctx, &mult_nuevo);
 +	if (mult_orig == 0.0f) {
@@ -2244,6 +2422,8 @@ index 6758d9f..3472fff 100644
 +	}
 +	void *r = g_cam_orig(ctx, cam, params, f, n);
 +	tt_cam_restaurar_mult(ctx, cam, mult_orig);
++	if (g_m00_ancho > 0.0f)
++		TrueTripleShadowFit::PublishConstructed((void *)cam, native_shadow_aspect);
 +	InterlockedIncrement(&g_cam_ensanchadas);
 +	return r;
 +}
@@ -2317,13 +2497,23 @@ index 6758d9f..3472fff 100644
 +
 +// Se instala SOLO si el usuario pidio un modo de call sites (bit 16 o 32 de
 +// $cull_widen). Con 0 no se toca un byte del exe. Un solo intento, un solo parche.
++static bool tt_shadow_fit_enabled()
++{
++	return (bf_leer_modo_var() & 64) && tt_hfov_objetivo() > 0.0f && !tt_replay_activo();
++}
++
 +static void bf_instalar_si_pedido()
 +{
 +	if (g_bf_hooked && g_cam_hooked)
 +		return;
 +	int modo = bf_leer_modo_var();
-+	if (modo & 64)
++	if (modo & 64) {
 +		tt_cam_instalar();
++		if (!TrueTripleShadowFit::install_state) {
++			bool ok = TrueTripleShadowFit::Install(&tt_shadow_fit_enabled);
++			LogInfo("TTSHADOWFIT: native-aspect snapshot for solar fitting: %s; object camera stays wide.\n", ok ? "installed" : "FAILED validation/patch");
++		}
++	}
 +	if ((modo & (16 | 32)) == 0 && !bf_sombras_activas())
 +		return;
 +	triple_install_buildfrustum_hook();
@@ -2340,8 +2530,11 @@ index 6758d9f..3472fff 100644
 +	if (g_bf_ultimo_reporte && ahora - g_bf_ultimo_reporte < 2000)
 +		return;
 +	g_bf_ultimo_reporte = ahora;
-+	CommandListVariable *grass = cl_global(L"$pasto_frustum_mode");
-+	LogInfo("GRASSSTAT: frustum_mode=%.0f\n", grass ? grass->fval : -1.0f);
++	LogInfo("TTSHADOWFIT: corrected=%ld passthrough=%ld\n",
++		InterlockedExchange(&TrueTripleShadowFit::corrections,0),
++		InterlockedExchange(&TrueTripleShadowFit::misses,0));
++	auto grass = cl_global(L"$pasto_frustum_mode");
++	LogInfo("GRASSSTAT: frustum_mode=%.0f\n", grass ? grass.fval : -1.0f);
 +	if(bf_leer_modo_var() & 1024) LogInfo("CULLRANGE: CS10 box half extent %.1f world units\n", g_bf_box_radius);
 +	LONG cam_llam = InterlockedExchange(&g_cam_llamadas, 0);
 +	LONG cam_ens = InterlockedExchange(&g_cam_ensanchadas, 0);
@@ -2384,13 +2577,16 @@ index 6758d9f..3472fff 100644
 +void TripleCullingOSD(wchar_t *buf, size_t n)
 +{
 +	buf[0] = 0;
++	// La linea de telemetria solo sirve durante la caza, no en uso normal.
++	if (!G || G->hunting != HUNTING_MODE_ENABLED)
++		return;
 +	int modo = bf_leer_modo_var();
-+	if (!g_bf_var && !g_bf_hooked && !g_cam_hooked)
++	if (!TripleReadIniGlobal(L"$cull_widen") && !g_bf_hooked && !g_cam_hooked)
 +		return;
 +	char que[128];
 +	bf_describir_modo(modo, que, sizeof(que));
-+	CommandListVariable *grass = cl_global(L"$pasto_frustum_mode");
-+	int k = _snwprintf_s(buf, n, _TRUNCATE, L"CULLING modo %d = %S | grass %.0f", modo, que, grass ? grass->fval : -1.0f);
++	auto grass = cl_global(L"$pasto_frustum_mode");
++	int k = _snwprintf_s(buf, n, _TRUNCATE, L"CULLING modo %d = %S | grass %.0f", modo, que, grass ? grass.fval : -1.0f);
 +	if (k < 0) return;
 +	if (modo & 32) {
 +		int extra = bf_leer_site_var();
@@ -2429,25 +2625,17 @@ index 6758d9f..3472fff 100644
 +static ULONGLONG g_auto_t0 = 0, g_auto_aviso_hasta = 0;
 +static wchar_t g_auto_dir[MAX_PATH] = L"";
 +static int g_auto_guardadas = 0, g_auto_fallidas = 0;
-+static CommandListVariable *g_auto_var = NULL;
-+static volatile LONG g_auto_var_init = 0;
++
 +
 +static float tt_auto_leer_var()
 +{
-+	if (!g_auto_var_init) {
-+		auto it = command_list_globals.find(L"$cull_auto");
-+		if (it != command_list_globals.end())
-+			g_auto_var = &it->second;
-+		InterlockedExchange(&g_auto_var_init, 1);
-+	}
-+	return g_auto_var ? g_auto_var->fval : 0.0f;
++	return TripleReadIniGlobal(L"$cull_auto").fval;
 +}
 +
 +static void tt_auto_poner_estado(int modo, float hfov)
 +{
-+	bf_leer_modo_var(); tt_hfov_objetivo();       // aseguran los punteros a las variables
-+	if (g_bf_var) g_bf_var->fval = (float)modo;
-+	if (g_hfov_var) g_hfov_var->fval = hfov;
++	TripleWriteIniGlobal(L"$cull_widen", (float)modo);
++	TripleWriteIniGlobal(L"$cull_hfov", hfov);
 +}
 +
 +static void tt_auto_capturar(IDXGISwapChain *sc, ID3D11DeviceContext *ctx, const char *nombre, int idx)
@@ -2515,7 +2703,7 @@ index 6758d9f..3472fff 100644
 +	g_auto_aviso_hasta = ahora + 4000;
 +	if (g_auto_paso >= (int)_countof(g_auto_pasos)) {
 +		InterlockedExchange(&g_auto_estado, 2);
-+		if (g_auto_var) g_auto_var->fval = 0.0f;
++		TripleWriteIniGlobal(L"$cull_auto", 0.0f);
 +		LogInfo("AUTO: corrida automatica TERMINADA: %d guardadas, %d fallidas, en %S\n",
 +			g_auto_guardadas, g_auto_fallidas, g_auto_dir);
 +		LogOverlay(LOG_WARNING, "AUTO: LISTO. %d capturas guardadas. Ya podes salir.\n", g_auto_guardadas);
@@ -2544,8 +2732,6 @@ index 6758d9f..3472fff 100644
 +	} else if (estado == 2) {
 +		_snwprintf_s(buf, n, _TRUNCATE, L"AUTO LISTO: %d capturas guardadas (%d fallidas). Ya podes salir.",
 +			g_auto_guardadas, g_auto_fallidas);
-+	} else if (tt_auto_leer_var() >= 0.0f && g_auto_var) {
-+		_snwprintf_s(buf, n, _TRUNCATE, L"AUTO: ubicate, quedate quieto y apreta la tecla de corrida automatica");
 +	}
 +}
 +
@@ -2747,20 +2933,28 @@ index 6758d9f..3472fff 100644
 +
 +// LISTA NEGRA de camaras del motor (v1.41). Los tres m11 de las camaras que NO
 +// deben recibir el triple: menu principal, menu del garage y la orbita del
-+// garage. Son CONSTANTES del juego, bit-exactas en toda sesion — a diferencia
++// garage. El FOV animado de largada cruza el segundo valor; para ese se exige
++// tambien el near del frontend (-0.08). Los valores estaticos se distinguen
 +// del rango de "camaras de conduccion" que se uso antes, que en realidad media
 +// el slider de FOV del usuario (m11 = 1/tan(fovV/2), ajustable POR CAMARA en
-+// DiRT) y por eso se rompio dos veces. La tolerancia 0.01 en espacio m11 es
-+// generosa para constantes exactas y chica frente a la camara real mas cercana
-+// medida (cockpit 3.732 vs menu2 3.546: distancia 0.186).
-+// El ASM de los shaders hace la misma comparacion por su cuenta (fila 5 de
++// DiRT) y por eso se rompio dos veces. La tolerancia 0.01 en m11 NO bastaba
++// para separar la animacion: se midieron seis cuadros consecutivos dentro de
++// ella con near=-0.400019, frente al near=-0.08 del menu alternativo.
++// El ASM de los shaders aplica la misma pareja de comparaciones (fila 5 de
 +// IniParams, publicada por [Present]); esta copia es para los flags x3/x9.
-+static inline bool tt_es_camara_de_menu(float m11)
++static inline bool tt_es_camara_de_menu(float m11, float m23)
 +{
 +	const float negras[3] = { 4.272611f, 3.545733f, 1.000000f };
 +	for (int i = 0; i < 3; i++) {
 +		float d = m11 - negras[i];
 +		if (d < 0) d = -d;
++		// El FOV animado de la largada cruza m11=3.545733 durante seis frames.
++		// El frontend real tiene near=-0.08; la camara de largada, -0.4.
++		if (i == 1) {
++			float dn = m23 + 0.08f;
++			if (dn < 0) dn = -dn;
++			if (dn >= 0.01f) continue;
++		}
 +		if (d < 0.01f)
 +			return true;
 +	}
@@ -2825,7 +3019,7 @@ index 6758d9f..3472fff 100644
 +			// contaba como "menu". Se pasa al mismo criterio que el resto: la
 +			// LISTA NEGRA de camaras del motor (constantes bit-exactas que el
 +			// usuario no puede tocar). Ver tt_es_camara_de_menu().
-+			if (tt_es_camara_de_menu(f[5])) {
++		if (tt_es_camara_de_menu(f[5], f[14])) {
 +				// v1.86: la RACHA de frames seguidos con el frontend en
 +				// pantalla. Si paso un frame ENTERO sin ninguna camara de la
 +				// lista negra, la racha se corto y vuelve a empezar. Que la
@@ -2944,7 +3138,7 @@ index 6758d9f..3472fff 100644
 +		//
 +		// La condicion es la ya probada: no es camara de menu y es perspectiva
 +		// real (m22 < -0.9, para descartar una ortografica que se cuela).
-+		if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f && G->iniParams.size() >= 10) {
++		if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f && G->iniParams.size() >= 10) {
 +			G->iniParams[9].z = f[33];
 +			// Y el CABECEO de la camara respecto del mundo.
 +			//
@@ -3100,7 +3294,7 @@ index 6758d9f..3472fff 100644
 +		// siguen leyendo son `TriplePcl` y `TriplePclM` (las particulas), que no
 +		// tienen volcado propio que permita afirmar lo mismo — para ellas esta
 +		// publicacion sigue siendo necesaria.
-+		if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f) {
++		if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f) {
 +			if (G->iniParams.size() >= 9) {
 +				// UNA linea, la primera vez que publicamos una camara que el
 +				// gate viejo (`m11 <= 3.0`) habria descartado. Es la prueba de
@@ -3155,7 +3349,7 @@ index 6758d9f..3472fff 100644
 +			// por el gate de captura (m22 == m00, near -1209) y con lista negra
 +			// en vez de rango habria contado como "de conduccion".
 +			static unsigned g_frame_conduccion = 0x80000000;
-+			if (!tt_es_camara_de_menu(f[5]) && f[10] < -0.9f)
++			if (!tt_es_camara_de_menu(f[5], f[14]) && f[10] < -0.9f)
 +				g_frame_conduccion = G->frame_no;
 +			if (G->iniParams.size() >= 10)
 +				G->iniParams[9].x =
@@ -3183,7 +3377,7 @@ index 6758d9f..3472fff 100644
 +			if (dm11 <= 0.02f && dm23 <= 0.05f) { ya_vista = true; break; }
 +		}
 +		if (!ya_vista && triple_logcount < 96) {
-+			bool negra = tt_es_camara_de_menu(f[5]);
++			bool negra = tt_es_camara_de_menu(f[5], f[14]);
 +			// las camaras interiores (cockpit/capo/piso) se distinguen por el
 +			// near chico; marcarlas hace el log legible de un vistazo
 +			bool interior = (f[14] > -0.30f && f[14] < -0.02f);
@@ -3745,10 +3939,28 @@ index 6758d9f..3472fff 100644
  		staging_type(false),
  		val(FLT_MAX),
 diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
-index 142cbbf..aca1a03 100644
+index 142cbbf4..bb6a192c 100644
 --- a/DirectX11/CommandList.h
 +++ b/DirectX11/CommandList.h
-@@ -379,6 +379,91 @@ public:
+@@ -26,6 +26,17 @@ class HackerContext;
+ enum class FrameAnalysisOptions;
+ class ResourceCopyTarget;
+ 
++// Native consumers must never retain a pointer into command_list_globals:
++// ParseConstants clears that map on reload. Return a locked value copy instead.
++struct TripleIniSnapshot {
++	bool found;
++	float fval;
++	explicit operator bool() const { return found; }
++};
++TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback = 0.0f);
++void TripleWriteIniGlobal(const wchar_t *name, float value);
++void TripleInstallHudLayout();
++
+ class CommandListState {
+ public:
+ 	HackerDevice *mHackerDevice;
+@@ -379,6 +390,91 @@ public:
  	void run(CommandListState*) override;
  };
  
@@ -3841,7 +4053,7 @@ index 142cbbf..aca1a03 100644
  enum class CustomResourceType {
  	INVALID,
 diff --git a/DirectX11/D3D11Wrapper.cpp b/DirectX11/D3D11Wrapper.cpp
-index 9829f2b..557377d 100644
+index 9829f2b1..eb2dec7e 100644
 --- a/DirectX11/D3D11Wrapper.cpp
 +++ b/DirectX11/D3D11Wrapper.cpp
 @@ -6,6 +6,10 @@
@@ -3864,27 +4076,35 @@ index 9829f2b..557377d 100644
  // globals.h and log.h files.
  
  // Globals used to be allocated on the heap, which is pointless given that it
-@@ -103,6 +107,28 @@ static bool InitializeDLL()
+@@ -103,6 +107,36 @@ static bool InitializeDLL()
  		return false;
  	}
  
-+    // This is before the first native D3D11CreateDevice and the renderer
-+    // constructors. Never install/remove these patches from config hot reload.
-+    auto aa = command_list_globals.find(L"$force_native_aa");
-+    if (aa != command_list_globals.end() && aa->second.fval >= 0.5f) {
++    TripleInstallHudLayout();
++
++    bool taa_installed_here = false;
++    auto taa_gate = command_list_globals.find(L"$force_taa_off");
++    if (taa_gate != command_list_globals.end() && taa_gate->second.fval >= 0.5f) {
 +        auto taa = TrueTripleTaaLock::Install();
-+        LogInfo("NATIVEAA042 TAA: %ls\n", TrueTripleTaaLock::Describe(taa));
++        LogInfo("NATIVEAA047 TAA off: %ls\n", TrueTripleTaaLock::Describe(taa));
 +        if (taa != TrueTripleTaaLock::Result::Installed &&
 +            taa != TrueTripleTaaLock::Result::AlreadyInstalled) {
 +            if (LogFile) fflush(LogFile);
 +            FatalAppExitA(0, "TrueTriple: no se pudo bloquear TAA. Consulte d3d11_log.txt.");
 +        }
++        taa_installed_here = taa == TrueTripleTaaLock::Result::Installed;
++    }
++
++    auto cmaa_gate = command_list_globals.find(L"$force_cmaa_on");
++    if (cmaa_gate != command_list_globals.end() && cmaa_gate->second.fval >= 0.5f) {
 +        auto cmaa = TrueTripleCmaaLock::Install();
-+        LogInfo("NATIVEAA042 CMAA: %ls\n", TrueTripleCmaaLock::Describe(cmaa));
++        LogInfo("NATIVEAA047 CMAA on: %ls\n", TrueTripleCmaaLock::Describe(cmaa));
 +        if (cmaa != TrueTripleCmaaLock::Result::Installed &&
 +            cmaa != TrueTripleCmaaLock::Result::AlreadyInstalled) {
-+            auto rollback = TrueTripleTaaLock::Remove();
-+            LogInfo("NATIVEAA042 TAA rollback: %ls\n", TrueTripleTaaLock::Describe(rollback));
++            if (taa_installed_here) {
++                auto rollback = TrueTripleTaaLock::Remove();
++                LogInfo("NATIVEAA047 TAA rollback: %ls\n", TrueTripleTaaLock::Describe(rollback));
++            }
 +            if (LogFile) fflush(LogFile);
 +            FatalAppExitA(0, "TrueTriple: no se pudo forzar CMAA. Consulte d3d11_log.txt.");
 +        }
@@ -3893,7 +4113,7 @@ index 9829f2b..557377d 100644
  	// Preload OUR nvapi before we call init because we need some of our calls.
  #if(_WIN64)
  #define NVAPI_DLL L"nvapi64.dll"
-@@ -159,7 +185,7 @@ static bool InitializeDLL()
+@@ -159,7 +193,7 @@ static bool InitializeDLL()
  	//	return false;
  	//}
  
@@ -3902,7 +4122,7 @@ index 9829f2b..557377d 100644
  	// into that mode early, before any possible CreateDevice occurs.
  	if (G->gForceStereo == 2)
  	{
-@@ -441,7 +467,7 @@ void InitD311()
+@@ -441,7 +475,7 @@ void InitD311()
  	InitializeCriticalSectionPretty(&resource_creation_mode_lock);
  
  	InitializeDLL();
@@ -3911,7 +4131,7 @@ index 9829f2b..557377d 100644
  
  	// Chain through to the either the original DLL in the system, or to a proxy
  	// DLL with the same interface, specified in the d3dx.ini file.
-@@ -482,7 +508,7 @@ void InitD311()
+@@ -482,7 +516,7 @@ void InitD311()
  	}
  	else
  	{
@@ -3920,7 +4140,7 @@ index 9829f2b..557377d 100644
  		// Must remain all lower case to be matched in DLLMainHook.
  		// We need the system d3d11 in order to find the original proc addresses.
  		// We hook LoadLibraryExW, so we need to use that here.
-@@ -695,10 +721,10 @@ static void ShowDebugInfo(ID3D11Device *origDevice)
+@@ -695,10 +729,10 @@ static void ShowDebugInfo(ID3D11Device *origDevice)
  // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476875(v=vs.85).aspx
  //
  // Also, when we are called with down-level requests, we need to not wrap the objects
@@ -3933,7 +4153,7 @@ index 9829f2b..557377d 100644
  // assume that they don't plan to use that device for the game, and will look
  // only for a DX11 device. No point in supporting DX10 here, too few games to matter.
  // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476150(v=vs.85).aspx#ID3D11Device_CreateTexture1D
-@@ -711,15 +737,15 @@ static void ShowDebugInfo(ID3D11Device *origDevice)
+@@ -711,15 +745,15 @@ static void ShowDebugInfo(ID3D11Device *origDevice)
  // it as a .ini option to force this mode.
  // (Can be an array. We are looking only at first element. Seems OK.)
  //
@@ -3952,7 +4172,7 @@ index 9829f2b..557377d 100644
  // Returns true if we need to error out with E_INVALIDARG, which is default in d3dx.ini.
  
  static bool ForceDX11(D3D_FEATURE_LEVEL *featureLevels)
-@@ -846,12 +872,12 @@ static HackerDevice* wrap_d3d11_device_and_context(ID3D11Device **ppDevice, ID3D
+@@ -846,12 +880,12 @@ static HackerDevice* wrap_d3d11_device_and_context(ID3D11Device **ppDevice, ID3D
  // For creating the device, we need to call the original D3D11CreateDevice in order to initialize
  // Direct3D, and collect the original Device and original Context.  Both of those will be handed
  // off to the wrapped HackerDevice and HackerContext objects, so they can call out to the originals
@@ -3968,7 +4188,7 @@ index 9829f2b..557377d 100644
  // the reference as a normal ID3D11Device.
  // In the no platform_update case, the mOrigDevice1 will actually be an ID3D11Device.
 diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
-index a0a8d70..20a0115 100644
+index a0a8d701..8cf88b36 100644
 --- a/DirectX11/HackerContext.cpp
 +++ b/DirectX11/HackerContext.cpp
 @@ -14,6 +14,11 @@
@@ -5058,7 +5278,7 @@ index a0a8d70..20a0115 100644
  	 mOrigContext1->PSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
  }
  
-@@ -1551,6 +2566,176 @@ void HackerContext::AfterDispatch(DispatchContext *context)
+@@ -1551,6 +2566,168 @@ void HackerContext::AfterDispatch(DispatchContext *context)
  		RunCommandList(mHackerDevice, this, context->post_commands, &context->call_info, true);
  }
  
@@ -5150,15 +5370,7 @@ index a0a8d70..20a0115 100644
 +	if (tls_gc_repitiendo || !es_vs_clutter(vs_hash) || !args)
 +		return;
 +
-+	static CommandListVariable *var = NULL;
-+	static volatile LONG init = 0;
-+	if (!init) {
-+		auto it = command_list_globals.find(L"$gc_tramos");
-+		if (it != command_list_globals.end())
-+			var = &it->second;
-+		InterlockedExchange(&init, 1);
-+	}
-+	int n = var ? (int)var->fval : 0;
++	int n = (int)TripleReadIniGlobal(L"$gc_tramos").fval;
 +	if (n <= 0)
 +		return;
 +	if (n > 64)
@@ -5235,7 +5447,7 @@ index a0a8d70..20a0115 100644
  STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
  	/* [annotation] */
  	__in  UINT ThreadGroupCountX,
-@@ -1561,6 +2746,22 @@ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
+@@ -1561,6 +2738,22 @@ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
  {
  	DispatchContext context{ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
  
@@ -5258,7 +5470,7 @@ index a0a8d70..20a0115 100644
  	if (BeforeDispatch(&context))
  		mOrigContext1->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
  	else
-@@ -1577,6 +2778,8 @@ STDMETHODIMP_(void) HackerContext::DispatchIndirect(THIS_
+@@ -1577,6 +2770,8 @@ STDMETHODIMP_(void) HackerContext::DispatchIndirect(THIS_
  {
  	DispatchContext context{&pBufferForArgs, AlignedByteOffsetForArgs};
  
@@ -5267,7 +5479,7 @@ index a0a8d70..20a0115 100644
  	if (BeforeDispatch(&context))
  		mOrigContext1->DispatchIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
  	else
-@@ -1607,6 +2810,60 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
+@@ -1607,6 +2802,59 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
  	/* [annotation] */
  	__in_ecount_opt(NumRects)  const D3D11_RECT *pRects)
  {
@@ -5301,8 +5513,7 @@ index a0a8d70..20a0115 100644
 +                if (desc.Width == desc.Height && desc.Width >= 1024 && desc.Width <= 4096 &&
 +                    desc.ArraySize >= 3 && desc.ArraySize <= 4 && desc.SampleDesc.Count == 1 &&
 +                    (desc.Format == DXGI_FORMAT_R32_TYPELESS || desc.Format == DXGI_FORMAT_D32_FLOAT)) {
-+                    auto site = command_list_globals.find(L"$cull_site");
-+                    bool open = site != command_list_globals.end() && site->second.fval == 100.0f;
++                    bool open = TripleReadIniGlobal(L"$cull_site").fval == 100.0f;
 +                    static LONG reports = 0;
 +                    if (InterlockedIncrement(&reports) <= 24) {
 +                        D3D11_DEPTH_STENCIL_VIEW_DESC viewDesc = {};
@@ -5328,7 +5539,7 @@ index a0a8d70..20a0115 100644
  	 mOrigContext1->RSSetScissorRects(NumRects, pRects);
  }
  
-@@ -1681,6 +2938,9 @@ STDMETHODIMP_(void) HackerContext::CopySubresourceRegion(THIS_
+@@ -1681,6 +2929,9 @@ STDMETHODIMP_(void) HackerContext::CopySubresourceRegion(THIS_
  	D3D11_BOX replaceSrcBox;
  	UINT replaceDstX = DstX;
  
@@ -5338,7 +5549,7 @@ index a0a8d70..20a0115 100644
  	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
  		MarkResourceHashContaminated(pDstResource, DstSubresource, pSrcResource, SrcSubresource, 'S', DstX, DstY, DstZ, pSrcBox);
  	}
-@@ -1707,6 +2967,9 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
+@@ -1707,6 +2958,9 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
  	/* [annotation] */
  	__in  ID3D11Resource *pSrcResource)
  {
@@ -5348,7 +5559,7 @@ index a0a8d70..20a0115 100644
  	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
  		MarkResourceHashContaminated(pDstResource, 0, pSrcResource, 0, 'C', 0, 0, 0, NULL);
  	}
-@@ -1735,9 +2998,54 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
+@@ -1735,9 +2989,54 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
  		MarkResourceHashContaminated(pDstResource, DstSubresource, NULL, 0, 'U', 0, 0, 0, NULL);
  	}
  
@@ -5404,7 +5615,7 @@ index a0a8d70..20a0115 100644
  	// We only update the destination resource hash when the entire
  	// subresource 0 is updated and pDstBox is NULL. We could check if the
  	// pDstBox fills the entire resource, but if the game is using pDstBox
-@@ -1756,6 +3064,14 @@ STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
+@@ -1756,6 +3055,14 @@ STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
  	/* [annotation] */
  	__in  ID3D11UnorderedAccessView *pSrcView)
  {
@@ -5419,7 +5630,7 @@ index a0a8d70..20a0115 100644
  	 mOrigContext1->CopyStructureCount(pDstBuffer, DstAlignedByteOffset, pSrcView);
  }
  
-@@ -1849,6 +3165,8 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
+@@ -1849,6 +3156,8 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
  		// need to rebind the 3DMigoto resources now. See also
  		// FinishCommandList's RestoreDeferredContextState:
  		Bind3DMigotoResources();
@@ -5428,7 +5639,7 @@ index a0a8d70..20a0115 100644
  	}
  }
  
-@@ -1956,6 +3274,23 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
+@@ -1956,6 +3265,23 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
  	/* [annotation] */
  	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
  {
@@ -5452,7 +5663,7 @@ index a0a8d70..20a0115 100644
  	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
  }
  
-@@ -1969,6 +3304,25 @@ STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
+@@ -1969,6 +3295,25 @@ STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
  	/* [annotation] */
  	__in_ecount(NumUAVs)  const UINT *pUAVInitialCounts)
  {
@@ -5478,7 +5689,7 @@ index a0a8d70..20a0115 100644
  	if (ppUnorderedAccessViews) {
  		// TODO: Record stats on unordered access view usage
  		for (UINT i = 0; i < NumUAVs; ++i) {
-@@ -2522,6 +3876,9 @@ STDMETHODIMP_(void) HackerContext::ClearState(THIS)
+@@ -2522,6 +3867,9 @@ STDMETHODIMP_(void) HackerContext::ClearState(THIS)
  {
  	 mOrigContext1->ClearState();
  
@@ -5488,7 +5699,7 @@ index a0a8d70..20a0115 100644
  	 // ClearState() will unbind StereoParams and IniParams, so we need to
  	 // rebind them now:
  	 Bind3DMigotoResources();
-@@ -2549,6 +3906,11 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
+@@ -2549,6 +3897,11 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
  {
  	BOOL ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
  
@@ -5500,7 +5711,7 @@ index a0a8d70..20a0115 100644
  	if (!RestoreDeferredContextState) {
  		// This is equivalent to calling ClearState() afterwards, so we
  		// need to rebind the 3DMigoto resources now. See also
-@@ -2789,6 +4151,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexed(THIS_
+@@ -2789,6 +4142,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexed(THIS_
  	/* [annotation] */
  	__in  INT BaseVertexLocation)
  {
@@ -5511,7 +5722,7 @@ index a0a8d70..20a0115 100644
  	DrawContext c = DrawContext(DrawCall::DrawIndexed, 0, IndexCount, 0, BaseVertexLocation, StartIndexLocation, 0, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2803,6 +4169,10 @@ STDMETHODIMP_(void) HackerContext::Draw(THIS_
+@@ -2803,6 +4160,10 @@ STDMETHODIMP_(void) HackerContext::Draw(THIS_
  	/* [annotation] */
  	__in  UINT StartVertexLocation)
  {
@@ -5522,7 +5733,7 @@ index a0a8d70..20a0115 100644
  	DrawContext c = DrawContext(DrawCall::Draw, VertexCount, 0, 0, StartVertexLocation, 0, 0, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2821,6 +4191,11 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
+@@ -2821,6 +4182,11 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
  {
  	mOrigContext1->IASetIndexBuffer(pIndexBuffer, Format, Offset);
  
@@ -5534,7 +5745,7 @@ index a0a8d70..20a0115 100644
  	// This is only used for index buffer hunting nowadays since the
  	// command list checks the hash on demand only when it is needed
  	mCurrentIndexBuffer = 0;
-@@ -2847,6 +4222,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstanced(THIS_
+@@ -2847,6 +4213,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstanced(THIS_
  	/* [annotation] */
  	__in  UINT StartInstanceLocation)
  {
@@ -5545,7 +5756,7 @@ index a0a8d70..20a0115 100644
  	DrawContext c = DrawContext(DrawCall::DrawIndexedInstanced, 0, IndexCountPerInstance, InstanceCount, BaseVertexLocation, StartIndexLocation, StartInstanceLocation, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2866,6 +4245,10 @@ STDMETHODIMP_(void) HackerContext::DrawInstanced(THIS_
+@@ -2866,6 +4236,10 @@ STDMETHODIMP_(void) HackerContext::DrawInstanced(THIS_
  	/* [annotation] */
  	__in  UINT StartInstanceLocation)
  {
@@ -5556,7 +5767,7 @@ index a0a8d70..20a0115 100644
  	DrawContext c = DrawContext(DrawCall::DrawInstanced, VertexCountPerInstance, 0, InstanceCount, StartVertexLocation, 0, StartInstanceLocation, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2882,6 +4265,25 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
+@@ -2882,6 +4256,25 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
  	/* [annotation] */
  	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
  {
@@ -5582,7 +5793,7 @@ index a0a8d70..20a0115 100644
  	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
  }
  
-@@ -2994,6 +4396,12 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstancedIndirect(THIS_
+@@ -2994,6 +4387,12 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstancedIndirect(THIS_
  	/* [annotation] */
  	__in  UINT AlignedByteOffsetForArgs)
  {
@@ -5595,7 +5806,7 @@ index a0a8d70..20a0115 100644
  	DrawContext c = DrawContext(DrawCall::DrawIndexedInstancedIndirect, 0, 0, 0, 0, 0, 0, &pBufferForArgs, AlignedByteOffsetForArgs);
  	BeforeDraw(c);
  
-@@ -3008,6 +4416,8 @@ STDMETHODIMP_(void) HackerContext::DrawInstancedIndirect(THIS_
+@@ -3008,6 +4407,8 @@ STDMETHODIMP_(void) HackerContext::DrawInstancedIndirect(THIS_
  	/* [annotation] */
  	__in  UINT AlignedByteOffsetForArgs)
  {
@@ -5605,7 +5816,7 @@ index a0a8d70..20a0115 100644
  	BeforeDraw(c);
  
 diff --git a/DirectX11/HackerContext.h b/DirectX11/HackerContext.h
-index 33c26e1..7ae1a9d 100644
+index 33c26e18..7ae1a9d4 100644
 --- a/DirectX11/HackerContext.h
 +++ b/DirectX11/HackerContext.h
 @@ -119,6 +119,11 @@ private:
@@ -5636,7 +5847,7 @@ index 33c26e1..7ae1a9d 100644
  	UINT64 mCurrentHullShader;
  	UINT64 mCurrentDomainShader;
 diff --git a/DirectX11/HackerDXGI.cpp b/DirectX11/HackerDXGI.cpp
-index 82cfd09..1f8cbbe 100644
+index 82cfd092..1f8cbbe7 100644
 --- a/DirectX11/HackerDXGI.cpp
 +++ b/DirectX11/HackerDXGI.cpp
 @@ -539,6 +539,8 @@ STDMETHODIMP HackerSwapChain::GetDevice(
@@ -5661,7 +5872,7 @@ index 82cfd09..1f8cbbe 100644
  			Profiling::end(&profiling_state, &Profiling::present_overhead);
  	}
 diff --git a/DirectX11/Hunting.cpp b/DirectX11/Hunting.cpp
-index b1c7861..f92d054 100644
+index b1c7861d..f92d054b 100644
 --- a/DirectX11/Hunting.cpp
 +++ b/DirectX11/Hunting.cpp
 @@ -1235,6 +1235,8 @@ static void RevertMissingShaders()
@@ -5674,7 +5885,7 @@ index b1c7861..f92d054 100644
  }
  
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..e9119a9 100644
+index 2c88983b..87a7e87c 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
 @@ -21,10 +21,8 @@
@@ -5690,135 +5901,7 @@ index 2c88983..e9119a9 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -945,13 +943,20 @@ static std::vector<std::wstring> GetIniStringMultipleKeys(const wchar_t *section
- 
- // Helper functions to parse common types and log their values. TODO: Convert
- // more of this file to use these where appropriate
-+// El eco del ini al log (nombres de seccion, clave=valor y cada linea de
-+// command list) va con LogDebug y no con LogInfo (2026-10-10). Con calls=1 y
-+// LogInfo, el d3dx.ini ENTERO terminaba en d3d11_log.txt, que es el archivo
-+// que los usuarios mandan por soporte y suben a Discord. Con [Logging]
-+// debug=0 (produccion) ya no se vuelca; con debug=1 (desarrollo) sale igual
-+// que siempre. El resto del log (shader analysis, TRIPLE camera, etc.) no
-+// cambia: sigue siendo la evidencia que pide la regla dura 10.
- int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
- 		const wchar_t *def, wchar_t *ret, unsigned size)
- {
- 	int rc = GetIniString(section, key, def, ret, size);
- 
- 	if (rc)
--		LogInfo("  %S=%S\n", key, ret);
-+		LogDebug("  %S=%S\n", key, ret);
- 
- 	return rc;
- }
-@@ -961,7 +966,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
- 	bool rc = GetIniString(section, key, def, ret);
- 
- 	if (rc)
--		LogInfo("  %S=%s\n", key, ret->c_str());
-+		LogDebug("  %S=%s\n", key, ret->c_str());
- 
- 	return rc;
- }
-@@ -983,7 +988,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
- 		} else {
- 			if (found)
- 				*found = true;
--			LogInfo("  %S=%f\n", key, ret);
-+			LogDebug("  %S=%f\n", key, ret);
- 		}
- 	}
- 
-@@ -1008,7 +1013,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
- 		} else {
- 			if (found)
- 				*found = true;
--			LogInfo("  %S=%d\n", key, ret);
-+			LogDebug("  %S=%d\n", key, ret);
- 		}
- 	}
- 
-@@ -1025,13 +1030,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
- 
- 	if (GetIniString(section, key, 0, val, 32)) {
- 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
--			LogInfo("  %S=1\n", key);
-+			LogDebug("  %S=1\n", key);
- 			if (found)
- 				*found = true;
- 			return true;
- 		}
- 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
--			LogInfo("  %S=0\n", key);
-+			LogDebug("  %S=0\n", key);
- 			if (found)
- 				*found = true;
- 			return false;
-@@ -1060,7 +1065,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
- 		} else {
- 			if (found)
- 				*found = true;
--			LogInfo("  %S=%016llx\n", key, ret);
-+			LogDebug("  %S=%016llx\n", key, ret);
- 		}
- 	}
- 
-@@ -1083,7 +1088,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
- 		} else {
- 			if (found)
- 				*found = true;
--			LogInfo("  %S=%x\n", key, ret);
-+			LogDebug("  %S=%x\n", key, ret);
- 		}
- 	}
- 
-@@ -1127,7 +1132,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
- 			ret = ParseEnum(val, prefix, names, names_len, first);
- 			if (found)
- 				*found = true;
--			LogInfo("  %S=%S\n", key, val);
-+			LogDebug("  %S=%S\n", key, val);
- 		} catch (EnumParseError) {
- 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
- 		}
-@@ -1155,7 +1160,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
- 		if (tmp_found) {
- 			if (found)
- 				*found = tmp_found;
--			LogInfo("  %S=%S\n", key, val);
-+			LogDebug("  %S=%S\n", key, val);
- 		} else {
- 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
- 		}
-@@ -1188,7 +1193,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
- 		if (tmp_found) {
- 			if (found)
- 				*found = tmp_found;
--			LogInfo("  %S=%s\n", key, val.c_str());
-+			LogDebug("  %S=%s\n", key, val.c_str());
- 		} else {
- 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
- 		}
-@@ -1296,7 +1301,7 @@ static void ParseIncludedIniFiles()
- 
- 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
- 			section_id = i->first.c_str();
--			LogInfo("[%S]\n", section_id);
-+			LogDebug("[%S]\n", section_id);
- 
- 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
- 
-@@ -1304,7 +1309,7 @@ static void ParseIncludedIniFiles()
- 			for (entry = section->begin(); entry < section->end(); entry++) {
- 				key = &entry->first;
- 				val = &entry->second;
--				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
-+				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
- 
- 				rel_path = namespace_path + *val;
- 
-@@ -1345,7 +1350,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1343,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -5827,16 +5910,7 @@ index 2c88983..e9119a9 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1356,7 +1361,7 @@ static void RegisterPresetKeyBindings()
- 	for (i = lower; i != upper; i++) {
- 		const wchar_t *id = i->first.c_str();
- 
--		LogInfo("[%S]\n", id);
-+		LogDebug("[%S]\n", id);
- 
- 		keys = GetIniStringMultipleKeys(id, L"Key");
- 		back = GetIniStringMultipleKeys(id, L"Back");
-@@ -1370,12 +1375,29 @@ static void RegisterPresetKeyBindings()
+@@ -1370,12 +1368,29 @@ static void RegisterPresetKeyBindings()
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
  
@@ -5867,7 +5941,7 @@ index 2c88983..e9119a9 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1405,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1398,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -5876,54 +5950,9 @@ index 2c88983..e9119a9 100644
  	}
  }
  
-@@ -1418,7 +1440,7 @@ static void ParsePresetOverrideSections()
- 		const wchar_t *id = i->first.c_str();
- 		preset = &i->second;
- 
--		LogInfo("[%S]\n", id);
-+		LogDebug("[%S]\n", id);
- 
- 		// Read parameters from ini
- 		preset->ParseIniSection(id);
-@@ -1959,7 +1981,7 @@ static void ParseCommandList(const wchar_t *id,
- 		}
- 
- 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
--			LogInfo("  %S\n", raw_line->c_str());
-+			LogDebug("  %S\n", raw_line->c_str());
- 			continue;
- 		}
- 
-@@ -2266,7 +2288,7 @@ static void ParseShaderOverrideSections()
- 	for (i = lower; i != upper; i++) {
- 		id = i->first.c_str();
- 
--		LogInfo("[%S]\n", id);
-+		LogDebug("[%S]\n", id);
- 
- 		hash = GetIniHash(id, L"Hash", 0, &found);
- 		if (!found) {
-@@ -2561,7 +2583,7 @@ static void ParseShaderRegexSections()
- 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
- 	for (i = lower; i != upper; i++) {
- 		section_id = &i->first;
--		LogInfo("[%S]\n", section_id->c_str());
-+		LogDebug("[%S]\n", section_id->c_str());
- 
- 		hash = hash_ini_section(hash, section_id);
- 
-@@ -3124,7 +3146,7 @@ static void ParseTextureOverrideSections()
- 	for (i = lower; i != upper; i++) {
- 		id = i->first.c_str();
- 
--		LogInfo("[%S]\n", id);
-+		LogDebug("[%S]\n", id);
- 
- 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
- 		if (!found) {
-diff --git b/DirectX11/OrthoFrustumProbe.h b/DirectX11/OrthoFrustumProbe.h
+diff --git a/DirectX11/OrthoFrustumProbe.h b/DirectX11/OrthoFrustumProbe.h
 new file mode 100644
-index 0000000..a263b4c
+index 00000000..a263b4c6
 --- /dev/null
 +++ b/DirectX11/OrthoFrustumProbe.h
 @@ -0,0 +1,56 @@
@@ -5984,7 +6013,7 @@ index 0000000..a263b4c
 +    return true;
 +}
 diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
-index 994124c..828e0a1 100644
+index 994124cd..828e0a14 100644
 --- a/DirectX11/Overlay.cpp
 +++ b/DirectX11/Overlay.cpp
 @@ -4,6 +4,7 @@
@@ -7591,7 +7620,7 @@ index 994124c..828e0a1 100644
  		mSpriteBatch->End();
  	}
 diff --git a/DirectX11/Overlay.h b/DirectX11/Overlay.h
-index e261940..fbb5bea 100644
+index e2619402..fbb5beab 100644
 --- a/DirectX11/Overlay.h
 +++ b/DirectX11/Overlay.h
 @@ -103,6 +103,16 @@ private:
@@ -7611,9 +7640,9 @@ index e261940..fbb5bea 100644
  	void DrawRectangle(float x, float y, float w, float h, float r, float g, float b, float opacity);
  	void DrawOutlinedString(DirectX::SpriteFont *font, wchar_t const *text, DirectX::XMFLOAT2 const &position, DirectX::FXMVECTOR color);
  
-diff --git b/DirectX11/TrueTripleCmaaLock.cpp b/DirectX11/TrueTripleCmaaLock.cpp
+diff --git a/DirectX11/TrueTripleCmaaLock.cpp b/DirectX11/TrueTripleCmaaLock.cpp
 new file mode 100644
-index 0000000..f475c45
+index 00000000..f475c45f
 --- /dev/null
 +++ b/DirectX11/TrueTripleCmaaLock.cpp
 @@ -0,0 +1,246 @@
@@ -7863,9 +7892,9 @@ index 0000000..f475c45
 +	}
 +}
 +}
-diff --git b/DirectX11/TrueTripleCmaaLock.h b/DirectX11/TrueTripleCmaaLock.h
+diff --git a/DirectX11/TrueTripleCmaaLock.h b/DirectX11/TrueTripleCmaaLock.h
 new file mode 100644
-index 0000000..d0db704
+index 00000000..0cfd83fa
 --- /dev/null
 +++ b/DirectX11/TrueTripleCmaaLock.h
 @@ -0,0 +1,30 @@
@@ -7874,7 +7903,7 @@ index 0000000..d0db704
 +#include <windows.h>
 +
 +// Included once by D3D11Wrapper.cpp; installed during early proxy initialization
-+// when the active mod configuration enables force_native_aa.
++// when the active mod configuration enables force_cmaa_on.
 +namespace TrueTripleCmaaLock
 +{
 +enum class Result
@@ -7899,9 +7928,519 @@ index 0000000..d0db704
 +Result Remove();
 +const wchar_t *Describe(Result result);
 +}
-diff --git b/DirectX11/TrueTripleTaaLock.cpp b/DirectX11/TrueTripleTaaLock.cpp
+diff --git a/DirectX11/TrueTripleHudLayout.h b/DirectX11/TrueTripleHudLayout.h
 new file mode 100644
-index 0000000..32fd295
+index 00000000..e4792193
+--- /dev/null
++++ b/DirectX11/TrueTripleHudLayout.h
+@@ -0,0 +1,118 @@
++#pragma once
++#include <windows.h>
++#include <cstdint>
++#include <cstring>
++
++// DR2 1.18.130.9032. Change only the osd_scaler query, never the global
++// Eyefinity state (which also shrinks menus and changes camera behavior).
++namespace TrueTripleHudLayout {
++using DisplayQuery = bool (__fastcall *)(int *, int *, bool *);
++using EnabledQuery = bool (*)();
++static DisplayQuery original = nullptr;
++static EnabledQuery enabled = nullptr;
++static uintptr_t osd_vtable = 0;
++static volatile LONG corrections = 0;
++static volatile LONG install_state = 0;
++
++// 0/1 preserve the original bool result. 3 asks the relay to resume after
++// the game's OSD enum getter with enum=middle already in EAX.
++static int __fastcall Query(int *columns, int *rows, bool *landscape, void *layout)
++{
++    bool osd = false;
++    __try { osd = layout && *reinterpret_cast<uintptr_t *>(layout) == osd_vtable; }
++    __except (EXCEPTION_EXECUTE_HANDLER) { osd = false; }
++    if (osd && enabled && enabled()) {
++        *columns = 3;
++        *rows = 1;
++        *landscape = false;
++        InterlockedIncrement(&corrections);
++        return 3;
++    }
++    return original(columns, rows, landscape) ? 1 : 0;
++}
++
++static size_t MakeRelay(unsigned char *dst, void *target)
++{
++    // RBX is the layout object at this exact call site. Supply it as arg4.
++    // Keep a normal Win64 shadow space/alignment while calling the C++ hook.
++    const unsigned char code[] = {
++        0x49,0x89,0xD9,                   // mov r9,rbx
++        0x48,0xB8,0,0,0,0,0,0,0,0,      // mov rax,target
++        0x48,0x83,0xEC,0x28,             // sub rsp,28h
++        0xFF,0xD0,                       // call rax
++        0x48,0x83,0xC4,0x28,             // add rsp,28h
++        0x83,0xF8,0x03,0x75,0x05,        // cmp eax,3; jne normal_return
++        0x48,0x83,0x04,0x24,0x0D,        // add qword [rsp],13
++        0xC3                             // ret (D79E36 or D79E43)
++    };
++    memcpy(dst, code, sizeof(code));
++    memcpy(dst + 5, &target, sizeof(target));
++    return sizeof(code);
++}
++
++static bool Validate(unsigned char *base)
++{
++    __try {
++        auto dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
++        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return false;
++        auto nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
++        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
++            nt->FileHeader.TimeDateStamp != 0x605CBAE3 || nt->OptionalHeader.SizeOfImage != 0x2255000) return false;
++        // Includes the instruction that supplies the object in RBX, the
++        // argument registers, original CALL/test/branch/getter and continuation.
++        const unsigned char site[] = {
++            0x40,0x32,0xF6,0xE8,0xAA,0xA0,0xED,0xFF,0x84,0xC0,
++            0x0F,0x84,0xCC,0x01,0x00,0x00,0xE8,0x8D,0xA0,0xED,0xFF,0x8B,0xF8
++        };
++        if (memcmp(base + 0xD79E2E, site, sizeof(site))) return false;
++        const uintptr_t methods[] = {0xD61250,0xD77F30,0xD79D00,0xD6F070,0xFC0220,0xD6E600,0x50BB70};
++        for (size_t i = 0; i < sizeof(methods)/sizeof(methods[0]); ++i)
++            if (*reinterpret_cast<uintptr_t *>(base + 0x13DB880 + i*8) != reinterpret_cast<uintptr_t>(base) + methods[i]) return false;
++        return memcmp(base + 0x13DB8C8, "osd_scale", 10) == 0;
++    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
++}
++
++static bool Install(EnabledQuery gate)
++{
++    if (InterlockedCompareExchange(&install_state, 1, 0)) return install_state == 2;
++    auto base = reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr));
++    if (!Validate(base)) return false;
++    // Only the call displacement changes. Its containing eight-byte word is
++    // aligned, so the transition cannot expose a partially written CALL.
++    constexpr uintptr_t slot_rva = 0xD79E30;
++    static_assert((slot_rva & 7) == 0, "atomic patch alignment");
++    unsigned char *relay = nullptr;
++    SYSTEM_INFO si; GetSystemInfo(&si);
++    uintptr_t origin = (reinterpret_cast<uintptr_t>(base) + 0x2255000 + si.dwAllocationGranularity - 1) & ~(uintptr_t(si.dwAllocationGranularity) - 1);
++    for (uintptr_t delta = 0; delta < 0x60000000 && !relay; delta += si.dwAllocationGranularity)
++        relay = reinterpret_cast<unsigned char *>(VirtualAlloc(reinterpret_cast<void *>(origin + delta), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
++    if (!relay) return false;
++    intptr_t distance = reinterpret_cast<intptr_t>(relay) - reinterpret_cast<intptr_t>(base + 0xD79E36);
++    if (distance < INT32_MIN || distance > INT32_MAX) { VirtualFree(relay, 0, MEM_RELEASE); return false; }
++    size_t n = MakeRelay(relay, reinterpret_cast<void *>(&Query));
++    DWORD old;
++    if (!VirtualProtect(relay, 4096, PAGE_EXECUTE_READ, &old) || !FlushInstructionCache(GetCurrentProcess(), relay, n)) {
++        VirtualFree(relay, 0, MEM_RELEASE); return false;
++    }
++    original = reinterpret_cast<DisplayQuery>(base + 0xC53EE0);
++    osd_vtable = reinterpret_cast<uintptr_t>(base + 0x13DB880);
++    enabled = gate;
++    LONG64 before, after;
++    memcpy(&before, base + slot_rva, 8);
++    after = before;
++    int32_t rel = static_cast<int32_t>(distance);
++    memcpy(reinterpret_cast<unsigned char *>(&after) + 2, &rel, 4);
++    auto slot = reinterpret_cast<volatile LONG64 *>(base + slot_rva);
++    if (!VirtualProtect(base + slot_rva, 8, PAGE_EXECUTE_READWRITE, &old)) return false;
++    bool changed = InterlockedCompareExchange64(slot, after, before) == before;
++    bool flushed = changed && FlushInstructionCache(GetCurrentProcess(), base + slot_rva, 8);
++    if (changed && !flushed) {
++        InterlockedCompareExchange64(slot, before, after);
++        FlushInstructionCache(GetCurrentProcess(), base + slot_rva, 8);
++    }
++    DWORD ignored;
++    VirtualProtect(base + slot_rva, 8, old, &ignored);
++    InterlockedExchange(&install_state, flushed ? 2 : -1);
++    return flushed;
++}
++}
+diff --git a/DirectX11/TrueTripleShadowFit.h b/DirectX11/TrueTripleShadowFit.h
+new file mode 100644
+index 00000000..9af0a867
+--- /dev/null
++++ b/DirectX11/TrueTripleShadowFit.h
+@@ -0,0 +1,144 @@
++#pragma once
++#include <windows.h>
++#include <cstdint>
++#include <cstring>
++#include <cmath>
++
++// DR2 1.18.130.9032: the solar fitter reads camera.aspect twice: to build
++// perspective cascade corners AND to stabilize/quantize the light bounds.
++// Supply a stack-local, read-only camera snapshot to that one call. Never
++// restore the shared CPU camera: grass/objects must retain their wide view.
++namespace TrueTripleShadowFit {
++using Fit = uintptr_t (__fastcall *)(void *, void *, void *, const void *, void *, void *);
++using Gate = bool (*)();
++static Fit original = nullptr;
++static Gate enabled = nullptr;
++static volatile LONG install_state = 0, corrections = 0, misses = 0;
++static SRWLOCK camera_lock = SRWLOCK_INIT;
++struct CameraAspect { const void *camera; float native_aspect, wide_aspect; };
++static CameraAspect cameras[16] = {};
++static unsigned next_camera = 0;
++constexpr size_t CameraBytes = 0x1d0; // last read is MOVAPS [r15+1c0]
++
++static bool ValidAspect(float f) { return std::isfinite(f) && f > 0.05f && f < 1000.0f; }
++
++// Called after the camera constructor. Store a coherent pair tied to the
++// actual camera object, not a global "last m00" from an unrelated viewport.
++static void Publish(const void *camera, float native_aspect, float wide_aspect)
++{
++    AcquireSRWLockExclusive(&camera_lock);
++    unsigned slot = 16;
++    for (unsigned i=0; i<16; ++i) if (cameras[i].camera == camera) { slot=i; break; }
++    if (slot==16) slot = next_camera++ % 16;
++    cameras[slot] = {camera, native_aspect, wide_aspect};
++    ReleaseSRWLockExclusive(&camera_lock);
++}
++
++static bool Snapshot(const void *camera, unsigned char *copy)
++{
++    CameraAspect pair = {};
++    AcquireSRWLockShared(&camera_lock);
++    for (unsigned i=0; i<16; ++i) if (cameras[i].camera==camera) { pair=cameras[i]; break; }
++    ReleaseSRWLockShared(&camera_lock);
++    if (!camera || !ValidAspect(pair.native_aspect) || !ValidAspect(pair.wide_aspect)) return false;
++    __try {
++        // The exact fitter only reads this object. It never calls its vtable,
++        // writes it, retains its address, or forwards it to another function.
++        const auto bytes = static_cast<const unsigned char *>(camera);
++        float actual; memcpy(&actual, bytes+0x130, 4);
++        if (!ValidAspect(actual) || fabsf(actual-pair.wide_aspect) > pair.wide_aspect*1e-5f) return false;
++        if (fabsf(actual-pair.native_aspect) <= actual*1e-5f) return false;
++        memcpy(copy, camera, CameraBytes);
++        memcpy(copy+0x130, &pair.native_aspect, 4);
++        return true;
++    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
++}
++
++static uintptr_t __fastcall Query(void *owner, void *slices, void *context,
++    const void *camera, void *pose, void *light)
++{
++    alignas(16) unsigned char local[CameraBytes];
++    if (enabled && enabled() && Snapshot(camera, local)) {
++        InterlockedIncrement(&corrections);
++        return original(owner, slices, context, local, pose, light);
++    }
++    InterlockedIncrement(&misses);
++    return original(owner, slices, context, camera, pose, light);
++}
++
++static bool Validate(unsigned char *base)
++{
++    __try {
++        auto dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
++        if (dos->e_magic!=IMAGE_DOS_SIGNATURE || dos->e_lfanew<=0 || dos->e_lfanew>0x100000) return false;
++        auto nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base+dos->e_lfanew);
++        if (nt->Signature!=IMAGE_NT_SIGNATURE || nt->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64 ||
++            nt->FileHeader.TimeDateStamp!=0x605CBAE3 || nt->OptionalHeader.SizeOfImage!=0x2255000) return false;
++        const unsigned char args[] = {0x4d,0x8b,0xcd,0x4c,0x89,0x74,0x24,0x20,0x4c,0x8b,0xc3,0x48,0x8b,0xce};
++        if (memcmp(base+0x3c63c4,args,sizeof(args))) return false;
++        const auto call = base+0x3c63d2;
++        int32_t rel; memcpy(&rel,call+1,4);
++        if (call[0]!=0xe8 || call+5+rel!=base+0x3a8da0) return false;
++        const unsigned char load[] = {0xf3,0x41,0x0f,0x10,0xbf,0x30,0x01,0x00,0x00};
++        const unsigned char mul[]  = {0xf3,0x41,0x0f,0x59,0x87,0x30,0x01,0x00,0x00};
++        return !memcmp(base+0x3a8ed6,load,sizeof(load)) && !memcmp(base+0x3a9424,mul,sizeof(mul));
++    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
++}
++
++static float NativeAspect(intptr_t context)
++{
++    __try {
++        auto rt=*reinterpret_cast<intptr_t *>(context+0xfa0);
++        if (!rt) return 0;
++        unsigned w=*reinterpret_cast<unsigned *>(rt+0xa4), h=*reinterpret_cast<unsigned *>(rt+0xa8);
++        if (!w || !h) return 0;
++        float value=(float(w)/float(h))* *reinterpret_cast<float *>(context+0xfe0);
++        return ValidAspect(value) ? value : 0;
++    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
++}
++
++static void PublishConstructed(const void *camera, float native_aspect)
++{
++    float wide=0;
++    __try { wide=*reinterpret_cast<const float *>(static_cast<const unsigned char *>(camera)+0x130); }
++    __except (EXCEPTION_EXECUTE_HANDLER) { native_aspect=0; }
++    Publish(camera,native_aspect,wide);
++}
++
++static bool Install(Gate gate)
++{
++    if (InterlockedCompareExchange(&install_state,1,0)) return install_state==2;
++    auto base = reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr));
++    if (!Validate(base)) { InterlockedExchange(&install_state,-1); return false; }
++    SYSTEM_INFO si; GetSystemInfo(&si);
++    auto origin = (reinterpret_cast<uintptr_t>(base)+0x2255000+si.dwAllocationGranularity-1) & ~(uintptr_t(si.dwAllocationGranularity)-1);
++    unsigned char *relay=nullptr;
++    for (uintptr_t delta=0; delta<0x60000000 && !relay; delta+=si.dwAllocationGranularity)
++        relay=static_cast<unsigned char *>(VirtualAlloc(reinterpret_cast<void *>(origin+delta),4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
++    if (!relay) { InterlockedExchange(&install_state,-1); return false; }
++    intptr_t distance = reinterpret_cast<intptr_t>(relay)-reinterpret_cast<intptr_t>(base+0x3c63d7);
++    if (distance<INT32_MIN || distance>INT32_MAX) { VirtualFree(relay,0,MEM_RELEASE); InterlockedExchange(&install_state,-1); return false; }
++    // Tail jump preserves the game's return address and both stack arguments.
++    const unsigned char jump[] = {0x48,0xb8,0,0,0,0,0,0,0,0,0xff,0xe0};
++    memcpy(relay,jump,sizeof(jump));
++    auto target=&Query; memcpy(relay+2,&target,8);
++    DWORD old;
++    if (!VirtualProtect(relay,4096,PAGE_EXECUTE_READ,&old) || !FlushInstructionCache(GetCurrentProcess(),relay,sizeof(jump))) {
++        VirtualFree(relay,0,MEM_RELEASE); InterlockedExchange(&install_state,-1); return false;
++    }
++    original=reinterpret_cast<Fit>(base+0x3a8da0); enabled=gate;
++    // Entire CALL lies within one aligned eight-byte word; atomically publish
++    // the rel32 without suspending threads or relocating a function prologue.
++    constexpr uintptr_t slot_rva=0x3c63d0;
++    LONG64 before,after; memcpy(&before,base+slot_rva,8); after=before;
++    int32_t rel=static_cast<int32_t>(distance); memcpy(reinterpret_cast<unsigned char *>(&after)+3,&rel,4);
++    if (!VirtualProtect(base+slot_rva,8,PAGE_EXECUTE_READWRITE,&old)) { InterlockedExchange(&install_state,-1); return false; }
++    auto slot=reinterpret_cast<volatile LONG64 *>(base+slot_rva);
++    bool changed=InterlockedCompareExchange64(slot,after,before)==before;
++    bool flushed=changed && FlushInstructionCache(GetCurrentProcess(),base+slot_rva,8);
++    if (changed && !flushed) { InterlockedCompareExchange64(slot,before,after); FlushInstructionCache(GetCurrentProcess(),base+slot_rva,8); }
++    DWORD ignored; VirtualProtect(base+slot_rva,8,old,&ignored);
++    InterlockedExchange(&install_state,flushed ? 2 : -1);
++    return flushed;
++}
++}
+diff --git a/DirectX11/TrueTripleShadowTrace.h b/DirectX11/TrueTripleShadowTrace.h
+new file mode 100644
+index 00000000..a10aee4d
+--- /dev/null
++++ b/DirectX11/TrueTripleShadowTrace.h
+@@ -0,0 +1,230 @@
++#pragma once
++// Temporary opt-in diagnostic. Copies inputs, never edits shader state or data.
++#include <d3d11_1.h>
++#include <wrl/client.h>
++#include <mutex>
++#include <vector>
++#include <cstdio>
++#include <cstdint>
++#include <string>
++#include <atomic>
++#include <share.h>
++
++namespace TrueTripleShadowTrace {
++using Microsoft::WRL::ComPtr;
++inline bool IsShadow(uint64_t h) {
++    return h == 0x7b1c3954b16cb924ULL || h == 0x8f4b91ddaa6d349cULL ||
++        h == 0x2a12730f88510d16ULL || h == 0x794efcbfc3a6b0c3ULL ||
++        h == 0xdcedabb6dc07fd9eULL || h == 0xf09ffcea62344a8eULL;
++}
++#pragma pack(push, 1)
++struct Record {
++    uint32_t magic = 0x31534854; // THS1
++    uint32_t size = sizeof(Record);
++    uint64_t sequence = 0, ms = 0, shader = 0, context = 0;
++    uint32_t recordFrame = 0, executeFrame = 0, readyFrame = 0, deferred = 0, thread = 0;
++    uint32_t groups[3] = {};
++    uint32_t bytes[4] = {}; // cb0, cb3, cb5, canonical IniParams texture
++    uint32_t first[3] = {}, count[3] = {};
++};
++#pragma pack(pop)
++struct Slot {
++    Record record;
++    ComPtr<ID3D11Resource> copy[4];
++    ComPtr<ID3D11Query> event;
++    ComPtr<ID3D11CommandList> list;
++    bool pending = false, submitted = false;
++    void Retire() {
++        pending = false; list.Reset();
++        // Deferred lists can be replayed. Never recycle their destinations/query.
++        if (record.deferred) { for (auto& c : copy) c.Reset(); event.Reset(); }
++    }
++};
++class Recorder {
++    std::mutex mutex;
++    Slot slots[32];
++    FILE *file = nullptr;
++    std::wstring statusPath;
++    uint64_t start = 0, written = 0, accepted = 0, done = 0, dropped = 0, errors = 0;
++    HRESULT lastError = S_OK;
++    bool initialized = false;
++    std::atomic<bool> accepting{false};
++    std::atomic<bool> open{false};
++    void Status(const char *phase) {
++        FILE *s = nullptr;
++        if (!_wfopen_s(&s, statusPath.c_str(), L"wb") && s) {
++            fprintf(s, "TTST1 phase=%s queued=%llu written=%llu dropped=%llu errors=%llu bytes=%llu last_hr=%08lx\n",
++                phase, accepted, done, dropped, errors, written, lastError);
++            fclose(s);
++        }
++    }
++    bool CopyInput(ID3D11DeviceContext *ctx, ID3D11Device *device, ID3D11Resource *source,
++                   ComPtr<ID3D11Resource>& copy, uint32_t& bytes) {
++        if (!source) { copy.Reset(); bytes = 0; return true; }
++        D3D11_RESOURCE_DIMENSION kind; source->GetType(&kind);
++        if (kind == D3D11_RESOURCE_DIMENSION_BUFFER) {
++            D3D11_BUFFER_DESC d; static_cast<ID3D11Buffer*>(source)->GetDesc(&d);
++            if (d.ByteWidth > 65536) return false;
++            bytes = d.ByteWidth;
++            if (copy) {
++                D3D11_RESOURCE_DIMENSION old; copy->GetType(&old);
++                if (old != kind) copy.Reset();
++                else { D3D11_BUFFER_DESC prev; static_cast<ID3D11Buffer*>(copy.Get())->GetDesc(&prev);
++                    if (prev.ByteWidth != d.ByteWidth) copy.Reset(); }
++            }
++            if (!copy) {
++                d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++                d.MiscFlags = 0; d.StructureByteStride = 0;
++                ComPtr<ID3D11Buffer> b;
++                if (FAILED(device->CreateBuffer(&d, nullptr, &b))) return false;
++                copy = b;
++            }
++        } else if (kind == D3D11_RESOURCE_DIMENSION_TEXTURE1D) {
++            D3D11_TEXTURE1D_DESC d; static_cast<ID3D11Texture1D*>(source)->GetDesc(&d);
++            if (d.Format != DXGI_FORMAT_R32G32B32A32_FLOAT || d.Width > 4096 || d.ArraySize != 1 || d.MipLevels != 1) return false;
++            bytes = d.Width * 16;
++            if (copy) {
++                D3D11_RESOURCE_DIMENSION old; copy->GetType(&old);
++                if (old != kind) copy.Reset();
++                else { D3D11_TEXTURE1D_DESC prev; static_cast<ID3D11Texture1D*>(copy.Get())->GetDesc(&prev);
++                    if (prev.Width != d.Width || prev.Format != d.Format) copy.Reset(); }
++            }
++            if (!copy) {
++                d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
++                ComPtr<ID3D11Texture1D> t;
++                if (FAILED(device->CreateTexture1D(&d, nullptr, &t))) return false;
++                copy = t;
++            }
++        } else return false;
++        ctx->CopyResource(copy.Get(), source);
++        return true;
++    }
++public:
++    bool Enabled() { return accepting; } // Called on the serialized context path after Init.
++    void Start(const std::wstring& path) {
++        if (file) return;
++        file = _wfsopen(path.c_str(), L"wb", _SH_DENYNO);
++        if (!file) return;
++        setvbuf(file, nullptr, _IOFBF, 1024 * 1024);
++        statusPath = path + L".status.txt";
++        start = GetTickCount64(); accepting = true; open = true; Status("armed");
++    }
++    void Init() {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (initialized) return;
++        initialized = true;
++        wchar_t exe[MAX_PATH] = {}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
++        std::wstring dir(exe); dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
++        if (GetFileAttributesW((dir + L"TrueTriple-shadow-trace.arm").c_str()) == INVALID_FILE_ATTRIBUTES) return;
++        SYSTEMTIME t; GetLocalTime(&t);
++        wchar_t name[128]; swprintf_s(name, L"TrueTriple-shadow-trace-%04u%02u%02u-%02u%02u%02u-%lu.bin",
++            t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,GetCurrentProcessId());
++        Start(dir + name);
++    }
++    void Capture(ID3D11DeviceContext *ctx, uint64_t hash, uint32_t frame, const UINT groups[3],
++                 ID3D11Buffer *const buffers[3], const UINT first[3], const UINT counts[3], ID3D11Texture1D *ini) {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (!accepting) return;
++        if (GetTickCount64() - start > 300000 || accepted >= 60000 || written >= 64 * 1024 * 1024) {
++            accepting = false; fflush(file); Status("limit-draining"); return;
++        }
++        Slot *slot = nullptr;
++        for (auto& s : slots) if (!s.pending) { slot = &s; break; }
++        if (!slot) { ++dropped; return; }
++        ComPtr<ID3D11Device> device; ctx->GetDevice(&device);
++        if (!slot->event) {
++            D3D11_QUERY_DESC d = { D3D11_QUERY_EVENT, 0 };
++            if (FAILED(device->CreateQuery(&d, &slot->event))) { ++errors; return; }
++        }
++        auto& r = slot->record; r = Record();
++        r.sequence = ++accepted; r.ms = GetTickCount64() - start; r.shader = hash;
++        r.context = reinterpret_cast<uint64_t>(ctx); r.recordFrame = frame;
++        r.deferred = ctx->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED; r.thread = GetCurrentThreadId();
++        r.executeFrame = r.deferred ? UINT32_MAX : frame;
++        slot->submitted = !r.deferred;
++        memcpy(r.groups, groups, sizeof(r.groups)); memcpy(r.first, first, sizeof(r.first)); memcpy(r.count, counts, sizeof(r.count));
++        bool ok = true;
++        for (int i = 0; i < 4; ++i) {
++            ID3D11Resource *source = i == 3 ? static_cast<ID3D11Resource*>(ini) : buffers[i];
++            if (!CopyInput(ctx, device.Get(), source, slot->copy[i], r.bytes[i])) { ok = false; break; }
++            r.size += r.bytes[i];
++        }
++        // Even a partial copy must complete before this staging slot can be reused.
++        if (!ok) { ++errors; r.magic = 0; }
++        ctx->End(slot->event.Get()); slot->pending = true;
++    }
++    void Finish(ID3D11DeviceContext *ctx, ID3D11CommandList *list) {
++        if (!open || !list) return;
++        std::lock_guard<std::mutex> lock(mutex);
++        for (auto& s : slots) if (s.pending && !s.submitted && !s.list &&
++            s.record.context == reinterpret_cast<uint64_t>(ctx)) s.list = list;
++    }
++    void Executed(ID3D11CommandList *list, uint32_t frame) {
++        if (!open) return;
++        std::lock_guard<std::mutex> lock(mutex);
++        for (auto& s : slots) if (s.pending && s.list.Get() == list) {
++            s.submitted = true; s.record.executeFrame = frame;
++        }
++    }
++    void Pump(ID3D11DeviceContext *ctx, uint32_t frame) {
++        if (!open) return;
++        if (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
++        std::lock_guard<std::mutex> lock(mutex);
++        if (!file) return;
++        for (auto& s : slots) {
++            if (!s.pending || !s.submitted) continue;
++            BOOL ready = FALSE;
++            HRESULT hr = ctx->GetData(s.event.Get(), &ready, sizeof(ready), D3D11_ASYNC_GETDATA_DONOTFLUSH);
++            if (hr == S_FALSE || (hr == S_OK && !ready)) continue;
++            if (FAILED(hr)) { ++errors; lastError=hr; s.Retire(); continue; }
++            if (!s.record.magic) { s.Retire(); continue; }
++            std::vector<unsigned char> payload;
++            bool ok = true;
++            for (int i = 0; i < 4; ++i) {
++                if (!s.record.bytes[i]) continue;
++                D3D11_MAPPED_SUBRESOURCE m = {};
++                hr = ctx->Map(s.copy[i].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
++                if (FAILED(hr)) { ok = false; ++errors; lastError=hr; break; }
++                const auto *p = static_cast<const unsigned char*>(m.pData);
++                payload.insert(payload.end(), p, p + s.record.bytes[i]);
++                ctx->Unmap(s.copy[i].Get(), 0);
++            }
++            if (ok && written + s.record.size <= 64 * 1024 * 1024) {
++                s.record.readyFrame = frame;
++                if (fwrite(&s.record, sizeof(Record), 1, file) != 1 || fwrite(payload.data(), 1, payload.size(), file) != payload.size()) {
++                    accepting = false; ++errors;
++                } else { written += s.record.size; ++done; }
++                if (done == 1 || done % 120 == 0) { fflush(file); Status(accepting ? "recording" : "draining"); }
++            }
++            s.Retire();
++        }
++        if (!accepting) {
++            bool pending = false; for (auto& s : slots) pending |= s.pending;
++            if (!pending) { fflush(file); Status("stopped"); fclose(file); file = nullptr; open = false; }
++        }
++    }
++    void Close() {
++        std::lock_guard<std::mutex> lock(mutex);
++        accepting = false;
++        if (file) { fflush(file); Status("closed"); fclose(file); file = nullptr; open = false; }
++    }
++    ~Recorder() { if (file) fclose(file); }
++};
++inline Recorder& Session() { static Recorder recorder; return recorder; }
++
++// Shadow bindings belong to EACH context; Get* is forbidden on deferred contexts.
++struct Bindings {
++    ComPtr<ID3D11Buffer> cb[3];
++    UINT first[3] = {}, count[3] = {};
++    void Set(UINT start, UINT n, ID3D11Buffer *const *buffers, const UINT *offset = nullptr, const UINT *length = nullptr) {
++        if (!Session().Enabled()) return;
++        const UINT slots[] = {0, 3, 5};
++        for (int i = 0; i < 3; ++i) if (slots[i] >= start && slots[i] < start+n) {
++            UINT j = slots[i]-start; cb[i] = buffers ? buffers[j] : nullptr;
++            first[i] = offset ? offset[j] : 0;
++            count[i] = length ? length[j] : 4096;
++        }
++    }
++    void Clear() { for (auto& b : cb) b.Reset(); memset(first, 0, sizeof(first)); memset(count, 0, sizeof(count)); }
++};
++}
+diff --git a/DirectX11/TrueTripleTaaLock.cpp b/DirectX11/TrueTripleTaaLock.cpp
+new file mode 100644
+index 00000000..32fd2951
 --- /dev/null
 +++ b/DirectX11/TrueTripleTaaLock.cpp
 @@ -0,0 +1,222 @@
@@ -8127,9 +8666,9 @@ index 0000000..32fd295
 +	}
 +}
 +}
-diff --git b/DirectX11/TrueTripleTaaLock.h b/DirectX11/TrueTripleTaaLock.h
+diff --git a/DirectX11/TrueTripleTaaLock.h b/DirectX11/TrueTripleTaaLock.h
 new file mode 100644
-index 0000000..aa06198
+index 00000000..872fcd16
 --- /dev/null
 +++ b/DirectX11/TrueTripleTaaLock.h
 @@ -0,0 +1,30 @@
@@ -8138,7 +8677,7 @@ index 0000000..aa06198
 +#include <windows.h>
 +
 +// Included once by D3D11Wrapper.cpp; installed during early proxy initialization
-+// when the active mod configuration enables force_native_aa.
++// when the active mod configuration enables force_taa_off.
 +namespace TrueTripleTaaLock
 +{
 +enum class Result
@@ -8163,9 +8702,9 @@ index 0000000..aa06198
 +Result Remove();
 +const wchar_t *Describe(Result result);
 +}
-diff --git b/DirectX11/VisibilityProbe.h b/DirectX11/VisibilityProbe.h
+diff --git a/DirectX11/VisibilityProbe.h b/DirectX11/VisibilityProbe.h
 new file mode 100644
-index 0000000..dd11733
+index 00000000..dd11733c
 --- /dev/null
 +++ b/DirectX11/VisibilityProbe.h
 @@ -0,0 +1,166 @@
@@ -8336,7 +8875,7 @@ index 0000000..dd11733
 +}
 +} // namespace
 diff --git a/DirectX11/profiling.cpp b/DirectX11/profiling.cpp
-index 1e28262..56c46fc 100644
+index 1e282627..56c46fc5 100644
 --- a/DirectX11/profiling.cpp
 +++ b/DirectX11/profiling.cpp
 @@ -434,6 +434,13 @@ void Profiling::update_txt()

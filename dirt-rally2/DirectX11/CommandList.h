@@ -26,6 +26,17 @@ class HackerContext;
 enum class FrameAnalysisOptions;
 class ResourceCopyTarget;
 
+// Native consumers must never retain a pointer into command_list_globals:
+// ParseConstants clears that map on reload. Return a locked value copy instead.
+struct TripleIniSnapshot {
+	bool found;
+	float fval;
+	explicit operator bool() const { return found; }
+};
+TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback = 0.0f);
+void TripleWriteIniGlobal(const wchar_t *name, float value);
+void TripleInstallHudLayout();
+
 class CommandListState {
 public:
 	HackerDevice *mHackerDevice;

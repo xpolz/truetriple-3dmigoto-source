@@ -3,7 +3,7 @@
 #include <windows.h>
 
 // Included once by D3D11Wrapper.cpp; installed during early proxy initialization
-// when the active mod configuration enables force_native_aa.
+// when the active mod configuration enables force_cmaa_on.
 namespace TrueTripleCmaaLock
 {
 enum class Result

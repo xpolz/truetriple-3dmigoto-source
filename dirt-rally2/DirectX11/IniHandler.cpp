@@ -943,20 +943,13 @@ static std::vector<std::wstring> GetIniStringMultipleKeys(const wchar_t *section
 
 // Helper functions to parse common types and log their values. TODO: Convert
 // more of this file to use these where appropriate
-// El eco del ini al log (nombres de seccion, clave=valor y cada linea de
-// command list) va con LogDebug y no con LogInfo (2026-10-10). Con calls=1 y
-// LogInfo, el d3dx.ini ENTERO terminaba en d3d11_log.txt, que es el archivo
-// que los usuarios mandan por soporte y suben a Discord. Con [Logging]
-// debug=0 (produccion) ya no se vuelca; con debug=1 (desarrollo) sale igual
-// que siempre. El resto del log (shader analysis, TRIPLE camera, etc.) no
-// cambia: sigue siendo la evidencia que pide la regla dura 10.
 int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 		const wchar_t *def, wchar_t *ret, unsigned size)
 {
 	int rc = GetIniString(section, key, def, ret, size);
 
 	if (rc)
-		LogDebug("  %S=%S\n", key, ret);
+		LogInfo("  %S=%S\n", key, ret);
 
 	return rc;
 }
@@ -966,7 +959,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 	bool rc = GetIniString(section, key, def, ret);
 
 	if (rc)
-		LogDebug("  %S=%s\n", key, ret->c_str());
+		LogInfo("  %S=%s\n", key, ret->c_str());
 
 	return rc;
 }
@@ -988,7 +981,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
 		} else {
 			if (found)
 				*found = true;
-			LogDebug("  %S=%f\n", key, ret);
+			LogInfo("  %S=%f\n", key, ret);
 		}
 	}
 
@@ -1013,7 +1006,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found, 
 		} else {
 			if (found)
 				*found = true;
-			LogDebug("  %S=%d\n", key, ret);
+			LogInfo("  %S=%d\n", key, ret);
 		}
 	}
 
@@ -1030,13 +1023,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
 
 	if (GetIniString(section, key, 0, val, 32)) {
 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
-			LogDebug("  %S=1\n", key);
+			LogInfo("  %S=1\n", key);
 			if (found)
 				*found = true;
 			return true;
 		}
 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
-			LogDebug("  %S=0\n", key);
+			LogInfo("  %S=0\n", key);
 			if (found)
 				*found = true;
 			return false;
@@ -1065,7 +1058,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
 		} else {
 			if (found)
 				*found = true;
-			LogDebug("  %S=%016llx\n", key, ret);
+			LogInfo("  %S=%016llx\n", key, ret);
 		}
 	}
 
@@ -1088,7 +1081,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def, 
 		} else {
 			if (found)
 				*found = true;
-			LogDebug("  %S=%x\n", key, ret);
+			LogInfo("  %S=%x\n", key, ret);
 		}
 	}
 
@@ -1132,7 +1125,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool 
 			ret = ParseEnum(val, prefix, names, names_len, first);
 			if (found)
 				*found = true;
-			LogDebug("  %S=%S\n", key, val);
+			LogInfo("  %S=%S\n", key, val);
 		} catch (EnumParseError) {
 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
 		}
@@ -1160,7 +1153,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 		if (tmp_found) {
 			if (found)
 				*found = tmp_found;
-			LogDebug("  %S=%S\n", key, val);
+			LogInfo("  %S=%S\n", key, val);
 		} else {
 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
 		}
@@ -1193,7 +1186,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 		if (tmp_found) {
 			if (found)
 				*found = tmp_found;
-			LogDebug("  %S=%s\n", key, val.c_str());
+			LogInfo("  %S=%s\n", key, val.c_str());
 		} else {
 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
 		}
@@ -1301,7 +1294,7 @@ static void ParseIncludedIniFiles()
 
 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
 			section_id = i->first.c_str();
-			LogDebug("[%S]\n", section_id);
+			LogInfo("[%S]\n", section_id);
 
 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
 
@@ -1309,7 +1302,7 @@ static void ParseIncludedIniFiles()
 			for (entry = section->begin(); entry < section->end(); entry++) {
 				key = &entry->first;
 				val = &entry->second;
-				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
+				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
 
 				rel_path = namespace_path + *val;
 
@@ -1361,7 +1354,7 @@ static void RegisterPresetKeyBindings()
 	for (i = lower; i != upper; i++) {
 		const wchar_t *id = i->first.c_str();
 
-		LogDebug("[%S]\n", id);
+		LogInfo("[%S]\n", id);
 
 		keys = GetIniStringMultipleKeys(id, L"Key");
 		back = GetIniStringMultipleKeys(id, L"Back");
@@ -1440,7 +1433,7 @@ static void ParsePresetOverrideSections()
 		const wchar_t *id = i->first.c_str();
 		preset = &i->second;
 
-		LogDebug("[%S]\n", id);
+		LogInfo("[%S]\n", id);
 
 		// Read parameters from ini
 		preset->ParseIniSection(id);
@@ -1981,7 +1974,7 @@ static void ParseCommandList(const wchar_t *id,
 		}
 
 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
-			LogDebug("  %S\n", raw_line->c_str());
+			LogInfo("  %S\n", raw_line->c_str());
 			continue;
 		}
 
@@ -2288,7 +2281,7 @@ static void ParseShaderOverrideSections()
 	for (i = lower; i != upper; i++) {
 		id = i->first.c_str();
 
-		LogDebug("[%S]\n", id);
+		LogInfo("[%S]\n", id);
 
 		hash = GetIniHash(id, L"Hash", 0, &found);
 		if (!found) {
@@ -2583,7 +2576,7 @@ static void ParseShaderRegexSections()
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
 	for (i = lower; i != upper; i++) {
 		section_id = &i->first;
-		LogDebug("[%S]\n", section_id->c_str());
+		LogInfo("[%S]\n", section_id->c_str());
 
 		hash = hash_ini_section(hash, section_id);
 
@@ -3146,7 +3139,7 @@ static void ParseTextureOverrideSections()
 	for (i = lower; i != upper; i++) {
 		id = i->first.c_str();
 
-		LogDebug("[%S]\n", id);
+		LogInfo("[%S]\n", id);
 
 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
 		if (!found) {
