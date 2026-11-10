@@ -19,6 +19,7 @@
 #include "cursor.h"
 
 #include "shellscalingapi.h"
+#include "TrueTripleMarca.h"
 
 #include <filesystem>
 // NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
@@ -4107,7 +4108,22 @@ void LoadConfigFile()
 	LogInfo("[Logging]\n");
 	LogInfo("  calls=1\n");
 
-	ParseIniFile(iniFile);
+	// TrueTriple: la marca de sesion (TrueTripleMarca.h). Sin una marca fresca
+	// de la app no se carga el d3dx.ini de la carpeta, aunque este armado: el
+	// dll queda como con el ini inerte. Se decide UNA vez por proceso y la
+	// decision vale tambien para la recarga (ReloadConfig vuelve a pasar por
+	// aca), asi que una recarga no habilita el mod a mitad de partida ni lo
+	// apaga si la marca vence mientras se juega.
+	static int tt_sesion = -1;
+	if (tt_sesion < 0)
+		tt_sesion = truetriple::MarcaDeSesionValida(L"dr2", time(NULL)) ? 1 : 0;
+	if (tt_sesion) {
+		ParseIniFile(iniFile);
+	} else {
+		LogInfo("TrueTriple: sin sesion, el mod queda en reposo\n");
+		ini_sections.clear();
+		ParseIniExcerpt(truetriple::kIniReposo);
+	}
 	InsertBuiltInIniSections();
 
 	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);

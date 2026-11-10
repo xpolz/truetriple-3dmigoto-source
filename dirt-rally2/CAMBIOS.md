@@ -47,3 +47,9 @@ compiló la dll D07FC901; la próxima dll que se compile de esta fuente ya lo tr
 | `DirectX11/TrueTripleShadowFit.h` | 144 | El ajuste de las cascadas de sombra lee la relación de aspecto de la cámara; se le da una copia local de solo lectura para esa llamada, sin tocar la cámara compartida (pasto y objetos conservan la vista ancha). |
 | `DirectX11/TrueTripleShadowTrace.h` | 230 | Diagnóstico opcional de las sombras: copia entradas, no edita estado ni datos de shaders. |
 
+## dll `486d34f7` (10/11/2026): la marca de sesión
+
+Agrega `TrueTripleMarca.h` y el enganche en `IniHandler.cpp` (`LoadConfigFile`): sin una marca
+fresca de la app en `%LOCALAPPDATA%\TrueTriple\sesion-dr2.json` el
+dll no carga el `d3dx.ini` y queda en reposo. SHA-256 de la dll: `486d34f70bbe0adc3686953796a50a05ad12a5b2cabb93762eb69e4a6de0f9cb`. Etiqueta
+`dr2-dll-486d34f7`. La anterior (`d07fc901…`) sigue en su etiqueta.

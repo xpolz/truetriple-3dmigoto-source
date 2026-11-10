@@ -25,3 +25,10 @@ MSBuild.exe "StereovisionHacks.sln" /t:NVAPI /p:Configuration=Release /p:Platfor
 ```
 
 La salida queda en `builds\x32\Release\`. Un dll x64 en `drt.exe` no carga y no da ningún error.
+
+## dll `b1d6e9aa` (10/11/2026): la marca de sesión
+
+Agrega `TrueTripleMarca.h` y el enganche en `IniHandler.cpp` (`LoadConfigFile`): sin una marca
+fresca de la app en `%LOCALAPPDATA%\TrueTriple\sesion-dr1.json` el
+dll no carga el `d3dx.ini` y queda en reposo. SHA-256 de la dll: `b1d6e9aaab71630bd2b4c0e4f69396ba943e4f6181e6f73117ef0248a111a0da`. Etiqueta
+`dr1-dll-b1d6e9aa`. La anterior (`ee23d9df…`) sigue en su etiqueta.

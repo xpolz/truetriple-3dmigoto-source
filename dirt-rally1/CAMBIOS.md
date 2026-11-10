@@ -34,3 +34,10 @@ la dll nueva, que tendrá su propia etiqueta.
 Es el mismo conjunto de ideas que en `dirt-rally2/` pero para un proceso de 32 bits: se dejó
 afuera el código de diagnóstico y de cacería del culling que solo servía en DR2 (x64) y no compila
 en x86. La carpeta no trae archivos nuevos: todo vive en archivos que ya existen en 3Dmigoto.
+
+## dll `b1d6e9aa` (10/11/2026): la marca de sesión
+
+Agrega `TrueTripleMarca.h` y el enganche en `IniHandler.cpp` (`LoadConfigFile`): sin una marca
+fresca de la app en `%LOCALAPPDATA%\TrueTriple\sesion-dr1.json` el
+dll no carga el `d3dx.ini` y queda en reposo. SHA-256 de la dll: `b1d6e9aaab71630bd2b4c0e4f69396ba943e4f6181e6f73117ef0248a111a0da`. Etiqueta
+`dr1-dll-b1d6e9aa`. La anterior (`ee23d9df…`) sigue en su etiqueta.
