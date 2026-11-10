@@ -4,14 +4,12 @@ Fuente modificada de 3Dmigoto del mod TrueTriple para **DiRT Rally (2015)**, eje
 
 - Versión del mod: 1.5.3 (app suelta, 5/9/2026) y 1.6.0 (paquete del launcher, 10/11/2026).
 - `d3d11.dll` (x86, 3.101.184 bytes), SHA-256
-  `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f`.
-- Fuente exacta: etiqueta `dr1-dll-f876672f`.
+  `ee23d9dfc7173fa688feca962928f7694ddda97fd61af419e32522af07052c70` (la anterior, `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f`, es la etiqueta `dr1-dll-f876672f`).
+- Fuente exacta: etiqueta `dr1-dll-ee23d9df`.
 - Contenido: `DirectX11/` (los 8 archivos completos), `truetriple.patch` (el mismo cambio
   contra el commit base `4ce5f2f72b2777223d2e809dcdafec514ac98295`) y `CAMBIOS.md`.
 
-Aviso: hay un cambio de fuente posterior a esa dll (`cb2010e`, `IniHandler.cpp`, el eco del
-`.ini` al log pasa a `LogDebug`) que todavía no está acá porque la dll no se recompiló. Cuando
-salga la dll nueva se agrega con su propia etiqueta.
+(El cambio `cb2010e` de `IniHandler.cpp`, el eco del `.ini` al log a `LogDebug`, ya está acá y en la dll `ee23d9df`.)
 
 ## Compilar
 

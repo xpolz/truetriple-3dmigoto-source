@@ -3674,7 +3674,7 @@ index 33c26e1..b8350ca 100644
  	UINT64 mCurrentHullShader;
  	UINT64 mCurrentDomainShader;
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..49e2083 100644
+index 2c88983..d4c5551 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
 @@ -21,10 +21,9 @@
@@ -3691,7 +3691,134 @@ index 2c88983..49e2083 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -1345,7 +1344,7 @@ static void RegisterPresetKeyBindings()
+@@ -945,13 +944,19 @@ static std::vector<std::wstring> GetIniStringMultipleKeys(const wchar_t *section
+ 
+ // Helper functions to parse common types and log their values. TODO: Convert
+ // more of this file to use these where appropriate
++// El eco del ini al log (nombres de seccion, clave=valor y cada linea de
++// command list) va con LogDebug y no con LogInfo (2026-10-10). Con calls=1 y
++// LogInfo, el d3dx.ini ENTERO terminaba en d3d11_log.txt, que es el archivo
++// que los usuarios mandan por soporte y suben a Discord. Con [Logging]
++// debug=0 (produccion) ya no se vuelca; con debug=1 (desarrollo) sale igual
++// que siempre. El resto del log (shader analysis, etc.) no cambia.
+ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 		const wchar_t *def, wchar_t *ret, unsigned size)
+ {
+ 	int rc = GetIniString(section, key, def, ret, size);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%S\n", key, ret);
++		LogDebug("  %S=%S\n", key, ret);
+ 
+ 	return rc;
+ }
+@@ -961,7 +966,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 	bool rc = GetIniString(section, key, def, ret);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%s\n", key, ret->c_str());
++		LogDebug("  %S=%s\n", key, ret->c_str());
+ 
+ 	return rc;
+ }
+@@ -983,7 +988,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%f\n", key, ret);
++			LogDebug("  %S=%f\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1008,7 +1013,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%d\n", key, ret);
++			LogDebug("  %S=%d\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1025,13 +1030,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
+ 
+ 	if (GetIniString(section, key, 0, val, 32)) {
+ 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
+-			LogInfo("  %S=1\n", key);
++			LogDebug("  %S=1\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return true;
+ 		}
+ 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
+-			LogInfo("  %S=0\n", key);
++			LogDebug("  %S=0\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return false;
+@@ -1060,7 +1065,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%016llx\n", key, ret);
++			LogDebug("  %S=%016llx\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1083,7 +1088,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%x\n", key, ret);
++			LogDebug("  %S=%x\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1127,7 +1132,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
+ 			ret = ParseEnum(val, prefix, names, names_len, first);
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} catch (EnumParseError) {
+ 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+ 		}
+@@ -1155,7 +1160,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
+ 		}
+@@ -1188,7 +1193,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%s\n", key, val.c_str());
++			LogDebug("  %S=%s\n", key, val.c_str());
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
+ 		}
+@@ -1296,7 +1301,7 @@ static void ParseIncludedIniFiles()
+ 
+ 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
+ 			section_id = i->first.c_str();
+-			LogInfo("[%S]\n", section_id);
++			LogDebug("[%S]\n", section_id);
+ 
+ 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
+ 
+@@ -1304,7 +1309,7 @@ static void ParseIncludedIniFiles()
+ 			for (entry = section->begin(); entry < section->end(); entry++) {
+ 				key = &entry->first;
+ 				val = &entry->second;
+-				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
++				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
+ 
+ 				rel_path = namespace_path + *val;
+ 
+@@ -1345,7 +1350,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -3700,7 +3827,16 @@ index 2c88983..49e2083 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1370,12 +1369,36 @@ static void RegisterPresetKeyBindings()
+@@ -1356,7 +1361,7 @@ static void RegisterPresetKeyBindings()
+ 	for (i = lower; i != upper; i++) {
+ 		const wchar_t *id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		keys = GetIniStringMultipleKeys(id, L"Key");
+ 		back = GetIniStringMultipleKeys(id, L"Back");
+@@ -1370,12 +1375,36 @@ static void RegisterPresetKeyBindings()
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
  
@@ -3738,7 +3874,7 @@ index 2c88983..49e2083 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1406,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1412,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -3747,6 +3883,51 @@ index 2c88983..49e2083 100644
  	}
  }
  
+@@ -1418,7 +1447,7 @@ static void ParsePresetOverrideSections()
+ 		const wchar_t *id = i->first.c_str();
+ 		preset = &i->second;
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		// Read parameters from ini
+ 		preset->ParseIniSection(id);
+@@ -1959,7 +1988,7 @@ static void ParseCommandList(const wchar_t *id,
+ 		}
+ 
+ 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
+-			LogInfo("  %S\n", raw_line->c_str());
++			LogDebug("  %S\n", raw_line->c_str());
+ 			continue;
+ 		}
+ 
+@@ -2266,7 +2295,7 @@ static void ParseShaderOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
+@@ -2561,7 +2590,7 @@ static void ParseShaderRegexSections()
+ 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
+ 	for (i = lower; i != upper; i++) {
+ 		section_id = &i->first;
+-		LogInfo("[%S]\n", section_id->c_str());
++		LogDebug("[%S]\n", section_id->c_str());
+ 
+ 		hash = hash_ini_section(hash, section_id);
+ 
+@@ -3124,7 +3153,7 @@ static void ParseTextureOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
 diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
 index 994124c..4fff228 100644
 --- a/DirectX11/Overlay.cpp

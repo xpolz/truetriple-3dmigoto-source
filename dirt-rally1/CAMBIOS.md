@@ -3,8 +3,8 @@
 Base: [bo3b/3Dmigoto](https://github.com/bo3b/3Dmigoto) en `4ce5f2f72b2777223d2e809dcdafec514ac98295`.
 Fuente del `d3d11.dll` de TrueTriple para DiRT Rally (2015), **x86 (Win32)**: la dll compilada el
 5/9/2026 y distribuida con la app suelta 1.5.3 y con el paquete del launcher 1.6.0 (10/11/2026),
-SHA-256 `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f`
-(3.101.184 bytes). Etiqueta de este repo: `dr1-dll-f876672f`.
+SHA-256 `ee23d9dfc7173fa688feca962928f7694ddda97fd61af419e32522af07052c70` (la anterior, `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f`, es la etiqueta `dr1-dll-f876672f`)
+(3.103.232 bytes). Etiqueta de este repo: `dr1-dll-f876672f`.
 
 Los 8 archivos de `DirectX11/` son los del commit `d85d471` del repo del mod, el árbol exacto con el
 que se compiló esa dll. `truetriple.patch` es el diff de esos 8 archivos contra el commit base y

@@ -14,7 +14,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
 | [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.2 (dll del 8/10/2026) | `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | 1.5.3 (app suelta) / 1.6.0 (paquete del launcher, 10/11/2026) | `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f` | etiqueta `dr1-dll-f876672f` |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | 1.6.1 (paquete del launcher, 10/11/2026) | `ee23d9dfc7173fa688feca962928f7694ddda97fd61af419e32522af07052c70` | etiqueta `dr1-dll-ee23d9df` (anterior: `dr1-dll-f876672f` |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
@@ -30,11 +30,11 @@ Todas las dll de DiRT Rally (DR1, x86) entregadas hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
+| `ee23d9df…52c70` | paquete del launcher 1.6.1 (10/11/2026) en adelante; `nvapi.dll` `35727ae4…bc6fb` | etiqueta `dr1-dll-ee23d9df` |
 | `f876672f…ddb9f` | app suelta 1.5.3 (5/9/2026) y paquete del launcher 1.6.0 | etiqueta `dr1-dll-f876672f` |
 
-Nota DR1: existe un cambio de fuente posterior a esa dll (commit `cb2010e` del repo del mod, 10/10/2026,
-`IniHandler.cpp`: el eco del `.ini` al log pasa a `LogDebug`) que **no** está en `dirt-rally1/` y
-está pendiente de recompilar. Cuando salga la dll nueva tendrá su propia etiqueta.
+Nota DR1: el cambio `cb2010e` del repo del mod (10/10/2026, `IniHandler.cpp`: el eco del `.ini` al
+log pasa a `LogDebug`) entró en la dll `ee23d9df` compilada el 10/11/2026 (etiqueta `dr1-dll-ee23d9df`).
 
 Cada carpeta trae:
 
