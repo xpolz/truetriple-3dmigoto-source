@@ -15,7 +15,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 |---|---|---|---|---|
 | [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.8.9 (dll del 10/11/2026, con la marca de sesión) | `486d34f70bbe0adc3686953796a50a05ad12a5b2cabb93762eb69e4a6de0f9cb` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
 | [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.1 (dll del 10/11/2026, sin el diagnóstico de la niebla) | `f7c969bce5782fab8887cd8988fb167aeba0539f5a35a548e496236214c4239b` | etiqueta `dr1-dll-f7c969bc` (anteriores en la tabla de abajo |
-| [`wreckfest/`](wreckfest/) | Wreckfest | app suelta 0.1.4 y paquete del launcher 0.2.0 | `b50cded63b73c99fce06fbd9e2feb2fada83c9a8d47c69953540cd93167a7845` | etiqueta `wreckfest-dll-b50cded6` |
+| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.1 (dll del 10/11/2026, con la marca de sesión) | `0a9871025b2f29dda8ca97ee25430305a8ce6635e0adcef16b21edfd5e621fd4` | etiqueta `wreckfest-dll-0a987102` |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas

@@ -19,6 +19,7 @@
 #include "cursor.h"
 
 #include "shellscalingapi.h"
+#include "TrueTripleMarca.h"
 
 #include <filesystem>
 // NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
@@ -4100,7 +4101,23 @@ void LoadConfigFile()
 	LogInfo("[Logging]\n");
 	LogInfo("  calls=1\n");
 
-	ParseIniFile(iniFile);
+	// TrueTriple Wreckfest: la marca de sesion (TrueTripleMarca.h, la misma de
+	// DR1). Sin una marca fresca de la app o del launcher no se carga el
+	// d3dx.ini de la carpeta: el dll queda en reposo (kIniReposo, 3Dmigoto sin
+	// el mod). Se decide UNA vez por proceso y la decision vale tambien para la
+	// recarga (ReloadConfig vuelve a pasar por aca). El texto del LogInfo lo
+	// busca el plugin en el binario (en_launcher::MARCA_DEL_LECTOR) para saber
+	// si este dll ya lee la marca: no cambiarlo sin cambiar los dos.
+	static int tt_sesion = -1;
+	if (tt_sesion < 0)
+		tt_sesion = truetriple::MarcaDeSesionValida(L"wreckfest", time(NULL)) ? 1 : 0;
+	if (tt_sesion) {
+		ParseIniFile(iniFile);
+	} else {
+		LogInfo("TrueTriple: sin sesion, el mod queda en reposo\n");
+		ini_sections.clear();
+		ParseIniExcerpt(truetriple::kIniReposo);
+	}
 	InsertBuiltInIniSections();
 
 	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);

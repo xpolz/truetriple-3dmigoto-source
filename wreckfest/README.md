@@ -2,9 +2,9 @@
 
 Fuente modificada de 3Dmigoto del mod TrueTriple para **Wreckfest** (ejecutable de 64 bits, `Wreckfest_x64.exe`).
 
-- `d3d11.dll` (x64), SHA-256 `b50cded63b73c99fce06fbd9e2feb2fada83c9a8d47c69953540cd93167a7845`.
-- Fuente exacta: etiqueta `wreckfest-dll-b50cded6`.
-- Se entregó con la app suelta 0.1.4 y con el paquete del launcher 0.2.0 (10/11/2026).
+- `d3d11.dll` (x64), SHA-256 `0a9871025b2f29dda8ca97ee25430305a8ce6635e0adcef16b21edfd5e621fd4`.
+- Fuente exacta: etiqueta `wreckfest-dll-0a987102`.
+- Paquete del launcher 0.2.1 (10/11/2026) en adelante: lee la marca de sesión (`TrueTripleMarca.h`); sin una sesión abierta desde el launcher el mod queda en reposo. La dll anterior (`b50cded63b73c99fce06fbd9e2feb2fada83c9a8d47c69953540cd93167a7845`, app suelta 0.1.4 y paquete 0.2.0) es la etiqueta `wreckfest-dll-b50cded6`.
 - Contenido: `DirectX11/` (los archivos modificados, completos) y `truetriple.patch` (el mismo
   cambio contra el commit base `4ce5f2f72b2777223d2e809dcdafec514ac98295` de `bo3b/3Dmigoto`).
 
