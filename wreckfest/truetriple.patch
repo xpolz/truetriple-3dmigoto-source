@@ -1,0 +1,1332 @@
+diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
+index 6758d9f..b5fd41a 100644
+--- a/DirectX11/CommandList.cpp
++++ b/DirectX11/CommandList.cpp
+@@ -923,6 +923,69 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+ 			return AddCommandToList(new AbortCommand(section), explicit_command_list, NULL, pre_command_list, post_command_list, section, key, val);
+ 	}
+ 
++	// TrueTriple — ver TripleParamsCommand en CommandList.h
++	//   triple_params = 0|1|2|3   (3 = passthrough)
++	if (!wcscmp(key, L"triple_params")) {
++		int r = -1, fila = -1;
++		if (swscanf_s(val->c_str(), L"%d %d", &r, &fila) == 2 && r >= 0 && r <= 3 && fila >= 0) {
++			TripleParamsCommand *cmd = new TripleParamsCommand();
++			cmd->region = r;
++			cmd->fila = fila;
++			// Reservar la fila igual que hace un "xN = ..." normal, para que la
++			// textura de IniParams sea lo bastante grande aunque nadie mas la
++			// escriba.
++			G->iniParamsReserved = max(G->iniParamsReserved, fila + 1);
++			return AddCommandToList(cmd, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		}
++		LogInfo("  WARNING: triple_params requires \"<region 0..3> <fila>\"\n");
++		return false;
++	}
++
++	// TrueTriple — ver TripleScissorCommand en CommandList.h
++	//   triple_scissor = <lo> <hi>   fraccion horizontal del render target
++	//   triple_scissor = restore
++	//   triple_scissor = fila <N> <par> <lo> <hi>   (2026-11-01, ver CommandList.h)
++	if (!wcscmp(key, L"triple_scissor")) {
++		TripleScissorCommand *cmd = new TripleScissorCommand();
++		if (!wcscmp(val->c_str(), L"restore")) {
++			cmd->restore = true;
++			return AddCommandToList(cmd, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		}
++		{
++			int f = -1, p = 0;
++			float rlo = 0.0f, rhi = 1.0f;
++			int forma = TripleParseScissorFila(val->c_str(), &f, &p, &rlo, &rhi);
++			if (forma == 1) {
++				cmd->fila = f;
++				cmd->par = p;
++				cmd->frac_lo = rlo;
++				cmd->frac_hi = rhi;
++				// Reservar la fila como un "xN = ..." normal: si [Present]
++				// todavia no la escribe (ini a medio portar), IniParams
++				// igual la tiene y run() cae al respaldo en vez de leer
++				// fuera del vector.
++				G->iniParamsReserved = max(G->iniParamsReserved, f + 1);
++				return AddCommandToList(cmd, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++			}
++			if (forma == -1) {
++				delete cmd;
++				LogOverlay(LOG_WARNING, "TrueTriple: triple_scissor = \"%S\" invalido "
++					"(se espera \"fila <N> <0|1> <lo> <hi>\" con 0 <= lo < hi <= 1)\n", val->c_str());
++				return false;
++			}
++		}
++		float lo = 0.0f, hi = 0.0f;
++		if (swscanf_s(val->c_str(), L"%f %f", &lo, &hi) == 2 &&
++		    lo >= 0.0f && hi > lo && hi <= 1.0f) {
++			cmd->frac_lo = lo;
++			cmd->frac_hi = hi;
++			return AddCommandToList(cmd, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
++		}
++		delete cmd;
++		LogInfo("  WARNING: triple_scissor requires \"<lo> <hi>\" with 0 <= lo < hi <= 1, or \"restore\"\n");
++		return false;
++	}
++
+ 	if (!wcscmp(key, L"reset_per_frame_limits"))
+ 		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+ 
+@@ -2492,6 +2555,372 @@ out_release_view:
+ 	view->Release();
+ }
+ 
++// ---- TrueTriple: texturas de IniParams pre-armadas por region --------------
++// Ver TripleParamsCommand en CommandList.h para el porque.
++
++static ID3D11Texture1D        *g_tp_tex[4] = { NULL, NULL, NULL, NULL };
++static ID3D11ShaderResourceView *g_tp_srv[4] = { NULL, NULL, NULL, NULL };
++static size_t   g_tp_size  = 0;
++static unsigned g_tp_frame = (unsigned)-1;
++
++void TripleParamsRelease()
++{
++	for (int i = 0; i < 4; i++) {
++		if (g_tp_srv[i]) { g_tp_srv[i]->Release(); g_tp_srv[i] = NULL; }
++		if (g_tp_tex[i]) { g_tp_tex[i]->Release(); g_tp_tex[i] = NULL; }
++	}
++	g_tp_size = 0;
++	g_tp_frame = (unsigned)-1;
++}
++
++// Refresca las cuatro copias desde G->iniParams. Una vez por frame alcanza: lo
++// unico que cambia dentro del frame es el indice de region, y de eso se encarga
++// tener una copia por valor.
++static bool triple_params_refresh(CommandListState *state, size_t fila)
++{
++	if (G->iniParams.empty() || fila >= G->iniParams.size())
++		return false;
++
++	if (g_tp_size != G->iniParams.size())
++		TripleParamsRelease();
++
++	const size_t n = G->iniParams.size();
++	std::vector<DirectX::XMFLOAT4> buf(G->iniParams);
++
++	for (int i = 0; i < 4; i++) {
++		buf[fila] = G->iniParams[fila];
++		buf[fila].x = (float)i;
++
++		if (!g_tp_tex[i]) {
++			D3D11_TEXTURE1D_DESC desc;
++			memset(&desc, 0, sizeof(desc));
++			desc.Width     = (UINT)n;
++			desc.MipLevels = 1;
++			desc.ArraySize = 1;
++			desc.Format    = DXGI_FORMAT_R32G32B32A32_FLOAT;
++			// DEFAULT + UpdateSubresource en vez de DYNAMIC + Map: son cuatro
++			// escrituras por frame, no por draw, y UpdateSubresource es valido
++			// tambien en contextos diferidos.
++			desc.Usage     = D3D11_USAGE_DEFAULT;
++			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++
++			D3D11_SUBRESOURCE_DATA init;
++			memset(&init, 0, sizeof(init));
++			init.pSysMem = buf.data();
++
++			if (FAILED(state->mOrigDevice1->CreateTexture1D(&desc, &init, &g_tp_tex[i]))) {
++				LogInfo("TripleParams: CreateTexture1D fallo para la region %d\n", i);
++				TripleParamsRelease();
++				return false;
++			}
++			if (FAILED(state->mOrigDevice1->CreateShaderResourceView(g_tp_tex[i], NULL, &g_tp_srv[i]))) {
++				LogInfo("TripleParams: CreateShaderResourceView fallo para la region %d\n", i);
++				TripleParamsRelease();
++				return false;
++			}
++		} else {
++			state->mOrigContext1->UpdateSubresource(g_tp_tex[i], 0, NULL, buf.data(), 0, 0);
++		}
++	}
++
++	g_tp_size = n;
++	return true;
++}
++
++void TripleParamsCommand::run(CommandListState *state)
++{
++	if (G->IniParamsReg < 0 || fila < 0)
++		return;
++
++	// Antes de tocar nada hay que VOLCAR lo que el ini haya escrito en este
++	// frame (por ejemplo las matrices de [Present]): si no, las copias se
++	// armarian con datos viejos.
++	CommandListFlushState(state);
++
++	if (g_tp_frame != G->frame_no) {
++		if (!triple_params_refresh(state, (size_t)fila))
++			return;
++		g_tp_frame = G->frame_no;
++	}
++
++	if (region < 0 || region > 3 || !g_tp_srv[region])
++		return;
++
++	// DIAGNOSTICO (una vez cada 600 frames, ~10 s): que ve el gate del shader.
++	//
++	// El gate vive en el ENSAMBLADOR, asi que no hay forma de observarlo desde
++	// aca; pero sus dos entradas si. La fila de region que se publica es
++	// exactamente lo que el shader lee de t120, y `aspect` es contra lo que
++	// compara. Si aspect sale 0 o distinto del lienzo, el gate cierra siempre y
++	// el sintoma es "los redibujos ocurren pero la perspectiva no cambia".
++	//
++	// Se logea desde la region 0 nomas, para tener una linea por frame y no tres.
++	{
++		// 2026-11-01: solo en modo caza. Es un LogInfo barato, pero en
++		// produccion no le sirve a nadie y ensucia el log del usuario.
++		static unsigned ultimo = (unsigned)-1;
++		if (G->hunting == HUNTING_MODE_ENABLED && region == 0 && G->frame_no / 600 != ultimo / 600) {
++			ultimo = G->frame_no;
++			const DirectX::XMFLOAT4 &f = G->iniParams[fila];
++			LogInfo("TRIPLEDIAG f=%u  fila%d=(%.4f, %.4f, %.4f, %.4f)  iniParams=%Iu  srv=%p\n",
++				G->frame_no, fila, f.x, f.y, f.z, f.w,
++				G->iniParams.size(), g_tp_srv[region]);
++		}
++	}
++
++	// Solo la etapa de vertex: los shaders parcheados son todos vertex shaders,
++	// y asi el resto del pipeline sigue viendo la textura de 3Dmigoto.
++	state->mOrigContext1->VSSetShaderResources(G->IniParamsReg, 1, &g_tp_srv[region]);
++}
++
++// TrueTriple (2026-11-01): aca vivia triple_diag_camara, que cada 600 frames
++// copiaba el cb2 del juego a un buffer STAGING y lo leia con Map(READ) sin
++// DO_NOT_WAIT: una espera a la GPU dentro del frame, en la ruta de cada usuario.
++// Se ELIMINO en vez de dejarla atras de G->hunting porque el ini de produccion
++// corre con hunting=1, asi que la compuerta no la hubiera apagado, y porque el
++// dato que daba era inutil (siempre identidad: ver
++// docs/INVENTARIO-MOD-2026-11-01.md, secciones 0 y 1.2). Si hace falta la
++// camara, la tecnica sin lectura de GPU es interceptar el Map del juego (DR2).
++
++void TripleScissorCommand::run(CommandListState *state)
++{
++	// Se llama al contexto ORIGINAL a proposito: asi estas escrituras no pasan
++	// por HackerContext::RSSetScissorRects y no contaminan la copia sombra, que
++	// tiene que quedarse con lo ultimo que seteo EL JUEGO.
++	ID3D11DeviceContext1 *ctx = state->mOrigContext1;
++	D3D11_RECT r;
++
++	if (restore) {
++		HackerContext *hc = state->mHackerContext;
++		if (hc && hc->mTripleScissorShadowCount > 0) {
++			ctx->RSSetScissorRects(hc->mTripleScissorShadowCount, hc->mTripleScissorShadow);
++			return;
++		}
++		// El juego no habia seteado ninguno: hay que dejar un rectangulo que no
++		// pueda recortar nada. NO sirve poner el del lienzo (p.ej. 7760x1440):
++		// los pases fuera de pantalla tienen otros tamanos —el shadow map suele
++		// ser cuadrado y mas alto que 1440— y ese rectangulo les cortaria la
++		// parte de abajo. El sintoma son sombras que "nadan" al girar, que no se
++		// parece en nada a un error de proyeccion y por eso cuesta rastrearlo.
++		// 16384 es el maximo de textura en D3D11: no puede recortar ningun RT.
++		r.left = 0; r.top = 0; r.right = 16384; r.bottom = 16384;
++		ctx->RSSetScissorRects(1, &r);
++		return;
++	}
++
++	// Fracciones efectivas. Forma vieja: los literales. Forma fila: lo que
++	// [Present] dejo en IniParams en ESTE frame, con los literales de respaldo
++	// si la fila no existe o no trae un rango valido (NaN cae afuera solo).
++	float lo = frac_lo, hi = frac_hi;
++	bool de_fila = false;
++	if (fila >= 0 && (size_t)fila < G->iniParams.size()) {
++		const DirectX::XMFLOAT4 &v = G->iniParams[fila];
++		float l = par ? v.z : v.x;
++		float h = par ? v.w : v.y;
++		if (TripleFraccionesValidas(l, h)) {
++			lo = l;
++			hi = h;
++			de_fila = true;
++		}
++	}
++
++	const bool caza = (G->hunting == HUNTING_MODE_ENABLED);
++
++	// DIAGNOSTICO (solo caza): las fracciones que se estan usando de verdad,
++	// una linea por (fila, par) cada 600 frames. Sirve para ver en el log que
++	// el scissor sigue al lienzo y si esta cayendo al respaldo.
++	if (caza && fila >= 0) {
++		static struct { int fila, par; unsigned ultimo; } vistos_sc[8];
++		static int nvistos_sc = 0;
++		int i;
++		for (i = 0; i < nvistos_sc; i++)
++			if (vistos_sc[i].fila == fila && vistos_sc[i].par == par)
++				break;
++		if (i == nvistos_sc && nvistos_sc < 8) {
++			vistos_sc[i].fila = fila; vistos_sc[i].par = par;
++			vistos_sc[i].ultimo = (unsigned)-1;
++			nvistos_sc++;
++		}
++		if (i < nvistos_sc && G->frame_no / 600 != vistos_sc[i].ultimo / 600) {
++			vistos_sc[i].ultimo = G->frame_no;
++			LogInfo("TRIPLEDIAG f=%u  scissor fila%d par%d: %.5f .. %.5f (%s)\n",
++				G->frame_no, fila, par, lo, hi, de_fila ? "de la fila" : "RESPALDO");
++		}
++	}
++
++	// DIAGNOSTICO: los TAMANOS de render target que estan llegando a triplicarse.
++	//
++	// El gate por destino decide con rt_width/rt_height, y si deja pasar algo que
++	// no es el lienzo principal —un atlas de sombras cuadrado, por ejemplo— se
++	// triplica el mapa de sombras y se ve como manchas negras enormes que se
++	// mueven con la camara, no como un error de proyeccion. Esto lista cada
++	// tamano distinto UNA vez, asi que el log dice exactamente que paso.
++	if (caza && lo < 0.001f) {
++		ProcessParamRTSize(state);
++		static struct { int w, h; } vistos[16];
++		static int nvistos = 0;
++		int w = (int)state->rt_width, h = (int)state->rt_height;
++		bool nuevo_tam = true;
++		for (int i = 0; i < nvistos; i++)
++			if (vistos[i].w == w && vistos[i].h == h) { nuevo_tam = false; break; }
++		if (nuevo_tam && nvistos < 16) {
++			vistos[nvistos].w = w; vistos[nvistos].h = h; nvistos++;
++			LogInfo("TRIPLEDIAG destino que se TRIPLICA: %dx%d (f=%u)\n", w, h, G->frame_no);
++		}
++	}
++
++	ProcessParamRTSize(state);
++	if (state->rt_width <= 0.0f || state->rt_height <= 0.0f)
++		return;
++
++	r.left   = (LONG)(state->rt_width * lo + 0.5f);
++	r.right  = (LONG)(state->rt_width * hi + 0.5f);
++	r.top    = 0;
++	r.bottom = (LONG)(state->rt_height + 0.5f);
++	ctx->RSSetScissorRects(1, &r);
++}
++
++// ===== TrueTriple (2026-11-01): aviso en pantalla de F7 y de las perillas ======
++//
++// Idea copiada de DR2 (eye_hud_thread), codigo propio. Antes de esto F7 no daba
++// ninguna respuesta visible: el unico indicio de ON/OFF era la imagen.
++//
++// Lecciones que vienen con la idea, todas escritas en DR2:
++//  - LOG_WARNING y no LOG_NOTICE: NOTICE tiene hide_in_release y fuera del modo
++//    caza no se dibuja nunca (Overlay.cpp, DrawNotices y LogOverlay).
++//  - Los valores se leen ANTES del bucle: con un centinela la primera vuelta
++//    siempre "cambia" y al arrancar saldrian cinco carteles diciendo que esta
++//    todo normal, que se leen como un error.
++//  - Se lee por NOMBRE en cada vuelta, bajo G->mCriticalSection (el mismo que
++//    toma ReloadConfig mientras rearma command_list_globals). NUNCA se guarda
++//    un puntero a la variable: la recarga del ini libera las globales y en DR2
++//    un puntero guardado dio un AccessViolation.
++//  - Si una global no existe (ini viejo), de esa no se avisa nada.
++
++struct TripleAvisoValor {
++	bool found;
++	float fval;
++};
++
++static TripleAvisoValor triple_aviso_leer(const wchar_t *nombre)
++{
++	TripleAvisoValor r = { false, 0.0f };
++	EnterCriticalSectionPretty(&G->mCriticalSection);
++	auto it = command_list_globals.find(nombre);
++	if (it != command_list_globals.end()) {
++		r.found = true;
++		r.fval = it->second.fval;
++	}
++	LeaveCriticalSection(&G->mCriticalSection);
++	return r;
++}
++
++// "61" si es entero (a la decima), si no "60.5". El bisel y el angulo se mueven
++// de a enteros; la distancia puede llegar con decimales desde la app.
++static void triple_aviso_num(char *buf, size_t n, float v)
++{
++	float r = floorf(v + 0.5f);
++	if (fabsf(v - r) < 0.05f)
++		_snprintf_s(buf, n, _TRUNCATE, "%.0f", r);
++	else
++		_snprintf_s(buf, n, _TRUNCATE, "%.1f", v);
++}
++
++static DWORD WINAPI triple_aviso_thread(LPVOID)
++{
++	struct Perilla {
++		const wchar_t *nombre;
++		int tipo;              // un aviso vivo por tipo (Overlay.cpp)
++		TripleAvisoValor ultimo;
++	} perillas[] = {
++		{ L"$triple_on", 1 },
++		{ L"$bezel_px",  2 },
++		{ L"$eye_cm",    3 },
++		{ L"$ang_deg",   4 },
++		{ L"$fov_zoom",  5 },
++		// 2026-11-02: SUELO FIJO (experimental, Ctrl+Alt+F7). Solo el estado,
++		// como $triple_on. Ver docs/SUELO-NEGRO-ARREGLO-2026-11-02.md.
++		{ L"$cb2_fijo",  6 },
++	};
++	const int n = sizeof(perillas) / sizeof(perillas[0]);
++
++	for (int i = 0; i < n; i++)
++		perillas[i].ultimo = triple_aviso_leer(perillas[i].nombre);
++
++	LogInfo("TTAVISO: hilo del aviso en pantalla activo (triple_on %s, bisel %s, "
++		"distancia %s, angulo %s, zoom %s, suelo fijo %s)\n",
++		perillas[0].ultimo.found ? "si" : "no", perillas[1].ultimo.found ? "si" : "no",
++		perillas[2].ultimo.found ? "si" : "no", perillas[3].ultimo.found ? "si" : "no",
++		perillas[4].ultimo.found ? "si" : "no", perillas[5].ultimo.found ? "si" : "no");
++
++	while (true) {
++		Sleep(120);
++		for (int i = 0; i < n; i++) {
++			TripleAvisoValor v = triple_aviso_leer(perillas[i].nombre);
++			TripleAvisoValor &u = perillas[i].ultimo;
++			if (!v.found) {
++				// Desaparecio (recarga a un ini viejo): olvidarla, asi si
++				// vuelve no avisa por haber "cambiado" desde nada.
++				u = v;
++				continue;
++			}
++			if (!u.found) {
++				// Aparecio (recarga a un ini nuevo): tomarla como base, sin
++				// aviso. Mismo criterio que al arrancar.
++				u = v;
++				continue;
++			}
++			if (v.fval == u.fval)
++				continue;
++
++			char num[32];
++			switch (perillas[i].tipo) {
++			case 1:
++				// Solo el estado: pasar de 1 a 2 no es "cambiar".
++				if ((v.fval >= 0.5f) != (u.fval >= 0.5f))
++					LogOverlayTrueTriple(1, "TrueTriple %s\n", v.fval >= 0.5f ? "ON" : "OFF");
++				break;
++			case 2:
++				triple_aviso_num(num, sizeof(num), v.fval);
++				LogOverlayTrueTriple(2, "Bisel %s px\n", num);
++				break;
++			case 3:
++				triple_aviso_num(num, sizeof(num), v.fval);
++				LogOverlayTrueTriple(3, "Distancia %s cm\n", num);
++				break;
++			case 4:
++				triple_aviso_num(num, sizeof(num), v.fval);
++				LogOverlayTrueTriple(4, "Angulo %s\n", num);
++				break;
++			case 5:
++				LogOverlayTrueTriple(5, "Zoom %.2f\n", v.fval);
++				break;
++			case 6:
++				if ((v.fval >= 0.5f) != (u.fval >= 0.5f))
++					LogOverlayTrueTriple(6, "Suelo fijo %s\n", v.fval >= 0.5f ? "ON" : "OFF");
++				break;
++			}
++			u = v;
++		}
++	}
++	return 0;
++}
++
++static volatile LONG g_triple_aviso_estado = 0;
++
++void TripleAvisoStart()
++{
++	// Una sola vez por proceso. Se llama desde el Present, o sea despues de
++	// cargado el ini, que es lo que hace falta para leer los valores iniciales.
++	if (InterlockedCompareExchange(&g_triple_aviso_estado, 1, 0) != 0)
++		return;
++	HANDLE h = CreateThread(NULL, 0, triple_aviso_thread, NULL, 0, NULL);
++	if (h)
++		CloseHandle(h);
++	else
++		LogInfo("TTAVISO: no pude lanzar el hilo del aviso en pantalla\n");
++}
++
+ static void UpdateScissorInfo(CommandListState *state)
+ {
+ 	UINT num = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
+index 142cbbf..1389d2b 100644
+--- a/DirectX11/CommandList.h
++++ b/DirectX11/CommandList.h
+@@ -1170,6 +1170,110 @@ public:
+ 	void run(CommandListState*) override;
+ };
+ 
++// TrueTriple — fija el scissor de un tercio del lienzo, o repone el del juego.
++//
++// 3Dmigoto de fabrica sabe LEER los scissor rects (como expresion) y sabe
++// HABILITARLOS en un estado de rasterizer, pero no tiene ningun comando que los
++// escriba. Sin eso no hay tres pasadas: cada redibujo pintaria sobre todo el
++// lienzo en vez de sobre su tercio, porque la proyeccion por region COLOCA pero
++// no RECORTA.
++//
++//     triple_scissor = <lo> <hi>    fraccion horizontal del render target
++//     triple_scissor = restore      repone lo que habia seteado el juego
++//     triple_scissor = fila <N> <par> <lo> <hi>
++//         (2026-11-01) las fracciones salen de IniParams en CADA ejecucion:
++//         par 0 = xN/yN, par 1 = zN/wN. Asi [Present] las calcula desde el
++//         lienzo real (bisel en vivo). <lo> <hi> son el respaldo cuando la fila
++//         no tiene un valor valido (arranque, NaN, fuera de 0..1).
++//
++// Las fracciones y no pixeles absolutos, a proposito: asi es independiente de la
++// resolucion y, sobre todo, no asume que todos los destinos midan lo mismo.
++class TripleScissorCommand : public CommandListCommand {
++public:
++	float frac_lo, frac_hi;   // literales (forma vieja) o respaldo (forma fila)
++	bool restore;
++	int fila;                 // -1 = forma vieja (literal)
++	int par;                  // 0 = .xy de la fila, 1 = .zw
++
++	TripleScissorCommand() :
++		frac_lo(0.0f),
++		frac_hi(1.0f),
++		restore(false),
++		fila(-1),
++		par(0)
++	{}
++
++	void run(CommandListState*) override;
++};
++
++// TrueTriple — bindea la textura de IniParams PRE-ARMADA de una region.
++//
++//     triple_params = <region 0..3> <fila de IniParams del indice de region>
++//
++// Sustituye a escribir el indice de region con "xN = valor". Ese camino marca
++// IniParams como sucia y dispara un Map(WRITE_DISCARD) de la textura antes del
++// dibujo siguiente (CommandList.cpp: CommandListFlushState). Con tres redibujos
++// mas la vuelta al passthrough son CUATRO Map por cada draw de la camara
++// principal: en Wreckfest, ~8.000 por frame. 3Dmigoto ya cuenta ese costo en
++// Profiling::iniparams_updates, o sea que sus autores tambien lo veian como
++// punto caliente.
++//
++// En vez de eso se mantienen CUATRO copias de la textura, identicas salvo el
++// indice de region, refrescadas UNA vez por frame; el comando solo cambia cual
++// esta bindeada. De ~8.000 Map por frame a 4 UpdateSubresource.
++//
++// Ojo con el efecto de borde: mientras hay una de estas bindeada, escribir
++// IniParams desde el ini NO tiene efecto, porque se escribe en la textura real
++// y la que lee el shader es otra. Por eso hace falta cerrar siempre con
++// `triple_params = 3` (passthrough) al terminar los redibujos.
++// La fila va EXPLICITA y no se deduce del tamano de IniParams: deducirla como
++// "la ultima reservada" es cierto hoy y se romperia MUDO el dia que el ini
++// reserve una fila mas alta, aplicando el indice de region sobre otro dato.
++class TripleParamsCommand : public CommandListCommand {
++public:
++	int region;
++	int fila;
++
++	TripleParamsCommand() : region(3), fila(-1) {}
++
++	void run(CommandListState*) override;
++};
++
++// Libera las texturas por region. La llama HackerDevice al recrear IniParams.
++void TripleParamsRelease();
++
++// TrueTriple (2026-11-01): aviso en pantalla cuando cambia $triple_on o una
++// perilla de geometria. Lanza el hilo UNA vez; se llama en cada Present.
++void TripleAvisoStart();
++
++// Validacion de las fracciones del scissor, compartida entre el parseo y la
++// lectura en vivo de la fila. NaN da false en las tres comparaciones.
++static inline bool TripleFraccionesValidas(float lo, float hi)
++{
++	return lo >= 0.0f && hi > lo && hi <= 1.0f;
++}
++
++// Parseo puro de "fila <N> <par> <lo> <hi>" (sin efectos), separado para poder
++// probarlo fuera del DLL (ver docs/DLL-HECHO-2026-11-01.md).
++//   devuelve 0 si val no empieza con "fila" (no es esta forma),
++//            1 si es la forma fila y es valida,
++//           -1 si empieza con "fila" pero esta mal escrita.
++static inline int TripleParseScissorFila(const wchar_t *val, int *fila, int *par, float *lo, float *hi)
++{
++	if (wcsncmp(val, L"fila", 4) != 0 || (val[4] != L' ' && val[4] != L'\t'))
++		return 0;
++	int f = -1, p = -1, n = 0;
++	float l = 0.0f, h = 0.0f;
++	if (swscanf_s(val, L"fila %d %d %f %f %n", &f, &p, &l, &h, &n) != 4)
++		return -1;
++	if (val[n] != L'\0')            // basura al final: mejor avisar que adivinar
++		return -1;
++	if (f < 0 || (p != 0 && p != 1) || !TripleFraccionesValidas(l, h))
++		return -1;
++	*fila = f; *par = p; *lo = l; *hi = h;
++	return 1;
++}
++
+ class PerDrawStereoOverrideCommand : public CommandListCommand {
+ public:
+ 	CommandListExpression expression;
+diff --git a/DirectX11/FrameAnalysis.cpp b/DirectX11/FrameAnalysis.cpp
+index ef8b635..8053e87 100644
+--- a/DirectX11/FrameAnalysis.cpp
++++ b/DirectX11/FrameAnalysis.cpp
+@@ -3354,6 +3354,12 @@ STDMETHODIMP_(void) FrameAnalysisContext::OMSetDepthStencilState(THIS_
+ 	FrameAnalysisLog("OMSetDepthStencilState(pDepthStencilState:0x%p, StencilRef:%u)\n",
+ 			pDepthStencilState, StencilRef);
+ 
++	if (G->analyse_frame && pDepthStencilState) {
++		D3D11_DEPTH_STENCIL_DESC desc;
++		pDepthStencilState->GetDesc(&desc);
++		FrameAnalysisLog("  DepthEnable=%u WriteMask=%u Func=%u StencilEnable=%u\n",
++			desc.DepthEnable, desc.DepthWriteMask, desc.DepthFunc, desc.StencilEnable);
++	}
+ 	HackerContext::OMSetDepthStencilState(pDepthStencilState, StencilRef);
+ }
+ 
+@@ -3416,6 +3422,13 @@ STDMETHODIMP_(void) FrameAnalysisContext::RSSetState(THIS_
+ 	FrameAnalysisLog("RSSetState(pRasterizerState:0x%p)\n",
+ 			pRasterizerState);
+ 
++	if (G->analyse_frame && pRasterizerState) {
++		D3D11_RASTERIZER_DESC desc;
++		pRasterizerState->GetDesc(&desc);
++		FrameAnalysisLog("  Fill=%u Cull=%u DepthBias=%d BiasClamp=%.9g SlopeBias=%.9g DepthClip=%u Scissor=%u MSAA=%u\n",
++			desc.FillMode, desc.CullMode, desc.DepthBias, desc.DepthBiasClamp,
++			desc.SlopeScaledDepthBias, desc.DepthClipEnable, desc.ScissorEnable, desc.MultisampleEnable);
++	}
+ 	HackerContext::RSSetState(pRasterizerState);
+ }
+ 
+@@ -3428,6 +3441,13 @@ STDMETHODIMP_(void) FrameAnalysisContext::RSSetViewports(THIS_
+ 	FrameAnalysisLog("RSSetViewports(NumViewports:%u, pViewports:0x%p)\n",
+ 			NumViewports, pViewports);
+ 
++	if (G->analyse_frame && pViewports) {
++		for (UINT i = 0; i < NumViewports; ++i) {
++			const D3D11_VIEWPORT &v = pViewports[i];
++			FrameAnalysisLog("  Viewport[%u] XY=%.9g,%.9g WH=%.9g,%.9g Depth=%.9g,%.9g\n",
++				i, v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth);
++		}
++	}
+ 	HackerContext::RSSetViewports(NumViewports, pViewports);
+ }
+ 
+diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
+index a0a8d70..8a05d7b 100644
+--- a/DirectX11/HackerContext.cpp
++++ b/DirectX11/HackerContext.cpp
+@@ -87,6 +87,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
+ 	mCurrentDepthTarget = NULL;
+ 	mCurrentPSUAVStartSlot = 0;
+ 	mCurrentPSNumUAVs = 0;
++
++	// TrueTriple: ver el comentario en HackerContext.h
++	memset(mTripleScissorShadow, 0, sizeof(mTripleScissorShadow));
++	mTripleScissorShadowCount = 0;
+ }
+ 
+ 
+@@ -1607,6 +1611,16 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
+ 	/* [annotation] */
+ 	__in_ecount_opt(NumRects)  const D3D11_RECT *pRects)
+ {
++	// TrueTriple: quedarse con lo que setea EL JUEGO, para poder reponerlo
++	// despues de los tres redibujos. RSGetScissorRects no sirve para esto en
++	// contextos diferidos. Ver HackerContext.h y TripleScissorCommand.
++	if (pRects && NumRects > 0 && NumRects <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
++		memcpy(mTripleScissorShadow, pRects, NumRects * sizeof(D3D11_RECT));
++		mTripleScissorShadowCount = NumRects;
++	} else {
++		mTripleScissorShadowCount = 0;
++	}
++
+ 	 mOrigContext1->RSSetScissorRects(NumRects, pRects);
+ }
+ 
+diff --git a/DirectX11/HackerContext.h b/DirectX11/HackerContext.h
+index 33c26e1..7bdc182 100644
+--- a/DirectX11/HackerContext.h
++++ b/DirectX11/HackerContext.h
+@@ -219,6 +219,17 @@ public:
+ 	ID3D11DeviceContext1* GetPassThroughOrigContext1();
+ 	void HookContext();
+ 
++	// TrueTriple: copia sombra de los scissor rects que setea EL JUEGO.
++	//
++	// Existe porque RSGetScissorRects NO es fiable en contextos diferidos: puede
++	// devolver basura, y restaurar esa basura rompe el postproceso y la UI en
++	// cascada. Guardar lo que pasa por RSSetScissorRects y reponer eso es lo
++	// unico seguro.
++	//
++	// Lo usa TripleScissorCommand (`triple_scissor = restore`) en CommandList.cpp.
++	D3D11_RECT mTripleScissorShadow[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++	UINT mTripleScissorShadowCount;
++
+ 	// public to allow CommandList access
+ 	virtual void FrameAnalysisLog(char *fmt, ...) {};
+ 	virtual void FrameAnalysisTrigger(FrameAnalysisOptions new_options) {};
+diff --git a/DirectX11/HackerDXGI.cpp b/DirectX11/HackerDXGI.cpp
+index 82cfd09..ef11e33 100644
+--- a/DirectX11/HackerDXGI.cpp
++++ b/DirectX11/HackerDXGI.cpp
+@@ -228,6 +228,23 @@ void HackerSwapChain::RunFrameActions()
+ {
+ 	LogDebug("Running frame actions.  Device: %p\n", mHackerDevice);
+ 
++	// DXGI permits 0x0 at creation/ResizeBuffers. Auxiliary swapchains and
++	// config reloads can erase the global dimensions. Use the actual buffer
++	// of the chain that is presenting, before evaluating [Present].
++	if (G->mResolutionInfo.from == GetResolutionFrom::SWAP_CHAIN) {
++		ID3D11Texture2D *backBuffer = nullptr;
++		if (SUCCEEDED(mOrigSwapChain1->GetBuffer(0, __uuidof(ID3D11Texture2D),
++			reinterpret_cast<void **>(&backBuffer)))) {
++			D3D11_TEXTURE2D_DESC desc;
++			backBuffer->GetDesc(&desc);
++			backBuffer->Release();
++			if (desc.Width && desc.Height) {
++				G->mResolutionInfo.width = desc.Width;
++				G->mResolutionInfo.height = desc.Height;
++			}
++		}
++	}
++
+ 	// Regardless of log settings, since this runs every frame, let's flush the log
+ 	// so that the most lost will be one frame worth.  Tradeoff of performance to accuracy
+ 	if (LogFile) fflush(LogFile);
+@@ -240,6 +257,10 @@ void HackerSwapChain::RunFrameActions()
+ 	// affect something at the start of the frame.
+ 	RunCommandList(mHackerDevice, mHackerContext, &G->present_command_list, NULL, false);
+ 
++	// TrueTriple (2026-11-01): aviso en pantalla de F7 y de las perillas. Lanza
++	// su hilo una sola vez; las demas llamadas son un InterlockedCompareExchange.
++	TripleAvisoStart();
++
+ 	if (G->analyse_frame) {
+ 		// We don't allow hold to be changed mid-frame due to potential
+ 		// for filename conflicts, so use def_analyse_options:
+diff --git a/DirectX11/HackerDevice.cpp b/DirectX11/HackerDevice.cpp
+index 3b38e6d..6dc55c6 100644
+--- a/DirectX11/HackerDevice.cpp
++++ b/DirectX11/HackerDevice.cpp
+@@ -328,6 +328,11 @@ HRESULT HackerDevice::CreateIniParamResources()
+ 	D3D11_TEXTURE1D_DESC desc;
+ 	memset(&desc, 0, sizeof(D3D11_TEXTURE1D_DESC));
+ 
++	// TrueTriple: las copias por region se derivan de esta textura, asi que si
++	// IniParams se recrea (recarga del ini, cambio de tamano) las nuestras
++	// quedan obsoletas. Ver TripleParamsCommand en CommandList.h.
++	TripleParamsRelease();
++
+ 	// If we are resizing IniParams we must release the old versions:
+ 	if (mIniResourceView) {
+ 		long refcount = mIniResourceView->Release();
+diff --git a/DirectX11/HookAddresses.c b/DirectX11/HookAddresses.c
+index 707c9cb..cab6b9b 100644
+--- a/DirectX11/HookAddresses.c
++++ b/DirectX11/HookAddresses.c
+@@ -84,6 +84,32 @@ LPVOID lpvtbl_Present1(IDXGISwapChain1* pSwapChain1)
+ 	return pSwapChain1->lpVtbl->Present1;
+ }
+ 
++// TrueTriple Wreckfest (2026-11-01): modo triple en la lista de resoluciones.
++// Ver triple_window_mode en HookedDXGI.cpp.
++LPVOID lpvtbl_GetDisplayModeList(IDXGIOutput* pOutput)
++{
++	if (!pOutput)
++		return NULL;
++
++	return pOutput->lpVtbl->GetDisplayModeList;
++}
++
++LPVOID lpvtbl_FindClosestMatchingMode(IDXGIOutput* pOutput)
++{
++	if (!pOutput)
++		return NULL;
++
++	return pOutput->lpVtbl->FindClosestMatchingMode;
++}
++
++LPVOID lpvtbl_GetDisplayModeList1(IDXGIOutput1* pOutput1)
++{
++	if (!pOutput1)
++		return NULL;
++
++	return pOutput1->lpVtbl->GetDisplayModeList1;
++}
++
+ 
+ 
+ #undef CINTERFACE
+diff --git a/DirectX11/HookedDXGI.cpp b/DirectX11/HookedDXGI.cpp
+index 53b5087..f7d1288 100644
+--- a/DirectX11/HookedDXGI.cpp
++++ b/DirectX11/HookedDXGI.cpp
+@@ -897,6 +897,306 @@ static void HookCreateSwapChain(void* factory)
+ }
+ 
+ 
++// -----------------------------------------------------------------------------
++// TrueTriple Wreckfest (2026-11-01): un modo de pantalla triple en la lista de
++// resoluciones del juego.
++//
++//     [Device]
++//     triple_window_mode = 7680 1440      ; ausente o 0 = no cambia nada
++//
++// Por que: Wreckfest dibuja la escena con SU resolucion interna, no con la del
++// backbuffer (con [Device] width=7680 el backbuffer sale de 7680 y la escena
++// ocupa los 2560 de la izquierda), y esa resolucion vive en settings.conf, que
++// tiene suma de control propia y no se puede escribir desde afuera. Lo unico
++// que queda es que el propio juego la elija: para eso tiene que aparecer en su
++// lista, que arma con IDXGIOutput::GetDisplayModeList.
++//
++// Como: se engancha el CODIGO de GetDisplayModeList, GetDisplayModeList1 y
++// FindClosestMatchingMode (Nektra, mismo patron que CreateSwapChain), sacando
++// las direcciones de la vtable de la primera salida que se encuentre. La
++// implementacion de dxgi es una sola, asi que vale para todas las salidas.
++// A la lista de cada salida se le suma W x H copiando formato, refresco,
++// scanline y scaling del modo mas ANCHO que tenga el mismo alto (una entrada
++// por cada variante de ese modo, o sea una por refresco).
++//
++// Riesgo: el modo no existe en ningun monitor. En Modo Ventana el juego solo
++// crea una ventana de ese tamano (es lo que se busca). En pantalla completa
++// exclusiva DXGI intentaria un cambio de modo imposible: la app tiene que
++// decirle al usuario que elija Modo Ventana. Ver docs/DLL-HECHO-2026-11-01.md.
++//
++// Reentrada: dxgi puede implementar una variante llamando a la otra. Mientras
++// uno de estos ganchos esta adentro, los demas pasan derecho (contador por
++// hilo), si no el modo se agregaria dos veces.
++
++typedef HRESULT(__stdcall *tt_tGetDisplayModeList)(IDXGIOutput *This,
++	DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes, DXGI_MODE_DESC *pDesc);
++typedef HRESULT(__stdcall *tt_tGetDisplayModeList1)(IDXGIOutput1 *This,
++	DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes, DXGI_MODE_DESC1 *pDesc);
++typedef HRESULT(__stdcall *tt_tFindClosestMatchingMode)(IDXGIOutput *This,
++	const DXGI_MODE_DESC *pModeToMatch, DXGI_MODE_DESC *pClosestMatch, IUnknown *pConcernedDevice);
++
++static tt_tGetDisplayModeList      fnOrigGetDisplayModeList = nullptr;
++static tt_tGetDisplayModeList1     fnOrigGetDisplayModeList1 = nullptr;
++static tt_tFindClosestMatchingMode fnOrigFindClosestMatchingMode = nullptr;
++
++static thread_local int tt_modos_dentro = 0;
++
++struct tt_guardia_modos {
++	tt_guardia_modos() { tt_modos_dentro++; }
++	~tt_guardia_modos() { tt_modos_dentro--; }
++};
++
++template <typename Desc>
++static bool tt_mismo_modo(const Desc &a, const Desc &b)
++{
++	return a.Width == b.Width && a.Height == b.Height &&
++		a.RefreshRate.Numerator == b.RefreshRate.Numerator &&
++		a.RefreshRate.Denominator == b.RefreshRate.Denominator &&
++		a.Format == b.Format &&
++		a.ScanlineOrdering == b.ScanlineOrdering &&
++		a.Scaling == b.Scaling;
++}
++
++// Lista completa = la original + las copias W x H al final (la lista de DXGI
++// va de menor a mayor, y el triple es el mas ancho). `extra` = cuantas se
++// agregaron; 0 = no hay nada que agregar (no hay modo de ese alto, o ya esta).
++template <typename Desc, typename Fn, typename Out>
++static HRESULT tt_lista_con_triple(Fn orig, Out *This, DXGI_FORMAT fmt, UINT flags,
++	std::vector<Desc> &modos, UINT *extra)
++{
++	*extra = 0;
++	modos.clear();
++	HRESULT hr = S_OK;
++	// El protocolo de dos llamadas tiene una carrera de fabrica (la lista puede
++	// crecer entre contar y llenar, p.ej. si se enchufa un monitor): reintentar.
++	for (int intento = 0; intento < 4; intento++) {
++		UINT n = 0;
++		hr = orig(This, fmt, flags, &n, NULL);
++		if (FAILED(hr))
++			return hr;
++		modos.resize(n);
++		if (n == 0)
++			break;
++		hr = orig(This, fmt, flags, &n, modos.data());
++		if (hr == DXGI_ERROR_MORE_DATA)
++			continue;
++		if (FAILED(hr))
++			return hr;
++		modos.resize(n);
++		break;
++	}
++	if (hr == DXGI_ERROR_MORE_DATA)
++		return hr;
++
++	const UINT W = (UINT)G->TRIPLE_MODE_WIDTH, H = (UINT)G->TRIPLE_MODE_HEIGHT;
++	if (!W || !H)
++		return hr;
++
++	UINT maxw = 0;
++	for (const Desc &m : modos)
++		if (m.Height == H && m.Width < W && m.Width > maxw)
++			maxw = m.Width;
++	if (!maxw)
++		return hr;
++
++	const size_t n0 = modos.size();
++	for (size_t i = 0; i < n0; i++) {
++		if (modos[i].Height != H || modos[i].Width != maxw)
++			continue;
++		Desc nuevo = modos[i];
++		nuevo.Width = W;
++		bool ya = false;
++		for (size_t j = 0; j < modos.size() && !ya; j++)
++			ya = tt_mismo_modo(modos[j], nuevo);
++		if (!ya) {
++			modos.push_back(nuevo);
++			(*extra)++;
++		}
++	}
++	return hr;
++}
++
++template <typename Desc, typename Fn, typename Out>
++static HRESULT tt_get_display_mode_list(Fn orig, const char *nombre, Out *This,
++	DXGI_FORMAT fmt, UINT flags, UINT *pNumModes, Desc *pDesc)
++{
++	if (tt_modos_dentro || G->TRIPLE_MODE_WIDTH <= 0 || G->TRIPLE_MODE_HEIGHT <= 0 || !pNumModes)
++		return orig(This, fmt, flags, pNumModes, pDesc);
++
++	tt_guardia_modos guardia;
++
++	std::vector<Desc> modos;
++	UINT extra = 0;
++	HRESULT hr;
++	try {
++		hr = tt_lista_con_triple<Desc>(orig, This, fmt, flags, modos, &extra);
++	} catch (...) {
++		LogInfo("TrueTriple: %s fallo armando la lista; se devuelve la original\n", nombre);
++		hr = E_FAIL;
++		extra = 0;
++	}
++
++	// Nada que agregar o algo raro: la respuesta exacta de dxgi.
++	if (FAILED(hr) || hr == DXGI_ERROR_MORE_DATA || extra == 0)
++		return orig(This, fmt, flags, pNumModes, pDesc);
++
++	const UINT total = (UINT)modos.size();
++	LogInfo("TrueTriple: modo triple agregado %dx%d (%s, formato %d, %u de %u entradas)\n",
++		G->TRIPLE_MODE_WIDTH, G->TRIPLE_MODE_HEIGHT, nombre, (int)fmt, extra, total);
++
++	if (!pDesc) {
++		*pNumModes = total;
++		return S_OK;
++	}
++	const UINT cap = *pNumModes;
++	const UINT k = cap < total ? cap : total;
++	if (k)
++		memcpy(pDesc, modos.data(), k * sizeof(Desc));
++	if (cap < total) {
++		*pNumModes = k;
++		return DXGI_ERROR_MORE_DATA;
++	}
++	*pNumModes = total;
++	return S_OK;
++}
++
++static HRESULT __stdcall Hooked_GetDisplayModeList(IDXGIOutput *This,
++	DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes, DXGI_MODE_DESC *pDesc)
++{
++	return tt_get_display_mode_list<DXGI_MODE_DESC>(fnOrigGetDisplayModeList,
++		"GetDisplayModeList", This, EnumFormat, Flags, pNumModes, pDesc);
++}
++
++static HRESULT __stdcall Hooked_GetDisplayModeList1(IDXGIOutput1 *This,
++	DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes, DXGI_MODE_DESC1 *pDesc)
++{
++	return tt_get_display_mode_list<DXGI_MODE_DESC1>(fnOrigGetDisplayModeList1,
++		"GetDisplayModeList1", This, EnumFormat, Flags, pNumModes, pDesc);
++}
++
++// Si piden EXACTAMENTE W x H se devuelve el modo falso (el de refresco mas
++// cercano al pedido, o el mas alto si no piden refresco); si no, dxgi.
++static HRESULT __stdcall Hooked_FindClosestMatchingMode(IDXGIOutput *This,
++	const DXGI_MODE_DESC *pModeToMatch, DXGI_MODE_DESC *pClosestMatch, IUnknown *pConcernedDevice)
++{
++	if (tt_modos_dentro || G->TRIPLE_MODE_WIDTH <= 0 || G->TRIPLE_MODE_HEIGHT <= 0 ||
++	    !pModeToMatch || !pClosestMatch || !fnOrigGetDisplayModeList ||
++	    pModeToMatch->Width != (UINT)G->TRIPLE_MODE_WIDTH ||
++	    pModeToMatch->Height != (UINT)G->TRIPLE_MODE_HEIGHT)
++		return fnOrigFindClosestMatchingMode(This, pModeToMatch, pClosestMatch, pConcernedDevice);
++
++	tt_guardia_modos guardia;
++
++	DXGI_FORMAT fmt = pModeToMatch->Format;
++	if (fmt == DXGI_FORMAT_UNKNOWN)
++		fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++
++	std::vector<DXGI_MODE_DESC> modos;
++	UINT extra = 0;
++	HRESULT hr;
++	try {
++		hr = tt_lista_con_triple<DXGI_MODE_DESC>(fnOrigGetDisplayModeList, This, fmt, 0, modos, &extra);
++	} catch (...) {
++		hr = E_FAIL;
++		extra = 0;
++	}
++	if (FAILED(hr) || hr == DXGI_ERROR_MORE_DATA || extra == 0)
++		return fnOrigFindClosestMatchingMode(This, pModeToMatch, pClosestMatch, pConcernedDevice);
++
++	double pedido = pModeToMatch->RefreshRate.Denominator ?
++		(double)pModeToMatch->RefreshRate.Numerator / pModeToMatch->RefreshRate.Denominator : 0.0;
++	size_t mejor = modos.size() - extra;
++	double mejor_d = 1e30;
++	for (size_t i = modos.size() - extra; i < modos.size(); i++) {
++		const DXGI_RATIONAL &r = modos[i].RefreshRate;
++		double hz = r.Denominator ? (double)r.Numerator / r.Denominator : 0.0;
++		double d = pedido > 0.0 ? fabs(hz - pedido) : -hz;
++		if (d < mejor_d) {
++			mejor_d = d;
++			mejor = i;
++		}
++	}
++	*pClosestMatch = modos[mejor];
++	LogInfo("TrueTriple: FindClosestMatchingMode %dx%d -> modo triple %u/%u Hz\n",
++		G->TRIPLE_MODE_WIDTH, G->TRIPLE_MODE_HEIGHT,
++		pClosestMatch->RefreshRate.Numerator, pClosestMatch->RefreshRate.Denominator);
++	return S_OK;
++}
++
++// Sin objetos de C++ adentro: la llama tt_instalar_ganchos_modos bajo __try.
++static void tt_instalar_ganchos_modos_cuerpo(void *factory)
++{
++	IDXGIFactory *fac = reinterpret_cast<IDXGIFactory*>(factory);
++	IDXGIAdapter *ad = NULL;
++	IDXGIOutput *out = NULL;
++	IDXGIOutput1 *out1 = NULL;
++	SIZE_T hook_id;
++	DWORD err;
++
++	// La primera salida del primer adaptador que tenga una (en una notebook
++	// hibrida el adaptador 0 puede no tener monitores).
++	for (UINT a = 0; a < 8 && !out; a++) {
++		if (FAILED(fac->EnumAdapters(a, &ad)) || !ad)
++			break;
++		if (FAILED(ad->EnumOutputs(0, &out)))
++			out = NULL;
++		ad->Release();
++		ad = NULL;
++	}
++	if (!out) {
++		LogInfo("TrueTriple: triple_window_mode sin ninguna salida DXGI; no se engancha nada\n");
++		return;
++	}
++
++	err = cHookMgr.Hook(&hook_id, (void**)&fnOrigGetDisplayModeList,
++		lpvtbl_GetDisplayModeList(out), Hooked_GetDisplayModeList, 0);
++	if (err != ERROR_SUCCESS) {
++		fnOrigGetDisplayModeList = nullptr;
++		LogInfo("TrueTriple: no se pudo enganchar IDXGIOutput::GetDisplayModeList (%u); triple_window_mode sin efecto\n", err);
++		out->Release();
++		return;
++	}
++	LogInfo("TrueTriple: enganchado IDXGIOutput::GetDisplayModeList (modo triple %dx%d)\n",
++		G->TRIPLE_MODE_WIDTH, G->TRIPLE_MODE_HEIGHT);
++
++	err = cHookMgr.Hook(&hook_id, (void**)&fnOrigFindClosestMatchingMode,
++		lpvtbl_FindClosestMatchingMode(out), Hooked_FindClosestMatchingMode, 0);
++	if (err != ERROR_SUCCESS) {
++		fnOrigFindClosestMatchingMode = nullptr;
++		LogInfo("TrueTriple: no se pudo enganchar IDXGIOutput::FindClosestMatchingMode (%u)\n", err);
++	}
++
++	if (SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput1), (void**)&out1)) && out1) {
++		err = cHookMgr.Hook(&hook_id, (void**)&fnOrigGetDisplayModeList1,
++			lpvtbl_GetDisplayModeList1(out1), Hooked_GetDisplayModeList1, 0);
++		if (err != ERROR_SUCCESS) {
++			fnOrigGetDisplayModeList1 = nullptr;
++			LogInfo("TrueTriple: no se pudo enganchar IDXGIOutput1::GetDisplayModeList1 (%u)\n", err);
++		} else {
++			LogInfo("TrueTriple: enganchado IDXGIOutput1::GetDisplayModeList1\n");
++		}
++		out1->Release();
++	}
++	out->Release();
++}
++
++static void tt_instalar_ganchos_modos(void *factory)
++{
++	static volatile LONG hecho = 0;
++
++	if (G->TRIPLE_MODE_WIDTH <= 0 || G->TRIPLE_MODE_HEIGHT <= 0 || !factory)
++		return;
++	if (InterlockedCompareExchange(&hecho, 1, 0) != 0)
++		return;
++
++	__try {
++		tt_instalar_ganchos_modos_cuerpo(factory);
++	} __except (EXCEPTION_EXECUTE_HANDLER) {
++		LogInfo("TrueTriple: excepcion 0x%x instalando los ganchos de triple_window_mode; el juego sigue sin ellos\n",
++			GetExceptionCode());
++	}
++}
++
+ // -----------------------------------------------------------------------------
+ // Actual function called by the game for every CreateDXGIFactory they make.
+ // This is only called for the in-process game, not system wide.
+@@ -940,6 +1240,9 @@ HRESULT __stdcall Hooked_CreateDXGIFactory(REFIID riid, void **ppFactory)
+ 	if (!fnOrigCreateSwapChain)
+ 		HookCreateSwapChain(*ppFactory);
+ 
++	// TrueTriple: [Device] triple_window_mode (apagado = no hace nada).
++	tt_instalar_ganchos_modos(*ppFactory);
++
+ 	// With the addition of the platform_update, we need to allow for specifically
+ 	// creating a DXGIFactory2 instead of DXGIFactory1.  We want to always upcast
+ 	// the highest supported object for each scenario, to properly suppport
+@@ -1012,6 +1315,9 @@ HRESULT __stdcall Hooked_CreateDXGIFactory1(REFIID riid, void **ppFactory1)
+ 	if (!fnOrigCreateSwapChain)
+ 		HookCreateSwapChain(*ppFactory1);
+ 
++	// TrueTriple: [Device] triple_window_mode (apagado = no hace nada).
++	tt_instalar_ganchos_modos(*ppFactory1);
++
+ 	// With the addition of the platform_update, we need to allow for specifically
+ 	// creating a DXGIFactory2 instead of DXGIFactory1.  We want to always upcast
+ 	// the highest supported object for each scenario, to properly suppport
+@@ -1077,6 +1383,9 @@ HRESULT __stdcall Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFa
+ 	if (!fnOrigCreateSwapChain)
+ 		HookCreateSwapChain(*ppFactory2);
+ 
++	// TrueTriple: [Device] triple_window_mode (apagado = no hace nada).
++	tt_instalar_ganchos_modos(*ppFactory2);
++
+ 	// We still upcast, even in CreateDXGIFactory2, because the game could
+ 	// have passed a lower version riid, and this way is safer. The version
+ 	// of this function isn't actually strongly related to the interface
+diff --git a/DirectX11/HookedDXGI.h b/DirectX11/HookedDXGI.h
+index 8bb968a..88376de 100644
+--- a/DirectX11/HookedDXGI.h
++++ b/DirectX11/HookedDXGI.h
+@@ -73,3 +73,10 @@ extern "C" LPVOID lpvtbl_Present(IDXGISwapChain* pSwapChain);
+ 
+ extern "C" LPVOID lpvtbl_Present1(IDXGISwapChain1* pSwapChain1);
+ 
++// TrueTriple Wreckfest (2026-11-01): [Device] triple_window_mode
++extern "C" LPVOID lpvtbl_GetDisplayModeList(IDXGIOutput* pOutput);
++
++extern "C" LPVOID lpvtbl_FindClosestMatchingMode(IDXGIOutput* pOutput);
++
++extern "C" LPVOID lpvtbl_GetDisplayModeList1(IDXGIOutput1* pOutput1);
++
+diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
+index 2c88983..8ca3c91 100644
+--- a/DirectX11/IniHandler.cpp
++++ b/DirectX11/IniHandler.cpp
+@@ -21,10 +21,11 @@
+ #include "shellscalingapi.h"
+ 
+ #include <filesystem>
+-// TODO: We probably don't need this <filesystem> header
+-// TODO: Remove this #define after we switch to C++17 and remove 'experimental'
+-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
+-#include <experimental/filesystem>
++// NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
++// The experimental namespace was unused here, so the include was dropped.
++// This is the ONLY change to the pristine 3Dmigoto 1.4.9 source in this copy:
++// it is a toolset-compatibility fix, not a behaviour change. Same fix as the
++// DiRT Rally 2.0 tree.
+ 
+ #define INI_FILENAME L"d3dx.ini"
+ 
+@@ -1345,7 +1346,7 @@ static void RegisterPresetKeyBindings()
+ {
+ 	KeyOverrideType type;
+ 	shared_ptr<KeyOverrideBase> preset;
+-	int delay, release_delay;
++	int delay, release_delay, repeat;
+ 	IniSections::iterator lower, upper, i;
+ 	vector<wstring> keys;
+ 	vector<wstring> back;
+@@ -1369,13 +1370,20 @@ static void RegisterPresetKeyBindings()
+ 
+ 		delay = GetIniInt(id, L"delay", 0, NULL);
+ 		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
++		// Seat adjustment cycles need auto-repeat while the key is held. Other
++		// override types keep their existing one-shot/hold behavior.
++		repeat = type == KeyOverrideType::CYCLE ? GetIniInt(id, L"repeat", 0, NULL) : 0;
++		if (repeat < 0 || repeat > 60) {
++			IniWarning("WARNING: [%S] repeat must be between 0 and 60\n", id);
++			repeat = 0;
++		}
+ 
+ 		if (type == KeyOverrideType::CYCLE) {
+ 			shared_ptr<KeyOverrideCycle> cycle_preset = make_shared<KeyOverrideCycle>();
+ 			shared_ptr<KeyOverrideCycleBack> cycle_back = make_shared<KeyOverrideCycleBack>(cycle_preset);
+ 			preset = cycle_preset;
+ 			for (wstring key : back)
+-				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, 0, delay, release_delay);
++				RegisterKeyBinding(L"Back", key.c_str(), cycle_back, repeat, delay, release_delay);
+ 		} else {
+ 			preset = make_shared<KeyOverride>(type);
+ 		}
+@@ -1383,7 +1391,7 @@ static void RegisterPresetKeyBindings()
+ 		preset->ParseIniSection(id);
+ 
+ 		for (wstring key : keys)
+-			RegisterKeyBinding(L"Key", key.c_str(), preset, 0, delay, release_delay);
++			RegisterKeyBinding(L"Key", key.c_str(), preset, repeat, delay, release_delay);
+ 	}
+ }
+ 
+@@ -4162,6 +4170,21 @@ void LoadConfigFile()
+ 	G->SCREEN_WIDTH = GetIniInt(L"Device", L"width", -1, NULL);
+ 	G->SCREEN_HEIGHT = GetIniInt(L"Device", L"height", -1, NULL);
+ 	G->SCREEN_REFRESH = GetIniInt(L"Device", L"refresh_rate", -1, NULL);
++
++	// TrueTriple Wreckfest (2026-11-01): un modo W x H extra en la lista de
++	// resoluciones que ve el juego (IDXGIOutput::GetDisplayModeList). Ausente,
++	// 0 o mal escrito = apagado. Ver HookedDXGI.cpp.
++	G->TRIPLE_MODE_WIDTH = 0;
++	G->TRIPLE_MODE_HEIGHT = 0;
++	if (GetIniStringAndLog(L"Device", L"triple_window_mode", 0, setting, MAX_PATH)) {
++		int tw = 0, th = 0;
++		if (swscanf_s(setting, L"%d %d", &tw, &th) == 2 && tw >= 640 && tw <= 16384 && th >= 480 && th <= 16384) {
++			G->TRIPLE_MODE_WIDTH = tw;
++			G->TRIPLE_MODE_HEIGHT = th;
++		} else if (!(swscanf_s(setting, L"%d", &tw) == 1 && tw == 0)) {
++			IniWarning("WARNING: triple_window_mode requires \"<width> <height>\" (or 0 to disable): %S\n", setting);
++		}
++	}
+ 	G->SCREEN_UPSCALING = GetIniInt(L"Device", L"upscaling", 0, NULL);
+ 	G->UPSCALE_MODE = GetIniInt(L"Device", L"upscale_mode", 0, NULL);
+ 
+diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
+index 994124c..e6b529b 100644
+--- a/DirectX11/Overlay.cpp
++++ b/DirectX11/Overlay.cpp
+@@ -692,6 +692,10 @@ void Overlay::DrawNotices(float *y)
+ 	Vector2 textPosition;
+ 	Vector2 strSize;
+ 	int level, displayed = 0;
++	// TrueTriple: columna propia para los avisos de TrueTriple, a ~12 % del
++	// alto (170 px en 1440): arriba al centro estan los contadores de FPS de
++	// NVIDIA/Steam y lo tapaban casi entero (prueba en el juego, 2026-11-01).
++	float tt_y = float(mResolution.y) * 0.118f;
+ 
+ 	EnterCriticalSectionPretty(&notices.lock);
+ 
+@@ -718,10 +722,20 @@ void Overlay::DrawNotices(float *y)
+ 
+ 			strSize = (this->*log_levels[level].font)->MeasureString(notice->message.c_str());
+ 
+-			DrawRectangle(0, *y, strSize.x + 3, strSize.y, 0, 0, 0, 0.75);
++			// TrueTriple: los avisos propios van al centro del lienzo. Con
++			// laterales iguales (y huecos iguales) es el centro del monitor
++			// del medio; el resto de 3Dmigoto sigue arriba a la izquierda.
++			float nx = 0.0f;
++			float *py = y;
++			if (notice->tt_tipo > 0) {
++				nx = max(float(mResolution.x - strSize.x) / 2, 0.0f);
++				py = &tt_y;
++			}
++
++			DrawRectangle(nx, *py, strSize.x + 3, strSize.y, 0, 0, 0, 0.75);
+ 
+-			(this->*log_levels[level].font)->DrawString(mSpriteBatch.get(), notice->message.c_str(), Vector2(0, *y), log_levels[level].colour);
+-			*y += strSize.y + 5;
++			(this->*log_levels[level].font)->DrawString(mSpriteBatch.get(), notice->message.c_str(), Vector2(nx, *py), log_levels[level].colour);
++			*py += strSize.y + 5;
+ 
+ 			has_notice = true;
+ 			notice++;
+@@ -837,9 +851,10 @@ fail_restore:
+ 		Profiling::end(&profiling_state, &Profiling::overlay_overhead);
+ }
+ 
+-OverlayNotice::OverlayNotice(std::wstring message) :
++OverlayNotice::OverlayNotice(std::wstring message, int tt_tipo) :
+ 	message(message),
+-	timestamp(0)
++	timestamp(0),
++	tt_tipo(tt_tipo)
+ {
+ }
+ 
+@@ -917,3 +932,39 @@ void LogOverlay(LogLevel level, char *fmt, ...)
+ 
+ 	va_end(ap);
+ }
++
++// TrueTriple (2026-11-01): ver Overlay.h. Mismo canal que LogOverlay(LOG_WARNING):
++// LOG_WARNING no tiene hide_in_release, asi que se dibuja tambien fuera de caza.
++// Reemplazar en vez de apilar importa con las teclas con repeat: mantener
++// apretado el bisel cambia el valor cada pocos frames y sin esto se llenaria la
++// columna de lineas viejas.
++void LogOverlayTrueTriple(int tipo, const char *fmt, ...)
++{
++	char amsg[maxstring];
++	wchar_t wmsg[maxstring];
++	va_list ap;
++
++	va_start(ap, fmt);
++	_vsnprintf_s(amsg, maxstring, _TRUNCATE, fmt, ap);
++	va_end(ap);
++
++	LogInfo("%s", amsg);
++	mbstowcs(wmsg, amsg, maxstring);
++	wmsg[maxstring - 1] = L'\0';
++
++	EnterCriticalSectionPretty(&notices.lock);
++
++	std::vector<OverlayNotice> &v = notices.notices[LOG_WARNING];
++	if (tipo > 0) {
++		for (auto it = v.begin(); it != v.end(); ) {
++			if (it->tt_tipo == tipo)
++				it = v.erase(it);
++			else
++				++it;
++		}
++	}
++	v.emplace_back(wmsg, tipo);
++	has_notice = true;
++
++	LeaveCriticalSection(&notices.lock);
++}
+diff --git a/DirectX11/Overlay.h b/DirectX11/Overlay.h
+index e261940..4fd6650 100644
+--- a/DirectX11/Overlay.h
++++ b/DirectX11/Overlay.h
+@@ -31,8 +31,12 @@ class OverlayNotice {
+ public:
+ 	std::wstring message;
+ 	DWORD timestamp;
++	// TrueTriple (2026-11-01): avisos propios. tt_tipo > 0 = un aviso por
++	// tipo (el nuevo reemplaza al anterior en vez de apilarse) y se dibuja
++	// centrado en el lienzo, o sea en el monitor del medio.
++	int tt_tipo;
+ 
+-	OverlayNotice(std::wstring message);
++	OverlayNotice(std::wstring message, int tt_tipo = 0);
+ };
+ 
+ class Overlay
+@@ -120,3 +124,6 @@ public:
+ void ClearNotices();
+ void LogOverlayW(LogLevel level, wchar_t *fmt, ...);
+ void LogOverlay(LogLevel level, char *fmt, ...);
++// TrueTriple: aviso LOG_WARNING (se ve fuera de caza) centrado y que reemplaza
++// al anterior del mismo tipo (tipo > 0).
++void LogOverlayTrueTriple(int tipo, const char *fmt, ...);
+diff --git a/DirectX11/globals.h b/DirectX11/globals.h
+index 111e77c..b86f9e4 100644
+--- a/DirectX11/globals.h
++++ b/DirectX11/globals.h
+@@ -424,6 +424,10 @@ struct Globals
+ 	int SCREEN_WIDTH;
+ 	int SCREEN_HEIGHT;
+ 	int SCREEN_REFRESH;
++	// TrueTriple Wreckfest (2026-11-01): [Device] triple_window_mode = W H.
++	// 0 = apagado (ni siquiera se instalan los ganchos de IDXGIOutput).
++	int TRIPLE_MODE_WIDTH;
++	int TRIPLE_MODE_HEIGHT;
+ 	int SCREEN_FULLSCREEN;
+ 	int SCREEN_UPSCALING;
+ 	int UPSCALE_MODE;
+@@ -666,6 +670,8 @@ struct Globals
+ 		SCREEN_WIDTH(-1),
+ 		SCREEN_HEIGHT(-1),
+ 		SCREEN_REFRESH(-1),
++		TRIPLE_MODE_WIDTH(0),
++		TRIPLE_MODE_HEIGHT(0),
+ 		SCREEN_FULLSCREEN(0),
+ 		SCREEN_ALLOW_COMMANDS(false),
+ 		upscaling_hooks_armed(true),
