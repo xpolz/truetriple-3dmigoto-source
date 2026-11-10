@@ -14,7 +14,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
 | [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.8.9 (dll del 10/11/2026, con la marca de sesión) | `486d34f70bbe0adc3686953796a50a05ad12a5b2cabb93762eb69e4a6de0f9cb` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.1 (dll del 10/11/2026, sin el diagnóstico de la niebla) | `f7c969bce5782fab8887cd8988fb167aeba0539f5a35a548e496236214c4239b` | etiqueta `dr1-dll-ee23d9df` (anterior: `dr1-dll-f876672f` |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.1 (dll del 10/11/2026, sin el diagnóstico de la niebla) | `f7c969bce5782fab8887cd8988fb167aeba0539f5a35a548e496236214c4239b` | etiqueta `dr1-dll-f7c969bc` (anteriores en la tabla de abajo |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
