@@ -1481,7 +1481,6 @@ void ScissorCommand::run(CommandListState *state)
 //   iniParams[7].w  (near de ESA MISMA camara; con [3].w forman su firma, y de
 //                    ahi sale si es una vista de conduccion -> ver el bloque de
 //                    la firma mas abajo)
-//   iniParams[8].z  (1 = hay un tramo dibujandose; lo gatea la niebla)
 //   iniParams[8].x  (NUMERO DE PLANTEL del auto cargado, 1..N; 0 = ninguno.
 //                    Lo publica tt_car_update() leyendo el id de modelo del motor)
 //   iniParams[9].y  (seno del ROLIDO, v6; misma camara que el cabeceo)
@@ -2298,59 +2297,12 @@ static const UINT64 g_tt_vs_terreno[] = {
 	0xf024befebf9fce2cull, 0xf6b5073fd4c5ec39ull };
 static volatile LONG g_tt_terreno_frame = 0;
 
-// Los 3 vertex shaders del PARABRISAS visto desde adentro (`interior_windscreen`
-// e `interior_windscreen_envFX` del shaderpack; sacados offline de
-// analisis/shaderpack/indice.json, sin abrir el juego). Ordenados para busqueda
-// binaria.
-//
-// POR QUE EXISTE ESTA LISTA. La niebla no se veia en camara cockpit, y el autor
-// lo describio exacto: *"como si hubiera una mascara que la oculta al mirar
-// desde el parabrisas; no existe la niebla cuando estamos dentro"*. El log del
-// 2026-09-05 descarto el gate -el pase CORRIA, 7128 veces, una por frame- asi
-// que lo que fallaba era el DEPTH. Y es literal: el parabrisas se dibuja con su
-// propio shader y ESCRIBE PROFUNDIDAD sobre todo el hueco de la ventanilla. El
-// depth que la niebla copiaba al final del frame decia "hay vidrio a 0,8 m" en
-// cada pixel por el que se ve el paisaje -> distancia casi cero -> niebla cero.
-// Una mascara, tal cual.
-//
-// La copia del depth se adelanta entonces al PRIMER draw del parabrisas del
-// frame, que es despues del mundo y del habitaculo y antes del vidrio. Ver el
-// bloque de niebla de [CustomShaderTripleRedraw].
-static const UINT64 g_tt_vs_vidrio[] = {
-	0x19da32ca8ac686b9ull, 0x8e528b6608310f36ull, 0xff60aaf27d29e615ull };
-
-// ===== DIAGNOSTICO DE LA NIEBLA (temporal, 2026-09-05) =======================
-// Reporte del autor: "no existe la niebla cuando estamos dentro" del cockpit,
-// "como si hubiera una mascara que la oculta al mirar desde el parabrisas".
-// Desde afuera, "el pase no corre" y "corre pero no se ve" son identicos, y ya
-// se gastaron tres builds probando hipotesis. Esto lo contesta en UNA corrida:
-// saca cada 300 frames el valor de cada condicion del gate y cuantas veces
-// corrio el pase de verdad ($fx_ran, que incrementa el propio ini).
-static void tt_fx_diag(unsigned frame)
-{
-	static unsigned ultimo = 0;
-	static CommandListVariable *v_on = NULL, *v_cond = NULL, *v_ran = NULL, *v_trip = NULL, *v_m = NULL;
-	static CommandListVariable *v_cop = NULL;
-	if (frame - ultimo < 300)
-		return;
-	ultimo = frame;
-	if (!v_on)   v_on   = cl_global(L"$fx_on");
-	if (!v_cond) v_cond = cl_global(L"$es_conduccion");
-	if (!v_ran)  v_ran  = cl_global(L"$fx_ran");
-	if (!v_trip) v_trip = cl_global(L"$triple_on");
-	if (!v_m)    v_m    = cl_global(L"$fx_niebla_m");
-	if (!v_cop)  v_cop  = cl_global(L"$fx_dcopy");
-	float z8 = (G && G->iniParams.size() >= 9) ? G->iniParams[8].z : -1.0f;
-	float w8 = (G && G->iniParams.size() >= 9) ? G->iniParams[8].w : -1.0f;
-	float x13 = (G && G->iniParams.size() >= 14) ? G->iniParams[13].x : -1.0f;
-	LogInfo("TTFX: frame=%u | fx_on=%.0f triple_on=%.0f es_conduccion=%.0f z8(terreno)=%.0f "
-		"w8(vidrio)=%.0f x13(gate)=%.0f | corrio=%.0f | depth_antes_del_vidrio=%.0f | niebla_m=%.0f\n",
-		frame,
-		v_on ? v_on->fval : -1.0f, v_trip ? v_trip->fval : -1.0f,
-		v_cond ? v_cond->fval : -1.0f, z8, w8, x13,
-		v_ran ? v_ran->fval : -1.0f, v_cop ? v_cop->fval : -1.0f,
-		v_m ? v_m->fval : -1.0f);
-}
+// Hasta el 2026-11-10 aca vivian la lista de los 3 vertex shaders del
+// PARABRISAS (`g_tt_vs_vidrio`, para que la niebla copiara el depth antes del
+// vidrio) y el diagnostico `tt_fx_diag` (la linea `TTFX:` del log cada 300
+// frames). Eran SOLO de la niebla por distancia, que se retiro de la plantilla
+// en la v33; se sacaron del dll junto con las senales w8 (vidrio) y z8 (tramo)
+// que publicaban. La lista de terreno de arriba se queda: gatea el ensanche.
 
 void TripleNotaVS(UINT64 hash)
 {
@@ -2363,21 +2315,6 @@ void TripleNotaVS(UINT64 hash)
 		}
 		if (g_tt_vs_terreno[m] < hash) lo = m + 1; else hi = m - 1;
 	}
-
-	// w8 = EL VERTEX SHADER BINDEADO AHORA ES EL PARABRISAS (ver g_tt_vs_vidrio).
-	// Lo consume [CustomShaderTripleRedraw] para copiar el depth JUSTO ANTES de
-	// que el vidrio lo pise. Vale para el draw que viene, no para el frame: esta
-	// funcion corre en cada VSSetShader, o sea que sube en el draw del vidrio y
-	// vuelve a 0 en el siguiente shader.
-	bool vidrio = false;
-	lo = 0; hi = (int)(sizeof(g_tt_vs_vidrio) / sizeof(g_tt_vs_vidrio[0])) - 1;
-	while (lo <= hi) {
-		int m = (lo + hi) / 2;
-		if (g_tt_vs_vidrio[m] == hash) { vidrio = true; break; }
-		if (g_tt_vs_vidrio[m] < hash) lo = m + 1; else hi = m - 1;
-	}
-	if (G && G->iniParams.size() >= 9)
-		G->iniParams[8].w = vidrio ? 1.0f : 0.0f;
 }
 // ===== EL ENSANCHE NO PUEDE LLEGAR A LOS SHADERS (2026-09-04, build 19) =======
 //
@@ -3859,25 +3796,6 @@ void TripleCaptureCameraCB(void *data, unsigned size)
 	tt_replay_update();
 	tt_car_update();
 	tt_cam_update();
-
-	if (G)
-		tt_fx_diag(G->frame_no);
-
-	// z8 = HAY UN TRAMO DIBUJANDOSE (1) o no (0). Lo consume [Present] para
-	// gatear la niebla. La senal es la misma que gatea el ensanche: un vertex
-	// shader de terreno bindeado en los ultimos 120 frames (ver TripleNotaVS).
-	//
-	// ⚠️ Hace falta porque `$es_conduccion` NO alcanza: la lista blanca de
-	// camaras deja pasar el cielo del menu principal (m11 3.974014, y esta
-	// documentado que no hay corte que lo excluya sin dejar afuera camaras
-	// reales del usuario). Con eso solo, el menu entero se veia BLANCO de
-	// niebla. El terreno, en cambio, no se dibuja en ningun menu.
-	if (G && G->iniParams.size() >= 9) {
-		unsigned fr = G->frame_no;
-		LONG ult = InterlockedCompareExchange(&g_tt_terreno_frame, 0, 0);
-		bool hay = ult != 0 && (fr - (unsigned)ult) <= 120;
-		G->iniParams[8].z = hay ? 1.0f : 0.0f;
-	}
 
 	// EL ENSANCHE SE QUEDA DEL LADO DE LA CPU. El motor ya hizo su descarte con
 	// la matriz ancha; lo que va a los shaders vuelve a ser la original, asi que
