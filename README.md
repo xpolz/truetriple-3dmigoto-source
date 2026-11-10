@@ -14,7 +14,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
 | [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | 1.7.2 (dll del 8/10/2026) | `d07fc90116a195e17dea47ca8104b82c79dfce1ef7da669e58c980fbaeac9421` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally | pendiente | pendiente | pendiente |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | 1.5.3 (app suelta) / 1.6.0 (paquete del launcher, 10/11/2026) | `f876672f4ddccca6a93c7f99f879899511e09b43b90a0adc591cfac08efddb9f` | etiqueta `dr1-dll-f876672f` |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
@@ -25,6 +25,16 @@ hasta hoy:
 | `d07fc901…9421` | app 1.7.2 (instaladores del 8/10 y 24/10/2026) y paquetes del launcher 1.8.2 en adelante | etiqueta `dr2-dll-d07fc901` |
 | `69d760b0…5017` | paquetes del launcher 1.8.0 y 1.8.1 (retirados el 8/11/2026) | etiqueta `dr2-dll-69d760b0` |
 | anteriores a 1.7.0 | instaladores 1.5.x y 1.6.x | pendiente de ubicar (se agregan acá a medida que se encuentran) |
+
+Todas las dll de DiRT Rally (DR1, x86) entregadas hasta hoy:
+
+| SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
+|---|---|---|
+| `f876672f…ddb9f` | app suelta 1.5.3 (5/9/2026) y paquete del launcher 1.6.0 | etiqueta `dr1-dll-f876672f` |
+
+Nota DR1: existe un cambio de fuente posterior a esa dll (commit `cb2010e` del repo del mod, 10/10/2026,
+`IniHandler.cpp`: el eco del `.ini` al log pasa a `LogDebug`) que **no** está en `dirt-rally1/` y
+está pendiente de recompilar. Cuando salga la dll nueva tendrá su propia etiqueta.
 
 Cada carpeta trae:
 
@@ -67,6 +77,18 @@ MSBuild.exe "StereovisionHacks.sln" /p:Configuration=Release /p:Platform=x64 /p:
 
 Si falta algo para compilar un dll que funcione, avisá: sería una falta de cumplimiento
 y se corrige.
+
+## `nvapi.dll` y `d3dcompiler_47.dll`
+
+El `nvapi.dll` que acompaña al `d3d11.dll` sale **de esta misma fuente**: se compila con el
+proyecto `NVAPI` del árbol de 3Dmigoto (GPLv3, sin modificaciones nuestras) y enlaza las
+librerías `nvapi.lib` / `nvapi64.lib` de NVIDIA, que se publican bajo licencia **MIT**. El texto
+de esa licencia, copiado textual de `ThirdPartyLibs/nvapi-lib/nvapi-main/License.txt` del árbol de
+3Dmigoto, está en [`LICENSE.NVAPI.txt`](LICENSE.NVAPI.txt). Para compilarlo, mismo comando que el
+`d3d11.dll` pero con `/t:NVAPI`.
+
+El `d3dcompiler_47.dll` **no es nuestro ni de 3Dmigoto**: es de Microsoft, redistribuible del
+Windows SDK (`Redist\D3D\x86` o `x64`). No está cubierto por la GPL y no se publica acá.
 
 ## Licencia
 
