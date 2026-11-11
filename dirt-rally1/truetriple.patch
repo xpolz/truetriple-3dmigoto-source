@@ -3592,7 +3592,7 @@ index 33c26e1..b8350ca 100644
  	UINT64 mCurrentHullShader;
  	UINT64 mCurrentDomainShader;
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..ba4ea5d 100644
+index 2c88983..1dc80fd 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
 @@ -19,12 +19,19 @@
@@ -3619,7 +3619,48 @@ index 2c88983..ba4ea5d 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -945,13 +952,19 @@ static std::vector<std::wstring> GetIniStringMultipleKeys(const wchar_t *section
+@@ -846,6 +853,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
+ 	return _GetIniSection(&ini_sections, key_vals, section);
+ }
+ 
++// TrueTriple (11/11/2026): si lo cargado hasta ahora (d3dx.ini y sus include,
++// sin d3dx_user.ini) no declara ninguna variable `global persist` en
++// [Constants], d3dx_user.ini no tiene nada que cargar ni que valga guardar:
++// leerlo solo serviria para tomar sus lineas por "desconocidas", marcarlo
++// sucio y dejarlo vacio al salir (lo que pasaba en reposo con el ini inerte).
++// Es la segunda defensa: tambien con sesion, si el d3dx.ini que quedo no es
++// el de TrueTriple o quedo a medias, el archivo del usuario no se toca.
++static bool TTConstantsDeclaraPersist()
++{
++	IniSectionVector *section = NULL;
++	IniSectionVector::iterator entry;
++	wstring name;
++	const wchar_t *name_pos;
++	VariableFlags flags;
++
++	GetIniSection(&section, L"Constants");
++	for (entry = section->begin(); entry < section->end(); entry++) {
++		// Como en ParseConstantsSection: el nombre va en la clave si la
++		// linea tiene asignacion, si no en la linea entera.
++		if (!entry->first.empty())
++			name = entry->first;
++		else
++			name = entry->raw_line;
++		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
++		flags = parse_enum_option_string_prefix<const wchar_t *, VariableFlags>
++			(VariableFlagNames, name.c_str(), &name_pos);
++		if (!(flags & VariableFlags::GLOBAL))
++			continue;
++		if (flags & VariableFlags::PERSIST)
++			return true;
++	}
++	return false;
++}
++
+ // This emulates the behaviour of the old GetPrivateProfileString API to
+ // facilitate switching to our own ini parser. Later we might consider changing
+ // the return values (e.g. return found/not found instead of string length),
+@@ -945,13 +986,19 @@ static std::vector<std::wstring> GetIniStringMultipleKeys(const wchar_t *section
  
  // Helper functions to parse common types and log their values. TODO: Convert
  // more of this file to use these where appropriate
@@ -3640,7 +3681,7 @@ index 2c88983..ba4ea5d 100644
  
  	return rc;
  }
-@@ -961,7 +974,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+@@ -961,7 +1008,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
  	bool rc = GetIniString(section, key, def, ret);
  
  	if (rc)
@@ -3649,7 +3690,7 @@ index 2c88983..ba4ea5d 100644
  
  	return rc;
  }
-@@ -983,7 +996,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
+@@ -983,7 +1030,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
  		} else {
  			if (found)
  				*found = true;
@@ -3658,7 +3699,7 @@ index 2c88983..ba4ea5d 100644
  		}
  	}
  
-@@ -1008,7 +1021,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
+@@ -1008,7 +1055,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
  		} else {
  			if (found)
  				*found = true;
@@ -3667,7 +3708,7 @@ index 2c88983..ba4ea5d 100644
  		}
  	}
  
-@@ -1025,13 +1038,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
+@@ -1025,13 +1072,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
  
  	if (GetIniString(section, key, 0, val, 32)) {
  		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
@@ -3683,7 +3724,7 @@ index 2c88983..ba4ea5d 100644
  			if (found)
  				*found = true;
  			return false;
-@@ -1060,7 +1073,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
+@@ -1060,7 +1107,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
  		} else {
  			if (found)
  				*found = true;
@@ -3692,7 +3733,7 @@ index 2c88983..ba4ea5d 100644
  		}
  	}
  
-@@ -1083,7 +1096,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
+@@ -1083,7 +1130,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
  		} else {
  			if (found)
  				*found = true;
@@ -3701,7 +3742,7 @@ index 2c88983..ba4ea5d 100644
  		}
  	}
  
-@@ -1127,7 +1140,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
+@@ -1127,7 +1174,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
  			ret = ParseEnum(val, prefix, names, names_len, first);
  			if (found)
  				*found = true;
@@ -3710,7 +3751,7 @@ index 2c88983..ba4ea5d 100644
  		} catch (EnumParseError) {
  			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
  		}
-@@ -1155,7 +1168,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+@@ -1155,7 +1202,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
  		if (tmp_found) {
  			if (found)
  				*found = tmp_found;
@@ -3719,7 +3760,7 @@ index 2c88983..ba4ea5d 100644
  		} else {
  			IniWarning("WARNING: Unknown %S=%S\n", key, val);
  		}
-@@ -1188,7 +1201,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+@@ -1188,7 +1235,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
  		if (tmp_found) {
  			if (found)
  				*found = tmp_found;
@@ -3728,7 +3769,7 @@ index 2c88983..ba4ea5d 100644
  		} else {
  			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
  		}
-@@ -1276,6 +1289,14 @@ static void ParseIncludedIniFiles()
+@@ -1276,6 +1323,14 @@ static void ParseIncludedIniFiles()
  	// ini_sections data structure:
  	GetUserConfigPath(migoto_path);
  
@@ -3743,7 +3784,7 @@ index 2c88983..ba4ea5d 100644
  	// Do this before removing [Include] from ini_sections. TODO: Allow
  	// recursively included files to modify the exclude mid-recursion:
  	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
-@@ -1296,7 +1317,7 @@ static void ParseIncludedIniFiles()
+@@ -1296,7 +1351,7 @@ static void ParseIncludedIniFiles()
  
  		for (i = include_sections.begin(); i != include_sections.end(); i++) {
  			section_id = i->first.c_str();
@@ -3752,7 +3793,7 @@ index 2c88983..ba4ea5d 100644
  
  			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
  
-@@ -1304,7 +1325,7 @@ static void ParseIncludedIniFiles()
+@@ -1304,7 +1359,7 @@ static void ParseIncludedIniFiles()
  			for (entry = section->begin(); entry < section->end(); entry++) {
  				key = &entry->first;
  				val = &entry->second;
@@ -3761,8 +3802,18 @@ index 2c88983..ba4ea5d 100644
  
  				rel_path = namespace_path + *val;
  
-@@ -1336,7 +1357,7 @@ static void ParseIncludedIniFiles()
+@@ -1334,9 +1389,17 @@ static void ParseIncludedIniFiles()
  
+ 	free_globbing_vector(exclude);
+ 
++	// TrueTriple: sin ninguna variable `persist` declarada, d3dx_user.ini no
++	// se lee ni se guarda (ver TTConstantsDeclaraPersist). Sin ruta, nada lo
++	// puede guardar ni borrar, igual que en reposo.
++	if (!G->user_config.empty() && !TTConstantsDeclaraPersist()) {
++		LogInfo("TrueTriple: el ini no declara variables persist, %S no se lee ni se guarda\n", G->user_config.c_str());
++		G->user_config.clear();
++	}
++
  	// User config is loaded very last to allow it to override all other
  	// ini files.
 -	attrib = GetFileAttributes(G->user_config.c_str());
@@ -3770,7 +3821,7 @@ index 2c88983..ba4ea5d 100644
  	if (attrib != INVALID_FILE_ATTRIBUTES)
  		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
  }
-@@ -1345,7 +1366,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1408,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -3779,7 +3830,7 @@ index 2c88983..ba4ea5d 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1356,7 +1377,7 @@ static void RegisterPresetKeyBindings()
+@@ -1356,7 +1419,7 @@ static void RegisterPresetKeyBindings()
  	for (i = lower; i != upper; i++) {
  		const wchar_t *id = i->first.c_str();
  
@@ -3788,7 +3839,7 @@ index 2c88983..ba4ea5d 100644
  
  		keys = GetIniStringMultipleKeys(id, L"Key");
  		back = GetIniStringMultipleKeys(id, L"Back");
-@@ -1370,12 +1391,36 @@ static void RegisterPresetKeyBindings()
+@@ -1370,12 +1433,36 @@ static void RegisterPresetKeyBindings()
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
  
@@ -3826,7 +3877,7 @@ index 2c88983..ba4ea5d 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1428,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1470,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -3835,7 +3886,7 @@ index 2c88983..ba4ea5d 100644
  	}
  }
  
-@@ -1418,7 +1463,7 @@ static void ParsePresetOverrideSections()
+@@ -1418,7 +1505,7 @@ static void ParsePresetOverrideSections()
  		const wchar_t *id = i->first.c_str();
  		preset = &i->second;
  
@@ -3844,7 +3895,7 @@ index 2c88983..ba4ea5d 100644
  
  		// Read parameters from ini
  		preset->ParseIniSection(id);
-@@ -1959,7 +2004,7 @@ static void ParseCommandList(const wchar_t *id,
+@@ -1959,7 +2046,7 @@ static void ParseCommandList(const wchar_t *id,
  		}
  
  		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
@@ -3853,7 +3904,7 @@ index 2c88983..ba4ea5d 100644
  			continue;
  		}
  
-@@ -2266,7 +2311,7 @@ static void ParseShaderOverrideSections()
+@@ -2266,7 +2353,7 @@ static void ParseShaderOverrideSections()
  	for (i = lower; i != upper; i++) {
  		id = i->first.c_str();
  
@@ -3862,7 +3913,7 @@ index 2c88983..ba4ea5d 100644
  
  		hash = GetIniHash(id, L"Hash", 0, &found);
  		if (!found) {
-@@ -2561,7 +2606,7 @@ static void ParseShaderRegexSections()
+@@ -2561,7 +2648,7 @@ static void ParseShaderRegexSections()
  	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
  	for (i = lower; i != upper; i++) {
  		section_id = &i->first;
@@ -3871,7 +3922,7 @@ index 2c88983..ba4ea5d 100644
  
  		hash = hash_ini_section(hash, section_id);
  
-@@ -3124,7 +3169,7 @@ static void ParseTextureOverrideSections()
+@@ -3124,7 +3211,7 @@ static void ParseTextureOverrideSections()
  	for (i = lower; i != upper; i++) {
  		id = i->first.c_str();
  
@@ -3880,7 +3931,7 @@ index 2c88983..ba4ea5d 100644
  
  		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
  		if (!found) {
-@@ -4092,7 +4137,21 @@ void LoadConfigFile()
+@@ -4092,7 +4179,21 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -3903,7 +3954,7 @@ index 2c88983..ba4ea5d 100644
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4478,6 +4537,14 @@ void SavePersistentSettings()
+@@ -4478,6 +4579,21 @@ void SavePersistentSettings()
  {
  	FILE *f;
  
@@ -3914,11 +3965,18 @@ index 2c88983..ba4ea5d 100644
 +		G->user_config_dirty = 0;
 +		return;
 +	}
++	// TrueTriple: y con sesion, si el ini cargado no declara ninguna
++	// variable `persist` no hay nada que guardar: escribir dejaria el archivo
++	// del usuario con la cabecera y [Constants] solos.
++	if (persistent_variables.empty()) {
++		G->user_config_dirty = 0;
++		return;
++	}
 +
  	if (!G->user_config_dirty)
  		return;
  	G->user_config_dirty = 0;
-@@ -4513,6 +4580,9 @@ static void WipeUserConfig()
+@@ -4513,6 +4629,9 @@ static void WipeUserConfig()
  	G->gWipeUserConfig = false;
  	G->user_config_dirty = 0;
  

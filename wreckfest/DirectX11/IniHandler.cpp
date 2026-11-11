@@ -855,6 +855,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
 	return _GetIniSection(&ini_sections, key_vals, section);
 }
 
+// TrueTriple (11/11/2026): si lo cargado hasta ahora (d3dx.ini y sus include,
+// sin d3dx_user.ini) no declara ninguna variable `global persist` en
+// [Constants], d3dx_user.ini no tiene nada que cargar ni que valga guardar:
+// leerlo solo serviria para tomar sus lineas por "desconocidas", marcarlo
+// sucio y dejarlo vacio al salir (lo que pasaba en reposo con el ini inerte).
+// Es la segunda defensa: tambien con sesion, si el d3dx.ini que quedo no es
+// el de TrueTriple o quedo a medias, el archivo del usuario no se toca.
+static bool TTConstantsDeclaraPersist()
+{
+	IniSectionVector *section = NULL;
+	IniSectionVector::iterator entry;
+	wstring name;
+	const wchar_t *name_pos;
+	VariableFlags flags;
+
+	GetIniSection(&section, L"Constants");
+	for (entry = section->begin(); entry < section->end(); entry++) {
+		// Como en ParseConstantsSection: el nombre va en la clave si la
+		// linea tiene asignacion, si no en la linea entera.
+		if (!entry->first.empty())
+			name = entry->first;
+		else
+			name = entry->raw_line;
+		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+		flags = parse_enum_option_string_prefix<const wchar_t *, VariableFlags>
+			(VariableFlagNames, name.c_str(), &name_pos);
+		if (!(flags & VariableFlags::GLOBAL))
+			continue;
+		if (flags & VariableFlags::PERSIST)
+			return true;
+	}
+	return false;
+}
+
 // This emulates the behaviour of the old GetPrivateProfileString API to
 // facilitate switching to our own ini parser. Later we might consider changing
 // the return values (e.g. return found/not found instead of string length),
@@ -1350,6 +1384,14 @@ static void ParseIncludedIniFiles()
 	} while (!include_sections.empty());
 
 	free_globbing_vector(exclude);
+
+	// TrueTriple: sin ninguna variable `persist` declarada, d3dx_user.ini no
+	// se lee ni se guarda (ver TTConstantsDeclaraPersist). Sin ruta, nada lo
+	// puede guardar ni borrar, igual que en reposo.
+	if (!G->user_config.empty() && !TTConstantsDeclaraPersist()) {
+		LogInfo("TrueTriple: el ini no declara variables persist, %S no se lee ni se guarda\n", G->user_config.c_str());
+		G->user_config.clear();
+	}
 
 	// User config is loaded very last to allow it to override all other
 	// ini files.
@@ -4536,6 +4578,13 @@ void SavePersistentSettings()
 	// se escribe d3dx_user.ini, este o no "sucio": el archivo es del usuario
 	// y el ini inerte no declara sus variables, asi que lo dejaria vacio.
 	if (!truetriple::SesionUsaUserConfig(tt_sesion) || G->user_config.empty()) {
+		G->user_config_dirty = 0;
+		return;
+	}
+	// TrueTriple: y con sesion, si el ini cargado no declara ninguna
+	// variable `persist` no hay nada que guardar: escribir dejaria el archivo
+	// del usuario con la cabecera y [Constants] solos.
+	if (persistent_variables.empty()) {
 		G->user_config_dirty = 0;
 		return;
 	}

@@ -1108,7 +1108,7 @@ index 8bb968a..88376de 100644
 +extern "C" LPVOID lpvtbl_GetDisplayModeList1(IDXGIOutput1* pOutput1);
 +
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..9113a25 100644
+index 2c88983..102c159 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
 @@ -19,12 +19,21 @@
@@ -1137,7 +1137,48 @@ index 2c88983..9113a25 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -1276,6 +1285,14 @@ static void ParseIncludedIniFiles()
+@@ -846,6 +855,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
+ 	return _GetIniSection(&ini_sections, key_vals, section);
+ }
+ 
++// TrueTriple (11/11/2026): si lo cargado hasta ahora (d3dx.ini y sus include,
++// sin d3dx_user.ini) no declara ninguna variable `global persist` en
++// [Constants], d3dx_user.ini no tiene nada que cargar ni que valga guardar:
++// leerlo solo serviria para tomar sus lineas por "desconocidas", marcarlo
++// sucio y dejarlo vacio al salir (lo que pasaba en reposo con el ini inerte).
++// Es la segunda defensa: tambien con sesion, si el d3dx.ini que quedo no es
++// el de TrueTriple o quedo a medias, el archivo del usuario no se toca.
++static bool TTConstantsDeclaraPersist()
++{
++	IniSectionVector *section = NULL;
++	IniSectionVector::iterator entry;
++	wstring name;
++	const wchar_t *name_pos;
++	VariableFlags flags;
++
++	GetIniSection(&section, L"Constants");
++	for (entry = section->begin(); entry < section->end(); entry++) {
++		// Como en ParseConstantsSection: el nombre va en la clave si la
++		// linea tiene asignacion, si no en la linea entera.
++		if (!entry->first.empty())
++			name = entry->first;
++		else
++			name = entry->raw_line;
++		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
++		flags = parse_enum_option_string_prefix<const wchar_t *, VariableFlags>
++			(VariableFlagNames, name.c_str(), &name_pos);
++		if (!(flags & VariableFlags::GLOBAL))
++			continue;
++		if (flags & VariableFlags::PERSIST)
++			return true;
++	}
++	return false;
++}
++
+ // This emulates the behaviour of the old GetPrivateProfileString API to
+ // facilitate switching to our own ini parser. Later we might consider changing
+ // the return values (e.g. return found/not found instead of string length),
+@@ -1276,6 +1319,14 @@ static void ParseIncludedIniFiles()
  	// ini_sections data structure:
  	GetUserConfigPath(migoto_path);
  
@@ -1152,8 +1193,18 @@ index 2c88983..9113a25 100644
  	// Do this before removing [Include] from ini_sections. TODO: Allow
  	// recursively included files to modify the exclude mid-recursion:
  	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
-@@ -1336,7 +1353,7 @@ static void ParseIncludedIniFiles()
+@@ -1334,9 +1385,17 @@ static void ParseIncludedIniFiles()
  
+ 	free_globbing_vector(exclude);
+ 
++	// TrueTriple: sin ninguna variable `persist` declarada, d3dx_user.ini no
++	// se lee ni se guarda (ver TTConstantsDeclaraPersist). Sin ruta, nada lo
++	// puede guardar ni borrar, igual que en reposo.
++	if (!G->user_config.empty() && !TTConstantsDeclaraPersist()) {
++		LogInfo("TrueTriple: el ini no declara variables persist, %S no se lee ni se guarda\n", G->user_config.c_str());
++		G->user_config.clear();
++	}
++
  	// User config is loaded very last to allow it to override all other
  	// ini files.
 -	attrib = GetFileAttributes(G->user_config.c_str());
@@ -1161,7 +1212,7 @@ index 2c88983..9113a25 100644
  	if (attrib != INVALID_FILE_ATTRIBUTES)
  		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
  }
-@@ -1345,7 +1362,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1404,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -1170,7 +1221,7 @@ index 2c88983..9113a25 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1369,13 +1386,20 @@ static void RegisterPresetKeyBindings()
+@@ -1369,13 +1428,20 @@ static void RegisterPresetKeyBindings()
  
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
@@ -1192,7 +1243,7 @@ index 2c88983..9113a25 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1407,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1449,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -1201,7 +1252,7 @@ index 2c88983..9113a25 100644
  	}
  }
  
-@@ -4092,7 +4116,22 @@ void LoadConfigFile()
+@@ -4092,7 +4158,22 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -1225,7 +1276,7 @@ index 2c88983..9113a25 100644
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4162,6 +4201,21 @@ void LoadConfigFile()
+@@ -4162,6 +4243,21 @@ void LoadConfigFile()
  	G->SCREEN_WIDTH = GetIniInt(L"Device", L"width", -1, NULL);
  	G->SCREEN_HEIGHT = GetIniInt(L"Device", L"height", -1, NULL);
  	G->SCREEN_REFRESH = GetIniInt(L"Device", L"refresh_rate", -1, NULL);
@@ -1247,7 +1298,7 @@ index 2c88983..9113a25 100644
  	G->SCREEN_UPSCALING = GetIniInt(L"Device", L"upscaling", 0, NULL);
  	G->UPSCALE_MODE = GetIniInt(L"Device", L"upscale_mode", 0, NULL);
  
-@@ -4478,6 +4532,14 @@ void SavePersistentSettings()
+@@ -4478,6 +4574,21 @@ void SavePersistentSettings()
  {
  	FILE *f;
  
@@ -1258,11 +1309,18 @@ index 2c88983..9113a25 100644
 +		G->user_config_dirty = 0;
 +		return;
 +	}
++	// TrueTriple: y con sesion, si el ini cargado no declara ninguna
++	// variable `persist` no hay nada que guardar: escribir dejaria el archivo
++	// del usuario con la cabecera y [Constants] solos.
++	if (persistent_variables.empty()) {
++		G->user_config_dirty = 0;
++		return;
++	}
 +
  	if (!G->user_config_dirty)
  		return;
  	G->user_config_dirty = 0;
-@@ -4513,6 +4575,9 @@ static void WipeUserConfig()
+@@ -4513,6 +4624,9 @@ static void WipeUserConfig()
  	G->gWipeUserConfig = false;
  	G->user_config_dirty = 0;
  
