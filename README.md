@@ -13,9 +13,9 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.8.9 (dll del 10/11/2026, con la marca de sesión) | `486d34f70bbe0adc3686953796a50a05ad12a5b2cabb93762eb69e4a6de0f9cb` | etiqueta `dr2-dll-d07fc901` (commit `1284106`) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.1 (dll del 10/11/2026, sin el diagnóstico de la niebla) | `f7c969bce5782fab8887cd8988fb167aeba0539f5a35a548e496236214c4239b` | etiqueta `dr1-dll-f7c969bc` (anteriores en la tabla de abajo |
-| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.1 (dll del 10/11/2026, con la marca de sesión) | `0a9871025b2f29dda8ca97ee25430305a8ce6635e0adcef16b21edfd5e621fd4` | etiqueta `wreckfest-dll-0a987102` |
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.1 (dll del 11/11/2026: en reposo no lee ni guarda `d3dx_user.ini`) | `854516be2af3c54187dd59189c177e320a8d7a00fde6a22c3f1141ee736d7b02` | etiqueta `dr2-dll-854516be` (anteriores en la tabla de abajo) |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.2 (dll del 11/11/2026: en reposo no lee ni guarda `d3dx_user.ini`) | `3b15cb3ee089a59c47c4f061958b0a4f62f79da1f07399158bd6ac48e60dc725` | etiqueta `dr1-dll-3b15cb3e` (anteriores en la tabla de abajo) |
+| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.2 (dll del 11/11/2026: en reposo no lee ni guarda `d3dx_user.ini`) | `63b42a12ea61c0290e92fdf8cef02ae42a7a227a96e218c07bf58f66a470fa6d` | etiqueta `wreckfest-dll-63b42a12` |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
@@ -23,7 +23,8 @@ hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `486d34f7…f9cb` | paquete del launcher 1.8.9 (10/11/2026) en adelante: marca de sesión (`TrueTripleMarca.h`); `nvapi64.dll` `dc4b96a8…5f46` | etiqueta `dr2-dll-486d34f7` |
+| `854516be…7b02` | paquete del launcher 1.9.1 (11/11/2026) en adelante: en reposo no lee ni guarda `d3dx_user.ini` (antes lo vaciaba al salir y borraba los presets de asiento); `nvapi64.dll` `e7ddc8e1…9321` | etiqueta `dr2-dll-854516be` |
+| `486d34f7…f9cb` | paquetes del launcher 1.8.9 a 1.9.0 (10/11/2026): marca de sesión (`TrueTripleMarca.h`); `nvapi64.dll` `dc4b96a8…5f46` | etiqueta `dr2-dll-486d34f7` |
 | `d07fc901…9421` | app 1.7.2 (instaladores del 8/10 y 24/10/2026) y paquetes del launcher 1.8.2 a 1.8.8 | etiqueta `dr2-dll-d07fc901` |
 | `69d760b0…5017` | paquetes del launcher 1.8.0 y 1.8.1 (retirados el 8/11/2026) | etiqueta `dr2-dll-69d760b0` |
 | anteriores a 1.7.0 | instaladores 1.5.x y 1.6.x | pendiente de ubicar (se agregan acá a medida que se encuentran) |
@@ -32,7 +33,8 @@ Todas las dll de DiRT Rally (DR1, x86) entregadas hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `f7c969bc…239b` | paquete del launcher 1.7.1 (10/11/2026) en adelante: fuera el diagnóstico de la niebla retirada; `nvapi.dll` `18bd4d54…af32` | etiqueta `dr1-dll-f7c969bc` |
+| `3b15cb3e…c725` | paquete del launcher 1.7.2 (11/11/2026) en adelante: en reposo no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `9f437cf7…9766` | etiqueta `dr1-dll-3b15cb3e` |
+| `f7c969bc…239b` | paquete del launcher 1.7.1 (10/11/2026): fuera el diagnóstico de la niebla retirada; `nvapi.dll` `18bd4d54…af32` | etiqueta `dr1-dll-f7c969bc` |
 | `b1d6e9aa…a0da` | paquetes del launcher 1.6.2 a 1.7.0 (10/11/2026): marca de sesión (`TrueTripleMarca.h`); `nvapi.dll` `75bedde1…5c9e` | etiqueta `dr1-dll-b1d6e9aa` |
 | `ee23d9df…52c70` | paquete del launcher 1.6.1 (10/11/2026); `nvapi.dll` `35727ae4…bc6fb` | etiqueta `dr1-dll-ee23d9df` |
 | `f876672f…ddb9f` | app suelta 1.5.3 (5/9/2026) y paquete del launcher 1.6.0 | etiqueta `dr1-dll-f876672f` |

@@ -70,6 +70,20 @@ static const char kIniReposo[] =
 	"[Hunting]\n"
 	"hunting=0\n";
 
+// La configuracion del usuario (d3dx_user.ini, las variables `persist`)
+// segun la decision de la marca (11/11/2026). `sesion` es lo que guarda
+// IniHandler.cpp: -1 = todavia no se decidio, 0 = reposo, 1 = sesion. Solo
+// con sesion se lee, se guarda o se borra d3dx_user.ini. Por que: en reposo
+// el ini inerte no declara ninguna variable, asi que 3Dmigoto tomaba las
+// lineas del archivo por "entradas desconocidas", lo marcaba para reescribir
+// (user_config_dirty |= 2) y al salir (DestroyDLL -> SavePersistentSettings)
+// lo dejaba con la cabecera y [Constants] solos: se perdian el asiento y los
+// presets del usuario.
+inline bool SesionUsaUserConfig(int sesion)
+{
+	return sesion == 1;
+}
+
 // El entero de `"clave": 123` en `texto` (terminado en NUL). `false` si la
 // clave no esta, si su valor no empieza con un digito (string, negativo,
 // null) o si no entra en un long long.

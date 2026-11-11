@@ -1108,14 +1108,21 @@ index 8bb968a..88376de 100644
 +extern "C" LPVOID lpvtbl_GetDisplayModeList1(IDXGIOutput1* pOutput1);
 +
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..f29b74d 100644
+index 2c88983..9113a25 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
-@@ -19,12 +19,14 @@
+@@ -19,12 +19,21 @@
  #include "cursor.h"
  
  #include "shellscalingapi.h"
 +#include "TrueTripleMarca.h"
++
++// TrueTriple: la decision de la marca de sesion, tomada UNA vez por proceso en
++// LoadConfigFile (-1 = todavia no, 0 = reposo, 1 = sesion). Vive aca arriba
++// porque tambien la miran ParseIncludedIniFiles, SavePersistentSettings y
++// WipeUserConfig: en reposo d3dx_user.ini no se lee, no se guarda y no se
++// borra (truetriple::SesionUsaUserConfig, 11/11/2026).
++static int tt_sesion = -1;
  
  #include <filesystem>
 -// TODO: We probably don't need this <filesystem> header
@@ -1130,7 +1137,31 @@ index 2c88983..f29b74d 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -1345,7 +1347,7 @@ static void RegisterPresetKeyBindings()
+@@ -1276,6 +1285,14 @@ static void ParseIncludedIniFiles()
+ 	// ini_sections data structure:
+ 	GetUserConfigPath(migoto_path);
+ 
++	// TrueTriple: en reposo no se toca la configuracion del usuario. Sin ruta,
++	// sus lineas no se leen (y no pasan por "entradas desconocidas", que la
++	// marcaban para reescribir) y nada la puede guardar ni borrar.
++	if (!truetriple::SesionUsaUserConfig(tt_sesion)) {
++		LogInfo("TrueTriple: en reposo, %S no se lee ni se guarda\n", G->user_config.c_str());
++		G->user_config.clear();
++	}
++
+ 	// Do this before removing [Include] from ini_sections. TODO: Allow
+ 	// recursively included files to modify the exclude mid-recursion:
+ 	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
+@@ -1336,7 +1353,7 @@ static void ParseIncludedIniFiles()
+ 
+ 	// User config is loaded very last to allow it to override all other
+ 	// ini files.
+-	attrib = GetFileAttributes(G->user_config.c_str());
++	attrib = G->user_config.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributes(G->user_config.c_str());
+ 	if (attrib != INVALID_FILE_ATTRIBUTES)
+ 		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
+ }
+@@ -1345,7 +1362,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -1139,7 +1170,7 @@ index 2c88983..f29b74d 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1369,13 +1371,20 @@ static void RegisterPresetKeyBindings()
+@@ -1369,13 +1386,20 @@ static void RegisterPresetKeyBindings()
  
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
@@ -1161,7 +1192,7 @@ index 2c88983..f29b74d 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1392,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1407,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -1170,7 +1201,7 @@ index 2c88983..f29b74d 100644
  	}
  }
  
-@@ -4092,7 +4101,23 @@ void LoadConfigFile()
+@@ -4092,7 +4116,22 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -1182,7 +1213,6 @@ index 2c88983..f29b74d 100644
 +	// recarga (ReloadConfig vuelve a pasar por aca). El texto del LogInfo lo
 +	// busca el plugin en el binario (en_launcher::MARCA_DEL_LECTOR) para saber
 +	// si este dll ya lee la marca: no cambiarlo sin cambiar los dos.
-+	static int tt_sesion = -1;
 +	if (tt_sesion < 0)
 +		tt_sesion = truetriple::MarcaDeSesionValida(L"wreckfest", time(NULL)) ? 1 : 0;
 +	if (tt_sesion) {
@@ -1195,7 +1225,7 @@ index 2c88983..f29b74d 100644
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4162,6 +4187,21 @@ void LoadConfigFile()
+@@ -4162,6 +4201,21 @@ void LoadConfigFile()
  	G->SCREEN_WIDTH = GetIniInt(L"Device", L"width", -1, NULL);
  	G->SCREEN_HEIGHT = GetIniInt(L"Device", L"height", -1, NULL);
  	G->SCREEN_REFRESH = GetIniInt(L"Device", L"refresh_rate", -1, NULL);
@@ -1216,6 +1246,31 @@ index 2c88983..f29b74d 100644
 +	}
  	G->SCREEN_UPSCALING = GetIniInt(L"Device", L"upscaling", 0, NULL);
  	G->UPSCALE_MODE = GetIniInt(L"Device", L"upscale_mode", 0, NULL);
+ 
+@@ -4478,6 +4532,14 @@ void SavePersistentSettings()
+ {
+ 	FILE *f;
+ 
++	// TrueTriple: en reposo (o si la configuracion nunca llego a cargarse) no
++	// se escribe d3dx_user.ini, este o no "sucio": el archivo es del usuario
++	// y el ini inerte no declara sus variables, asi que lo dejaria vacio.
++	if (!truetriple::SesionUsaUserConfig(tt_sesion) || G->user_config.empty()) {
++		G->user_config_dirty = 0;
++		return;
++	}
++
+ 	if (!G->user_config_dirty)
+ 		return;
+ 	G->user_config_dirty = 0;
+@@ -4513,6 +4575,9 @@ static void WipeUserConfig()
+ 	G->gWipeUserConfig = false;
+ 	G->user_config_dirty = 0;
+ 
++	// TrueTriple: en reposo tampoco se borra (ver SavePersistentSettings).
++	if (!truetriple::SesionUsaUserConfig(tt_sesion) || G->user_config.empty())
++		return;
+ 	DeleteFile(G->user_config.c_str());
+ }
  
 diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
 index 994124c..e6b529b 100644
@@ -1336,10 +1391,10 @@ index e261940..4fd6650 100644
 +void LogOverlayTrueTriple(int tipo, const char *fmt, ...);
 diff --git a/b/DirectX11/TrueTripleMarca.h b/DirectX11/TrueTripleMarca.h
 new file mode 100644
-index 0000000..89e13bf
+index 0000000..5a2e152
 --- /dev/null
 +++ b/DirectX11/TrueTripleMarca.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,190 @@
 +#pragma once
 +
 +// TrueTriple: la marca de sesion (10/11/2026).
@@ -1411,6 +1466,20 @@ index 0000000..89e13bf
 +	"override_directory=ShaderFixes\n"
 +	"[Hunting]\n"
 +	"hunting=0\n";
++
++// La configuracion del usuario (d3dx_user.ini, las variables `persist`)
++// segun la decision de la marca (11/11/2026). `sesion` es lo que guarda
++// IniHandler.cpp: -1 = todavia no se decidio, 0 = reposo, 1 = sesion. Solo
++// con sesion se lee, se guarda o se borra d3dx_user.ini. Por que: en reposo
++// el ini inerte no declara ninguna variable, asi que 3Dmigoto tomaba las
++// lineas del archivo por "entradas desconocidas", lo marcaba para reescribir
++// (user_config_dirty |= 2) y al salir (DestroyDLL -> SavePersistentSettings)
++// lo dejaba con la cabecera y [Constants] solos: se perdian el asiento y los
++// presets del usuario.
++inline bool SesionUsaUserConfig(int sesion)
++{
++	return sesion == 1;
++}
 +
 +// El entero de `"clave": 123` en `texto` (terminado en NUL). `false` si la
 +// clave no esta, si su valor no empieza con un digito (string, negativo,

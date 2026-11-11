@@ -21,6 +21,13 @@
 #include "shellscalingapi.h"
 #include "TrueTripleMarca.h"
 
+// TrueTriple: la decision de la marca de sesion, tomada UNA vez por proceso en
+// LoadConfigFile (-1 = todavia no, 0 = reposo, 1 = sesion). Vive aca arriba
+// porque tambien la miran ParseIncludedIniFiles, SavePersistentSettings y
+// WipeUserConfig: en reposo d3dx_user.ini no se lee, no se guarda y no se
+// borra (truetriple::SesionUsaUserConfig, 11/11/2026).
+static int tt_sesion = -1;
+
 #include <filesystem>
 // TrueTriple DR1: <experimental/filesystem> ya no existe en el toolset v145
 // (VS 2026). El namespace experimental no se usaba en este archivo, asi que
@@ -1282,6 +1289,14 @@ static void ParseIncludedIniFiles()
 	// ini_sections data structure:
 	GetUserConfigPath(migoto_path);
 
+	// TrueTriple: en reposo no se toca la configuracion del usuario. Sin ruta,
+	// sus lineas no se leen (y no pasan por "entradas desconocidas", que la
+	// marcaban para reescribir) y nada la puede guardar ni borrar.
+	if (!truetriple::SesionUsaUserConfig(tt_sesion)) {
+		LogInfo("TrueTriple: en reposo, %S no se lee ni se guarda\n", G->user_config.c_str());
+		G->user_config.clear();
+	}
+
 	// Do this before removing [Include] from ini_sections. TODO: Allow
 	// recursively included files to modify the exclude mid-recursion:
 	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
@@ -1342,7 +1357,7 @@ static void ParseIncludedIniFiles()
 
 	// User config is loaded very last to allow it to override all other
 	// ini files.
-	attrib = GetFileAttributes(G->user_config.c_str());
+	attrib = G->user_config.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributes(G->user_config.c_str());
 	if (attrib != INVALID_FILE_ATTRIBUTES)
 		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
 }
@@ -4128,7 +4143,6 @@ void LoadConfigFile()
 	// decision vale tambien para la recarga (ReloadConfig vuelve a pasar por
 	// aca), asi que una recarga no habilita el mod a mitad de partida ni lo
 	// apaga si la marca vence mientras se juega.
-	static int tt_sesion = -1;
 	if (tt_sesion < 0)
 		tt_sesion = truetriple::MarcaDeSesionValida(L"dr1", time(NULL)) ? 1 : 0;
 	if (tt_sesion) {
@@ -4523,6 +4537,14 @@ void SavePersistentSettings()
 {
 	FILE *f;
 
+	// TrueTriple: en reposo (o si la configuracion nunca llego a cargarse) no
+	// se escribe d3dx_user.ini, este o no "sucio": el archivo es del usuario
+	// y el ini inerte no declara sus variables, asi que lo dejaria vacio.
+	if (!truetriple::SesionUsaUserConfig(tt_sesion) || G->user_config.empty()) {
+		G->user_config_dirty = 0;
+		return;
+	}
+
 	if (!G->user_config_dirty)
 		return;
 	G->user_config_dirty = 0;
@@ -4558,6 +4580,9 @@ static void WipeUserConfig()
 	G->gWipeUserConfig = false;
 	G->user_config_dirty = 0;
 
+	// TrueTriple: en reposo tampoco se borra (ver SavePersistentSettings).
+	if (!truetriple::SesionUsaUserConfig(tt_sesion) || G->user_config.empty())
+		return;
 	DeleteFile(G->user_config.c_str());
 }
 
