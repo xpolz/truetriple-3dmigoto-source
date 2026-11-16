@@ -13,9 +13,9 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.2 (dll del 11/11/2026: también sin variables persist en el ini no lee ni guarda `d3dx_user.ini`) | `eb261ec8c1bcb68743f2df4c6450ebf0ce7dc7955dbc9e59bd66fffc6cefd145` | etiqueta `dr2-dll-eb261ec8` (anteriores en la tabla de abajo) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.3 (dll del 11/11/2026: también sin variables persist en el ini no lee ni guarda `d3dx_user.ini`) | `165accf81a11649216bb198e28660f69d71346d8609445c95b4d2155287166a7` | etiqueta `dr1-dll-165accf8` (anteriores en la tabla de abajo) |
-| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.3 (dll del 11/11/2026: también sin variables persist en el ini no lee ni guarda `d3dx_user.ini`) | `881ad15d477f19ded212216dfb08faa51cb32b1772e045557d199283efedc8b5` | etiqueta `wreckfest-dll-881ad15d` |
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.11 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `ed02623fc5e7b499b504603f58432c7181e6e2ac09b353b782e5150990dff951` | etiqueta `dr2-dll-ed02623f` (anteriores en la tabla de abajo) |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.11 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `1065e51aa92d3645bd27ec33d5f1442d244f62260f4268d863d1000b769def0b` | etiqueta `dr1-dll-1065e51a` (anteriores en la tabla de abajo) |
+| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.10 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `d74a6908d6a2abb06eae6f45db8bcc76115273971816baf848b10d2c5cb19bb4` | etiqueta `wreckfest-dll-d74a6908` (anteriores en [`wreckfest/README.md`](wreckfest/README.md)) |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
@@ -23,7 +23,8 @@ hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `eb261ec8…d145` | paquete del launcher 1.9.2 (11/11/2026) en adelante: con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi64.dll` `7d7eeefa…fe75` | etiqueta `dr2-dll-eb261ec8` |
+| `ed02623f…f951` | paquete del launcher 1.9.11 (16/11/2026) en adelante: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (`IniHandler.cpp`, `CommandList.cpp`, `Hunting.cpp` y, nuevos acá, `Override.cpp`, `input.cpp` y `ShaderRegex.cpp`); `nvapi64.dll` `d11b8848…5acf` | etiqueta `dr2-dll-ed02623f` |
+| `eb261ec8…d145` | paquetes del launcher 1.9.2 a 1.9.10 (11/11/2026): con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi64.dll` `7d7eeefa…fe75` | etiqueta `dr2-dll-eb261ec8` |
 | `854516be…7b02` | paquete del launcher 1.9.1 (11/11/2026): en reposo no lee ni guarda `d3dx_user.ini` (antes lo vaciaba al salir y borraba los presets de asiento); `nvapi64.dll` `e7ddc8e1…9321` | etiqueta `dr2-dll-854516be` |
 | `486d34f7…f9cb` | paquetes del launcher 1.8.9 a 1.9.0 (10/11/2026): marca de sesión (`TrueTripleMarca.h`); `nvapi64.dll` `dc4b96a8…5f46` | etiqueta `dr2-dll-486d34f7` |
 | `d07fc901…9421` | app 1.7.2 (instaladores del 8/10 y 24/10/2026) y paquetes del launcher 1.8.2 a 1.8.8 | etiqueta `dr2-dll-d07fc901` |
@@ -34,7 +35,8 @@ Todas las dll de DiRT Rally (DR1, x86) entregadas hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `165accf8…66a7` | paquete del launcher 1.7.3 (11/11/2026) en adelante: con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `ef4b3fd1…8b72` | etiqueta `dr1-dll-165accf8` |
+| `1065e51a…ef0b` | paquete del launcher 1.7.11 (16/11/2026) en adelante: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (lo que faltaba: `CommandList.cpp`, `Override.cpp`, `input.cpp`, `ShaderRegex.cpp` y el resto de `IniHandler.cpp`); `nvapi.dll` `3daebb8d…5490` | etiqueta `dr1-dll-1065e51a` |
+| `165accf8…66a7` | paquetes del launcher 1.7.3 a 1.7.10 (11/11/2026): con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `ef4b3fd1…8b72` | etiqueta `dr1-dll-165accf8` |
 | `3b15cb3e…c725` | paquete del launcher 1.7.2 (11/11/2026): en reposo no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `9f437cf7…9766` | etiqueta `dr1-dll-3b15cb3e` |
 | `f7c969bc…239b` | paquete del launcher 1.7.1 (10/11/2026): fuera el diagnóstico de la niebla retirada; `nvapi.dll` `18bd4d54…af32` | etiqueta `dr1-dll-f7c969bc` |
 | `b1d6e9aa…a0da` | paquetes del launcher 1.6.2 a 1.7.0 (10/11/2026): marca de sesión (`TrueTripleMarca.h`); `nvapi.dll` `75bedde1…5c9e` | etiqueta `dr1-dll-b1d6e9aa` |
@@ -57,6 +59,10 @@ Todo es un cambio sobre **[bo3b/3Dmigoto](https://github.com/bo3b/3Dmigoto) en e
 del árbol de 3Dmigoto no se modifica.
 
 ## Cómo compilar
+
+Desde las dll del 16/11/2026 se compila con la variable de entorno `LINK=/PDBALTPATH:%_PDB%`
+(link.exe la suma a sus opciones): la dll guarda solo el nombre del PDB y no la ruta de la PC
+donde se compiló. No cambia el código.
 
 Hace falta Windows con Visual Studio (toolset **v145**) y el SDK **10.0.22621.0**.
 
@@ -125,3 +131,12 @@ hace que el dll lea una vez por proceso `%LOCALAPPDATA%\TrueTriple\sesion-<juego
 app escribe al Jugar (vale 2 horas, se renueva cada 10 minutos, se borra al cerrar). Sin marca
 fresca el dll no carga el `d3dx.ini` de la carpeta y queda con el ini inerte embebido. Es parte
 de la fuente GPL publicada acá, como todo lo demás.
+
+## El log ya no repite el ini (16/11/2026)
+
+Desde las dll `ed02623f` (DR2), `1065e51a` (DR1) y `d74a6908` (Wreckfest), todo lo que repetía contenido
+del `d3dx.ini` en `d3d11_log.txt` (clave=valor, nombres de sección, teclas, variables, ciclos de
+los `[Key]`, cuerpos de ShaderRegex, líneas de command list, "Optimised out", "Statically
+evaluated", "Creating cached resource") pasó de `LogInfo` a `LogDebug`. Con `[Logging] calls=1`
+y `debug=0` el log conserva la versión, los avisos y los errores; con `debug=1` sale todo como en
+3Dmigoto original.

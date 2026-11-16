@@ -24,6 +24,12 @@
 
 #include <D3DCompiler.h>
 
+// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
+// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
+// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
+// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
+// igual que siempre. Avisos y errores no cambian.
+
 CustomResources customResources;
 CustomShaders customShaders;
 ExplicitCommandListSections explicitCommandListSections;
@@ -292,7 +298,7 @@ void optimise_command_lists(HackerDevice *device)
 		for (CommandList *command_list : registered_command_lists) {
 			for (i = 0; i < command_list->commands.size(); ) {
 				if (command_list->commands[i]->noop(command_list->post, ignore_cto_pre, ignore_cto_post)) {
-					LogInfo("Optimised out %s %S\n",
+					LogDebug("Optimised out %s %S\n",
 							command_list->post ? "post" : "pre",
 							command_list->commands[i]->ini_line.c_str());
 					command_list->commands.erase(command_list->commands.begin() + i);
@@ -5135,7 +5141,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	bool found = false;
 	FILETIME timestamp;
 
-	LogInfo("  %cs=%S\n", type, filename);
+	LogDebug("  %cs=%S\n", type, filename);
 
 	switch(type) {
 		case 'v':
@@ -6436,7 +6442,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
 	if (!static_evaluate(&val, device))
 		return false;
 
-	LogInfo("Statically evaluated %S as %f\n",
+	LogDebug("Statically evaluated %S as %f\n",
 		lookup_enum_name(ParamOverrideTypeNames, type), val);
 
 	type = ParamOverrideType::VALUE;
@@ -7107,9 +7113,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
 		return making_progress;
 
 	// FIXME: Pretty print rather than dumping syntax tree
-	LogInfoNoNL("Statically evaluated \"");
-	_log_token(dynamic_cast<CommandListToken*>(this));
-	LogInfo("\" as %f\n", static_val);
+	if (gLogDebug) {
+		LogInfoNoNL("Statically evaluated \"");
+		_log_token(dynamic_cast<CommandListToken*>(this));
+		LogInfo("\" as %f\n", static_val);
+	}
 	static_val_str = std::to_wstring(static_val);
 
 	operand = make_shared<CommandListOperand>(token_pos, static_val_str.c_str());
@@ -7510,17 +7518,19 @@ static ResourceType* GetResourceFromPool(
 			return resource;
 		}
 
-		LogInfo("Device mismatch, discarding %S from resource pool\n", ini_line->c_str());
+		LogInfo("Device mismatch, discarding cached resource from resource pool\n");
+		LogDebug("  %S\n", ini_line->c_str());
 		resource_pool->cache.erase(pool_i);
 		resource->Release();
 	}
 
-	LogInfo("Creating cached resource %S\n", ini_line->c_str());
+	LogDebug("Creating cached resource %S\n", ini_line->c_str());
 	Profiling::resources_created++;
 
 	hr = (state->mOrigDevice1->*CreateResource)(desc, NULL, &resource);
 	if (FAILED(hr)) {
-		LogInfo("Resource copy failed %S: 0x%x\n", ini_line->c_str(), hr);
+		LogInfo("Resource copy failed: 0x%x\n", hr);
+		LogDebug("  %S\n", ini_line->c_str());
 		LogResourceDesc(desc);
 		src_resource->GetDesc(&old_desc);
 		LogInfo("Original resource was:\n");
@@ -7825,7 +7835,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf, 
 
 	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
 	if (SUCCEEDED(hr)) {
-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
 		LogDebugResourceDesc(&desc);
 		resource = (ID3D11Resource*)buffer;
@@ -7852,7 +7862,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
 
 	hr = mOrigDevice1->CreateTexture1D(&desc, NULL, &tex1d);
 	if (SUCCEEDED(hr)) {
-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
 		LogDebugResourceDesc(&desc);
 		resource = (ID3D11Resource*)tex1d;
@@ -7878,7 +7888,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
 
 	hr = mOrigDevice1->CreateTexture2D(&desc, NULL, &tex2d);
 	if (SUCCEEDED(hr)) {
-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
 		LogDebugResourceDesc(&desc);
 		resource = (ID3D11Resource*)tex2d;
@@ -7904,7 +7914,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
 
 	hr = mOrigDevice1->CreateTexture3D(&desc, NULL, &tex3d);
 	if (SUCCEEDED(hr)) {
-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
 		LogDebugResourceDesc(&desc);
 		resource = (ID3D11Resource*)tex3d;
@@ -8367,7 +8377,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
 	// TODO: Option to discard individual resources instead of transfer
 	// TODO: Option to discard all custom resources and re-run [Constants]
 	//       on new device (for convoluted startup sequences)
-	LogInfo("Device mismatch, transferring [%S] to new device\n", name.c_str());
+	LogInfo("Device mismatch, transferring custom resource to new device\n");
+	LogDebug("  [%S]\n", name.c_str());
 	new_resource = inter_device_resource_transfer(
 			mOrigDevice1, mOrigContext1, resource, &name);
 

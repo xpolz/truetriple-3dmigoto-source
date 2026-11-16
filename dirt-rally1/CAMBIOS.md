@@ -41,3 +41,13 @@ Agrega `TrueTripleMarca.h` y el enganche en `IniHandler.cpp` (`LoadConfigFile`):
 fresca de la app en `%LOCALAPPDATA%\TrueTriple\sesion-dr1.json` el
 dll no carga el `d3dx.ini` y queda en reposo. SHA-256 de la dll: `b1d6e9aaab71630bd2b4c0e4f69396ba943e4f6181e6f73117ef0248a111a0da`. Etiqueta
 `dr1-dll-b1d6e9aa`. La anterior (`ee23d9df…`) sigue en su etiqueta.
+
+## dll `1065e51a` (16/11/2026): el log ya no repite el ini
+
+`IniHandler.cpp`, `CommandList.cpp` y, nuevos en esta carpeta, `Override.cpp`, `input.cpp` y
+`ShaderRegex.cpp`: todo lo que repetía contenido del `d3dx.ini` en `d3d11_log.txt` pasó de
+`LogInfo` a `LogDebug` (clave=valor, nombres de sección, teclas, variables, ciclos de los `[Key]`,
+cuerpos de ShaderRegex, líneas de command list, "Optimised out", "Statically evaluated",
+"Creating cached resource"). Con `debug=0` el log conserva versión, avisos y errores; con
+`debug=1` sale todo. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
+`1065e51aa92d3645bd27ec33d5f1442d244f62260f4268d863d1000b769def0b`; `nvapi.dll`: `3daebb8d871718421ad1f9900fddc9d1801f860b52c4ef40e101220a42c35490`. Etiqueta `dr1-dll-1065e51a`.

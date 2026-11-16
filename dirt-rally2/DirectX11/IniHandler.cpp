@@ -29,6 +29,13 @@
 static int tt_sesion = -1;
 
 #include <filesystem>
+
+// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
+// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
+// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
+// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
+// igual que siempre. Avisos y errores no cambian.
+
 // NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
 // The experimental namespace was unused here, so the include was dropped.
 
@@ -470,7 +477,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
 	}
 
 	if (!ret)
-		LogInfo("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
+		LogDebug("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
 
 	return !!ret;
 }
@@ -480,7 +487,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 	size_t first, last, delim;
 	wstring key, val;
 
-	LogInfo("      %S\n", wline->c_str());
+	LogDebug("      %S\n", wline->c_str());
 
 	// Key / Val pair
 	delim = wline->find(L"=");
@@ -497,7 +504,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 		}
 
 		if (!_wcsicmp(key.c_str(), L"namespace")) {
-			LogInfo("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
+			LogDebug("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
 			*ini_namespace = val;
 			return true;
 		}
@@ -991,7 +998,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 	int rc = GetIniString(section, key, def, ret, size);
 
 	if (rc)
-		LogInfo("  %S=%S\n", key, ret);
+		LogDebug("  %S=%S\n", key, ret);
 
 	return rc;
 }
@@ -1001,7 +1008,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
 	bool rc = GetIniString(section, key, def, ret);
 
 	if (rc)
-		LogInfo("  %S=%s\n", key, ret->c_str());
+		LogDebug("  %S=%s\n", key, ret->c_str());
 
 	return rc;
 }
@@ -1023,7 +1030,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
 		} else {
 			if (found)
 				*found = true;
-			LogInfo("  %S=%f\n", key, ret);
+			LogDebug("  %S=%f\n", key, ret);
 		}
 	}
 
@@ -1048,7 +1055,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found, 
 		} else {
 			if (found)
 				*found = true;
-			LogInfo("  %S=%d\n", key, ret);
+			LogDebug("  %S=%d\n", key, ret);
 		}
 	}
 
@@ -1065,13 +1072,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
 
 	if (GetIniString(section, key, 0, val, 32)) {
 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
-			LogInfo("  %S=1\n", key);
+			LogDebug("  %S=1\n", key);
 			if (found)
 				*found = true;
 			return true;
 		}
 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
-			LogInfo("  %S=0\n", key);
+			LogDebug("  %S=0\n", key);
 			if (found)
 				*found = true;
 			return false;
@@ -1100,7 +1107,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
 		} else {
 			if (found)
 				*found = true;
-			LogInfo("  %S=%016llx\n", key, ret);
+			LogDebug("  %S=%016llx\n", key, ret);
 		}
 	}
 
@@ -1123,7 +1130,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def, 
 		} else {
 			if (found)
 				*found = true;
-			LogInfo("  %S=%x\n", key, ret);
+			LogDebug("  %S=%x\n", key, ret);
 		}
 	}
 
@@ -1167,7 +1174,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool 
 			ret = ParseEnum(val, prefix, names, names_len, first);
 			if (found)
 				*found = true;
-			LogInfo("  %S=%S\n", key, val);
+			LogDebug("  %S=%S\n", key, val);
 		} catch (EnumParseError) {
 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
 		}
@@ -1195,7 +1202,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 		if (tmp_found) {
 			if (found)
 				*found = tmp_found;
-			LogInfo("  %S=%S\n", key, val);
+			LogDebug("  %S=%S\n", key, val);
 		} else {
 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
 		}
@@ -1228,7 +1235,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
 		if (tmp_found) {
 			if (found)
 				*found = tmp_found;
-			LogInfo("  %S=%s\n", key, val.c_str());
+			LogDebug("  %S=%s\n", key, val.c_str());
 		} else {
 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
 		}
@@ -1344,7 +1351,7 @@ static void ParseIncludedIniFiles()
 
 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
 			section_id = i->first.c_str();
-			LogInfo("[%S]\n", section_id);
+			LogDebug("[%S]\n", section_id);
 
 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
 
@@ -1352,7 +1359,7 @@ static void ParseIncludedIniFiles()
 			for (entry = section->begin(); entry < section->end(); entry++) {
 				key = &entry->first;
 				val = &entry->second;
-				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
+				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
 
 				rel_path = namespace_path + *val;
 
@@ -1412,7 +1419,7 @@ static void RegisterPresetKeyBindings()
 	for (i = lower; i != upper; i++) {
 		const wchar_t *id = i->first.c_str();
 
-		LogInfo("[%S]\n", id);
+		LogDebug("[%S]\n", id);
 
 		keys = GetIniStringMultipleKeys(id, L"Key");
 		back = GetIniStringMultipleKeys(id, L"Back");
@@ -1491,7 +1498,7 @@ static void ParsePresetOverrideSections()
 		const wchar_t *id = i->first.c_str();
 		preset = &i->second;
 
-		LogInfo("[%S]\n", id);
+		LogDebug("[%S]\n", id);
 
 		// Read parameters from ini
 		preset->ParseIniSection(id);
@@ -1829,7 +1836,7 @@ static void ParseResourceSections()
 	lower = ini_sections.lower_bound(wstring(L"Resource"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
 	for (i = lower; i != upper; i++) {
-		LogInfoW(L"[%s]\n", i->first.c_str());
+		LogDebugW(L"[%s]\n", i->first.c_str());
 
 		// Convert section name to lower case so our keys will be
 		// consistent in the unordered_map:
@@ -1876,7 +1883,7 @@ static void ParseResourceSections()
 			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
 				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
 			} else {
-				LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
+				LogDebug("  format=%s\n", TexFormatStr(custom_resource->override_format));
 			}
 		}
 
@@ -2032,7 +2039,7 @@ static void ParseCommandList(const wchar_t *id,
 		}
 
 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
-			LogInfo("  %S\n", raw_line->c_str());
+			LogDebug("  %S\n", raw_line->c_str());
 			continue;
 		}
 
@@ -2186,9 +2193,9 @@ static void ParseConstantsSection()
 			persistent_variables.emplace_back(&inserted.first->second);
 
 		if (val->empty())
-			LogInfo("  global %S\n", name.c_str());
+			LogDebug("  global %S\n", name.c_str());
 		else
-			LogInfo("  global %S=%f\n", name.c_str(), fval);
+			LogDebug("  global %S=%f\n", name.c_str(), fval);
 
 		// Remove this line from the ini section data structures so the
 		// command list won't consider it in the 2nd pass:
@@ -2339,7 +2346,7 @@ static void ParseShaderOverrideSections()
 	for (i = lower; i != upper; i++) {
 		id = i->first.c_str();
 
-		LogInfo("[%S]\n", id);
+		LogDebug("[%S]\n", id);
 
 		hash = GetIniHash(id, L"Hash", 0, &found);
 		if (!found) {
@@ -2484,7 +2491,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		pattern.append(aline);
 	}
 
@@ -2493,9 +2500,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 	// stripped, so that if there is a problem the user can see exactly
 	// what we used. This will look ugly, but will make errors like missing
 	// \n or \s+ easier to spot.
-	LogInfo("--------- final pcre2 regex pattern used after ini parsing ---------\n");
-	LogInfo("%s\n", pattern.c_str());
-	LogInfo("--------------------------------------------------------------------\n");
+	LogDebug("--------- final pcre2 regex pattern used after ini parsing ---------\n");
+	LogDebug("%s\n", pattern.c_str());
+	LogDebug("--------------------------------------------------------------------\n");
 
 	regex_pattern = &regex_group->patterns[*pattern_id];
 	if (!regex_pattern->compile(&pattern))
@@ -2529,7 +2536,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		regex_group->declarations.push_back(aline);
 	}
 
@@ -2559,16 +2566,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		regex_pattern->replace.append(aline);
 	}
 
 	// Similar to above we want to see the final substitution string after
 	// ini parsing, especially to help spot missing newlines. TODO: Add an
 	// option to automatically add newlines after every ini line.
-	LogInfo("--------- final pcre2 replace string used after ini parsing ---------\n");
-	LogInfo("%s\n", regex_pattern->replace.c_str());
-	LogInfo("---------------------------------------------------------------------\n");
+	LogDebug("--------- final pcre2 replace string used after ini parsing ---------\n");
+	LogDebug("%s\n", regex_pattern->replace.c_str());
+	LogDebug("---------------------------------------------------------------------\n");
 
 	regex_pattern->do_replace = true;
 	return true;
@@ -2634,7 +2641,7 @@ static void ParseShaderRegexSections()
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
 	for (i = lower; i != upper; i++) {
 		section_id = &i->first;
-		LogInfo("[%S]\n", section_id->c_str());
+		LogDebug("[%S]\n", section_id->c_str());
 
 		hash = hash_ini_section(hash, section_id);
 
@@ -2932,7 +2939,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
 		{
 			if (id[j] <= 0) break;
 			override->iterations.push_back(id[j]);
-			LogInfo("  Iteration=%d\n", id[j]);
+			LogDebug("  Iteration=%d\n", id[j]);
 		}
 	}
 
@@ -2998,7 +3005,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 	if (!setting.size() || !setting.compare(L"0")) {
 		*val = 0;
 		*mask = 0xffffffff;
-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 		return true;
 	}
 
@@ -3007,7 +3014,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 	if (ret != 0 && ret != EOF && (len1 == setting.length() || len2 == setting.length())) {
 		if (ret == 2)
 			*mask = 0xffffffff;
-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 		return true;
 	}
 
@@ -3049,7 +3056,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 
 	if (!use_mask)
 		*mask = 0xffffffff;
-	LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+	LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 
 	return true;
 }
@@ -3197,7 +3204,7 @@ static void ParseTextureOverrideSections()
 	for (i = lower; i != upper; i++) {
 		id = i->first.c_str();
 
-		LogInfo("[%S]\n", id);
+		LogDebug("[%S]\n", id);
 
 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
 		if (!found) {
@@ -3918,7 +3925,7 @@ static void ParseCustomShaderSections()
 
 		// FIXME: This will be logged in lower case. It would be better
 		// to use the original case, but not a big deal:
-		LogInfoW(L"[%s]\n", shader_id->c_str());
+		LogDebugW(L"[%s]\n", shader_id->c_str());
 
 		failed = false;
 
@@ -4016,7 +4023,7 @@ static void ParseExplicitCommandListSections()
 
 		// FIXME: This will be logged in lower case. It would be better
 		// to use the original case, but not a big deal:
-		LogInfoW(L"[%s]\n", section_id->c_str());
+		LogDebugW(L"[%s]\n", section_id->c_str());
 		ParseCommandList(section_id->c_str(), &command_list_section->command_list, &command_list_section->post_command_list, NULL);
 	}
 }

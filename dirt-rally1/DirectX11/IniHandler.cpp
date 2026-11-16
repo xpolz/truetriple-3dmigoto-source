@@ -29,6 +29,13 @@
 static int tt_sesion = -1;
 
 #include <filesystem>
+
+// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
+// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
+// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
+// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
+// igual que siempre. Avisos y errores no cambian.
+
 // TrueTriple DR1: <experimental/filesystem> ya no existe en el toolset v145
 // (VS 2026). El namespace experimental no se usaba en este archivo, asi que
 // se quita el include; <filesystem> ya estaba incluido arriba.
@@ -471,7 +478,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
 	}
 
 	if (!ret)
-		LogInfo("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
+		LogDebug("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
 
 	return !!ret;
 }
@@ -481,7 +488,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 	size_t first, last, delim;
 	wstring key, val;
 
-	LogInfo("      %S\n", wline->c_str());
+	LogDebug("      %S\n", wline->c_str());
 
 	// Key / Val pair
 	delim = wline->find(L"=");
@@ -498,7 +505,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 		}
 
 		if (!_wcsicmp(key.c_str(), L"namespace")) {
-			LogInfo("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
+			LogDebug("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
 			*ini_namespace = val;
 			return true;
 		}
@@ -1843,7 +1850,7 @@ static void ParseResourceSections()
 	lower = ini_sections.lower_bound(wstring(L"Resource"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
 	for (i = lower; i != upper; i++) {
-		LogInfoW(L"[%s]\n", i->first.c_str());
+		LogDebugW(L"[%s]\n", i->first.c_str());
 
 		// Convert section name to lower case so our keys will be
 		// consistent in the unordered_map:
@@ -1890,7 +1897,7 @@ static void ParseResourceSections()
 			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
 				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
 			} else {
-				LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
+				LogDebug("  format=%s\n", TexFormatStr(custom_resource->override_format));
 			}
 		}
 
@@ -2200,9 +2207,9 @@ static void ParseConstantsSection()
 			persistent_variables.emplace_back(&inserted.first->second);
 
 		if (val->empty())
-			LogInfo("  global %S\n", name.c_str());
+			LogDebug("  global %S\n", name.c_str());
 		else
-			LogInfo("  global %S=%f\n", name.c_str(), fval);
+			LogDebug("  global %S=%f\n", name.c_str(), fval);
 
 		// Remove this line from the ini section data structures so the
 		// command list won't consider it in the 2nd pass:
@@ -2498,7 +2505,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		pattern.append(aline);
 	}
 
@@ -2507,9 +2514,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 	// stripped, so that if there is a problem the user can see exactly
 	// what we used. This will look ugly, but will make errors like missing
 	// \n or \s+ easier to spot.
-	LogInfo("--------- final pcre2 regex pattern used after ini parsing ---------\n");
-	LogInfo("%s\n", pattern.c_str());
-	LogInfo("--------------------------------------------------------------------\n");
+	LogDebug("--------- final pcre2 regex pattern used after ini parsing ---------\n");
+	LogDebug("%s\n", pattern.c_str());
+	LogDebug("--------------------------------------------------------------------\n");
 
 	regex_pattern = &regex_group->patterns[*pattern_id];
 	if (!regex_pattern->compile(&pattern))
@@ -2543,7 +2550,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		regex_group->declarations.push_back(aline);
 	}
 
@@ -2573,16 +2580,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
 		// job for another day
 		wline = &entry->raw_line;
 		aline = std::string(wline->begin(), wline->end());
-		LogInfo("  %s\n", aline.c_str());
+		LogDebug("  %s\n", aline.c_str());
 		regex_pattern->replace.append(aline);
 	}
 
 	// Similar to above we want to see the final substitution string after
 	// ini parsing, especially to help spot missing newlines. TODO: Add an
 	// option to automatically add newlines after every ini line.
-	LogInfo("--------- final pcre2 replace string used after ini parsing ---------\n");
-	LogInfo("%s\n", regex_pattern->replace.c_str());
-	LogInfo("---------------------------------------------------------------------\n");
+	LogDebug("--------- final pcre2 replace string used after ini parsing ---------\n");
+	LogDebug("%s\n", regex_pattern->replace.c_str());
+	LogDebug("---------------------------------------------------------------------\n");
 
 	regex_pattern->do_replace = true;
 	return true;
@@ -2946,7 +2953,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
 		{
 			if (id[j] <= 0) break;
 			override->iterations.push_back(id[j]);
-			LogInfo("  Iteration=%d\n", id[j]);
+			LogDebug("  Iteration=%d\n", id[j]);
 		}
 	}
 
@@ -3012,7 +3019,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 	if (!setting.size() || !setting.compare(L"0")) {
 		*val = 0;
 		*mask = 0xffffffff;
-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 		return true;
 	}
 
@@ -3021,7 +3028,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 	if (ret != 0 && ret != EOF && (len1 == setting.length() || len2 == setting.length())) {
 		if (ret == 2)
 			*mask = 0xffffffff;
-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 		return true;
 	}
 
@@ -3063,7 +3070,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
 
 	if (!use_mask)
 		*mask = 0xffffffff;
-	LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+	LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
 
 	return true;
 }
@@ -3932,7 +3939,7 @@ static void ParseCustomShaderSections()
 
 		// FIXME: This will be logged in lower case. It would be better
 		// to use the original case, but not a big deal:
-		LogInfoW(L"[%s]\n", shader_id->c_str());
+		LogDebugW(L"[%s]\n", shader_id->c_str());
 
 		failed = false;
 
@@ -4030,7 +4037,7 @@ static void ParseExplicitCommandListSections()
 
 		// FIXME: This will be logged in lower case. It would be better
 		// to use the original case, but not a big deal:
-		LogInfoW(L"[%s]\n", section_id->c_str());
+		LogDebugW(L"[%s]\n", section_id->c_str());
 		ParseCommandList(section_id->c_str(), &command_list_section->command_list, &command_list_section->post_command_list, NULL);
 	}
 }

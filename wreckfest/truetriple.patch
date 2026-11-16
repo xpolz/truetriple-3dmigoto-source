@@ -1,8 +1,30 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f..b5fd41a 100644
+index 6758d9f1..3f51ecc0 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
-@@ -923,6 +923,69 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+@@ -20,6 +20,12 @@
+ 
+ #include <D3DCompiler.h>
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ CustomResources customResources;
+ CustomShaders customShaders;
+ ExplicitCommandListSections explicitCommandListSections;
+@@ -288,7 +294,7 @@ void optimise_command_lists(HackerDevice *device)
+ 		for (CommandList *command_list : registered_command_lists) {
+ 			for (i = 0; i < command_list->commands.size(); ) {
+ 				if (command_list->commands[i]->noop(command_list->post, ignore_cto_pre, ignore_cto_post)) {
+-					LogInfo("Optimised out %s %S\n",
++					LogDebug("Optimised out %s %S\n",
+ 							command_list->post ? "post" : "pre",
+ 							command_list->commands[i]->ini_line.c_str());
+ 					command_list->commands.erase(command_list->commands.begin() + i);
+@@ -923,6 +929,69 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
  			return AddCommandToList(new AbortCommand(section), explicit_command_list, NULL, pre_command_list, post_command_list, section, key, val);
  	}
  
@@ -72,7 +94,16 @@ index 6758d9f..b5fd41a 100644
  	if (!wcscmp(key, L"reset_per_frame_limits"))
  		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -2492,6 +2555,372 @@ out_release_view:
+@@ -1875,7 +1944,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
+ 	bool found = false;
+ 	FILETIME timestamp;
+ 
+-	LogInfo("  %cs=%S\n", type, filename);
++	LogDebug("  %cs=%S\n", type, filename);
+ 
+ 	switch(type) {
+ 		case 'v':
+@@ -2492,6 +2561,372 @@ out_release_view:
  	view->Release();
  }
  
@@ -445,8 +476,101 @@ index 6758d9f..b5fd41a 100644
  static void UpdateScissorInfo(CommandListState *state)
  {
  	UINT num = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+@@ -3176,7 +3611,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
+ 	if (!static_evaluate(&val, device))
+ 		return false;
+ 
+-	LogInfo("Statically evaluated %S as %f\n",
++	LogDebug("Statically evaluated %S as %f\n",
+ 		lookup_enum_name(ParamOverrideTypeNames, type), val);
+ 
+ 	type = ParamOverrideType::VALUE;
+@@ -3847,9 +4282,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
+ 		return making_progress;
+ 
+ 	// FIXME: Pretty print rather than dumping syntax tree
+-	LogInfoNoNL("Statically evaluated \"");
+-	_log_token(dynamic_cast<CommandListToken*>(this));
+-	LogInfo("\" as %f\n", static_val);
++	if (gLogDebug) {
++		LogInfoNoNL("Statically evaluated \"");
++		_log_token(dynamic_cast<CommandListToken*>(this));
++		LogInfo("\" as %f\n", static_val);
++	}
+ 	static_val_str = std::to_wstring(static_val);
+ 
+ 	operand = make_shared<CommandListOperand>(token_pos, static_val_str.c_str());
+@@ -4250,17 +4687,19 @@ static ResourceType* GetResourceFromPool(
+ 			return resource;
+ 		}
+ 
+-		LogInfo("Device mismatch, discarding %S from resource pool\n", ini_line->c_str());
++		LogInfo("Device mismatch, discarding cached resource from resource pool\n");
++		LogDebug("  %S\n", ini_line->c_str());
+ 		resource_pool->cache.erase(pool_i);
+ 		resource->Release();
+ 	}
+ 
+-	LogInfo("Creating cached resource %S\n", ini_line->c_str());
++	LogDebug("Creating cached resource %S\n", ini_line->c_str());
+ 	Profiling::resources_created++;
+ 
+ 	hr = (state->mOrigDevice1->*CreateResource)(desc, NULL, &resource);
+ 	if (FAILED(hr)) {
+-		LogInfo("Resource copy failed %S: 0x%x\n", ini_line->c_str(), hr);
++		LogInfo("Resource copy failed: 0x%x\n", hr);
++		LogDebug("  %S\n", ini_line->c_str());
+ 		LogResourceDesc(desc);
+ 		src_resource->GetDesc(&old_desc);
+ 		LogInfo("Original resource was:\n");
+@@ -4565,7 +5004,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
+ 
+ 	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)buffer;
+@@ -4592,7 +5031,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture1D(&desc, NULL, &tex1d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex1d;
+@@ -4618,7 +5057,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture2D(&desc, NULL, &tex2d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex2d;
+@@ -4644,7 +5083,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture3D(&desc, NULL, &tex3d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex3d;
+@@ -5107,7 +5546,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
+ 	// TODO: Option to discard individual resources instead of transfer
+ 	// TODO: Option to discard all custom resources and re-run [Constants]
+ 	//       on new device (for convoluted startup sequences)
+-	LogInfo("Device mismatch, transferring [%S] to new device\n", name.c_str());
++	LogInfo("Device mismatch, transferring custom resource to new device\n");
++	LogDebug("  [%S]\n", name.c_str());
+ 	new_resource = inter_device_resource_transfer(
+ 			mOrigDevice1, mOrigContext1, resource, &name);
+ 
 diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
-index 142cbbf..1389d2b 100644
+index 142cbbf4..1389d2b3 100644
 --- a/DirectX11/CommandList.h
 +++ b/DirectX11/CommandList.h
 @@ -1170,6 +1170,110 @@ public:
@@ -561,7 +685,7 @@ index 142cbbf..1389d2b 100644
  public:
  	CommandListExpression expression;
 diff --git a/DirectX11/FrameAnalysis.cpp b/DirectX11/FrameAnalysis.cpp
-index ef8b635..8053e87 100644
+index ef8b635a..8053e873 100644
 --- a/DirectX11/FrameAnalysis.cpp
 +++ b/DirectX11/FrameAnalysis.cpp
 @@ -3354,6 +3354,12 @@ STDMETHODIMP_(void) FrameAnalysisContext::OMSetDepthStencilState(THIS_
@@ -606,7 +730,7 @@ index ef8b635..8053e87 100644
  }
  
 diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
-index a0a8d70..8a05d7b 100644
+index a0a8d701..8a05d7b8 100644
 --- a/DirectX11/HackerContext.cpp
 +++ b/DirectX11/HackerContext.cpp
 @@ -87,6 +87,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
@@ -638,7 +762,7 @@ index a0a8d70..8a05d7b 100644
  }
  
 diff --git a/DirectX11/HackerContext.h b/DirectX11/HackerContext.h
-index 33c26e1..7bdc182 100644
+index 33c26e18..7bdc1820 100644
 --- a/DirectX11/HackerContext.h
 +++ b/DirectX11/HackerContext.h
 @@ -219,6 +219,17 @@ public:
@@ -660,7 +784,7 @@ index 33c26e1..7bdc182 100644
  	virtual void FrameAnalysisLog(char *fmt, ...) {};
  	virtual void FrameAnalysisTrigger(FrameAnalysisOptions new_options) {};
 diff --git a/DirectX11/HackerDXGI.cpp b/DirectX11/HackerDXGI.cpp
-index 82cfd09..ef11e33 100644
+index 82cfd092..ef11e331 100644
 --- a/DirectX11/HackerDXGI.cpp
 +++ b/DirectX11/HackerDXGI.cpp
 @@ -228,6 +228,23 @@ void HackerSwapChain::RunFrameActions()
@@ -699,7 +823,7 @@ index 82cfd09..ef11e33 100644
  		// We don't allow hold to be changed mid-frame due to potential
  		// for filename conflicts, so use def_analyse_options:
 diff --git a/DirectX11/HackerDevice.cpp b/DirectX11/HackerDevice.cpp
-index 3b38e6d..6dc55c6 100644
+index 3b38e6d0..6dc55c62 100644
 --- a/DirectX11/HackerDevice.cpp
 +++ b/DirectX11/HackerDevice.cpp
 @@ -328,6 +328,11 @@ HRESULT HackerDevice::CreateIniParamResources()
@@ -715,7 +839,7 @@ index 3b38e6d..6dc55c6 100644
  	if (mIniResourceView) {
  		long refcount = mIniResourceView->Release();
 diff --git a/DirectX11/HookAddresses.c b/DirectX11/HookAddresses.c
-index 707c9cb..cab6b9b 100644
+index 707c9cbd..cab6b9b1 100644
 --- a/DirectX11/HookAddresses.c
 +++ b/DirectX11/HookAddresses.c
 @@ -84,6 +84,32 @@ LPVOID lpvtbl_Present1(IDXGISwapChain1* pSwapChain1)
@@ -752,7 +876,7 @@ index 707c9cb..cab6b9b 100644
  
  #undef CINTERFACE
 diff --git a/DirectX11/HookedDXGI.cpp b/DirectX11/HookedDXGI.cpp
-index 53b5087..f7d1288 100644
+index 53b50873..f7d1288a 100644
 --- a/DirectX11/HookedDXGI.cpp
 +++ b/DirectX11/HookedDXGI.cpp
 @@ -897,6 +897,306 @@ static void HookCreateSwapChain(void* factory)
@@ -1093,7 +1217,7 @@ index 53b5087..f7d1288 100644
  	// have passed a lower version riid, and this way is safer. The version
  	// of this function isn't actually strongly related to the interface
 diff --git a/DirectX11/HookedDXGI.h b/DirectX11/HookedDXGI.h
-index 8bb968a..88376de 100644
+index 8bb968a4..88376de7 100644
 --- a/DirectX11/HookedDXGI.h
 +++ b/DirectX11/HookedDXGI.h
 @@ -73,3 +73,10 @@ extern "C" LPVOID lpvtbl_Present(IDXGISwapChain* pSwapChain);
@@ -1107,11 +1231,24 @@ index 8bb968a..88376de 100644
 +
 +extern "C" LPVOID lpvtbl_GetDisplayModeList1(IDXGIOutput1* pOutput1);
 +
+diff --git a/DirectX11/Hunting.cpp b/DirectX11/Hunting.cpp
+index b1c7861d..5d6371c1 100644
+--- a/DirectX11/Hunting.cpp
++++ b/DirectX11/Hunting.cpp
+@@ -544,7 +544,7 @@ STDMETHODIMP MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFi
+ 	// #include <3dmigoto.h>
+ 	switch (IncludeType) {
+ 		case D3D_INCLUDE_LOCAL:
+-			LogInfo("      #include \"%s\"\n", apath.c_str());
++			LogDebug("      #include \"%s\"\n", apath.c_str()); // TrueTriple: eco del ini, solo con debug=1
+ 			break;
+ 		case D3D_INCLUDE_SYSTEM:
+ 		default:
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..102c159 100644
+index 2c88983b..abeaa832 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
-@@ -19,12 +19,21 @@
+@@ -19,12 +19,28 @@
  #include "cursor.h"
  
  #include "shellscalingapi.h"
@@ -1129,6 +1266,13 @@ index 2c88983..102c159 100644
 -// TODO: Remove this #define after we switch to C++17 and remove 'experimental'
 -#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
 -#include <experimental/filesystem>
++
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
 +// NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
 +// The experimental namespace was unused here, so the include was dropped.
 +// This is the ONLY change to the pristine 3Dmigoto 1.4.9 source in this copy:
@@ -1137,7 +1281,34 @@ index 2c88983..102c159 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -846,6 +855,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
+@@ -464,7 +480,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
+ 	}
+ 
+ 	if (!ret)
+-		LogInfo("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
++		LogDebug("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
+ 
+ 	return !!ret;
+ }
+@@ -474,7 +490,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+ 	size_t first, last, delim;
+ 	wstring key, val;
+ 
+-	LogInfo("      %S\n", wline->c_str());
++	LogDebug("      %S\n", wline->c_str());
+ 
+ 	// Key / Val pair
+ 	delim = wline->find(L"=");
+@@ -491,7 +507,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+ 		}
+ 
+ 		if (!_wcsicmp(key.c_str(), L"namespace")) {
+-			LogInfo("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
++			LogDebug("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
+ 			*ini_namespace = val;
+ 			return true;
+ 		}
+@@ -846,6 +862,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
  	return _GetIniSection(&ini_sections, key_vals, section);
  }
  
@@ -1178,7 +1349,104 @@ index 2c88983..102c159 100644
  // This emulates the behaviour of the old GetPrivateProfileString API to
  // facilitate switching to our own ini parser. Later we might consider changing
  // the return values (e.g. return found/not found instead of string length),
-@@ -1276,6 +1319,14 @@ static void ParseIncludedIniFiles()
+@@ -951,7 +1001,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 	int rc = GetIniString(section, key, def, ret, size);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%S\n", key, ret);
++		LogDebug("  %S=%S\n", key, ret);
+ 
+ 	return rc;
+ }
+@@ -961,7 +1011,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 	bool rc = GetIniString(section, key, def, ret);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%s\n", key, ret->c_str());
++		LogDebug("  %S=%s\n", key, ret->c_str());
+ 
+ 	return rc;
+ }
+@@ -983,7 +1033,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%f\n", key, ret);
++			LogDebug("  %S=%f\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1008,7 +1058,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%d\n", key, ret);
++			LogDebug("  %S=%d\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1025,13 +1075,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
+ 
+ 	if (GetIniString(section, key, 0, val, 32)) {
+ 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
+-			LogInfo("  %S=1\n", key);
++			LogDebug("  %S=1\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return true;
+ 		}
+ 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
+-			LogInfo("  %S=0\n", key);
++			LogDebug("  %S=0\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return false;
+@@ -1060,7 +1110,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%016llx\n", key, ret);
++			LogDebug("  %S=%016llx\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1083,7 +1133,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%x\n", key, ret);
++			LogDebug("  %S=%x\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1127,7 +1177,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
+ 			ret = ParseEnum(val, prefix, names, names_len, first);
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} catch (EnumParseError) {
+ 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+ 		}
+@@ -1155,7 +1205,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
+ 		}
+@@ -1188,7 +1238,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%s\n", key, val.c_str());
++			LogDebug("  %S=%s\n", key, val.c_str());
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
+ 		}
+@@ -1276,6 +1326,14 @@ static void ParseIncludedIniFiles()
  	// ini_sections data structure:
  	GetUserConfigPath(migoto_path);
  
@@ -1193,7 +1461,25 @@ index 2c88983..102c159 100644
  	// Do this before removing [Include] from ini_sections. TODO: Allow
  	// recursively included files to modify the exclude mid-recursion:
  	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
-@@ -1334,9 +1385,17 @@ static void ParseIncludedIniFiles()
+@@ -1296,7 +1354,7 @@ static void ParseIncludedIniFiles()
+ 
+ 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
+ 			section_id = i->first.c_str();
+-			LogInfo("[%S]\n", section_id);
++			LogDebug("[%S]\n", section_id);
+ 
+ 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
+ 
+@@ -1304,7 +1362,7 @@ static void ParseIncludedIniFiles()
+ 			for (entry = section->begin(); entry < section->end(); entry++) {
+ 				key = &entry->first;
+ 				val = &entry->second;
+-				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
++				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
+ 
+ 				rel_path = namespace_path + *val;
+ 
+@@ -1334,9 +1392,17 @@ static void ParseIncludedIniFiles()
  
  	free_globbing_vector(exclude);
  
@@ -1212,7 +1498,7 @@ index 2c88983..102c159 100644
  	if (attrib != INVALID_FILE_ATTRIBUTES)
  		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
  }
-@@ -1345,7 +1404,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1411,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -1221,7 +1507,16 @@ index 2c88983..102c159 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1369,13 +1428,20 @@ static void RegisterPresetKeyBindings()
+@@ -1356,7 +1422,7 @@ static void RegisterPresetKeyBindings()
+ 	for (i = lower; i != upper; i++) {
+ 		const wchar_t *id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		keys = GetIniStringMultipleKeys(id, L"Key");
+ 		back = GetIniStringMultipleKeys(id, L"Back");
+@@ -1369,13 +1435,20 @@ static void RegisterPresetKeyBindings()
  
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
@@ -1243,7 +1538,7 @@ index 2c88983..102c159 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1449,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1456,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -1252,7 +1547,188 @@ index 2c88983..102c159 100644
  	}
  }
  
-@@ -4092,7 +4158,22 @@ void LoadConfigFile()
+@@ -1418,7 +1491,7 @@ static void ParsePresetOverrideSections()
+ 		const wchar_t *id = i->first.c_str();
+ 		preset = &i->second;
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		// Read parameters from ini
+ 		preset->ParseIniSection(id);
+@@ -1756,7 +1829,7 @@ static void ParseResourceSections()
+ 	lower = ini_sections.lower_bound(wstring(L"Resource"));
+ 	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
+ 	for (i = lower; i != upper; i++) {
+-		LogInfoW(L"[%s]\n", i->first.c_str());
++		LogDebugW(L"[%s]\n", i->first.c_str());
+ 
+ 		// Convert section name to lower case so our keys will be
+ 		// consistent in the unordered_map:
+@@ -1803,7 +1876,7 @@ static void ParseResourceSections()
+ 			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
+ 				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
+ 			} else {
+-				LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
++				LogDebug("  format=%s\n", TexFormatStr(custom_resource->override_format));
+ 			}
+ 		}
+ 
+@@ -1959,7 +2032,7 @@ static void ParseCommandList(const wchar_t *id,
+ 		}
+ 
+ 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
+-			LogInfo("  %S\n", raw_line->c_str());
++			LogDebug("  %S\n", raw_line->c_str());
+ 			continue;
+ 		}
+ 
+@@ -2113,9 +2186,9 @@ static void ParseConstantsSection()
+ 			persistent_variables.emplace_back(&inserted.first->second);
+ 
+ 		if (val->empty())
+-			LogInfo("  global %S\n", name.c_str());
++			LogDebug("  global %S\n", name.c_str());
+ 		else
+-			LogInfo("  global %S=%f\n", name.c_str(), fval);
++			LogDebug("  global %S=%f\n", name.c_str(), fval);
+ 
+ 		// Remove this line from the ini section data structures so the
+ 		// command list won't consider it in the 2nd pass:
+@@ -2266,7 +2339,7 @@ static void ParseShaderOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
+@@ -2411,7 +2484,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		pattern.append(aline);
+ 	}
+ 
+@@ -2420,9 +2493,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+ 	// stripped, so that if there is a problem the user can see exactly
+ 	// what we used. This will look ugly, but will make errors like missing
+ 	// \n or \s+ easier to spot.
+-	LogInfo("--------- final pcre2 regex pattern used after ini parsing ---------\n");
+-	LogInfo("%s\n", pattern.c_str());
+-	LogInfo("--------------------------------------------------------------------\n");
++	LogDebug("--------- final pcre2 regex pattern used after ini parsing ---------\n");
++	LogDebug("%s\n", pattern.c_str());
++	LogDebug("--------------------------------------------------------------------\n");
+ 
+ 	regex_pattern = &regex_group->patterns[*pattern_id];
+ 	if (!regex_pattern->compile(&pattern))
+@@ -2456,7 +2529,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		regex_group->declarations.push_back(aline);
+ 	}
+ 
+@@ -2486,16 +2559,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		regex_pattern->replace.append(aline);
+ 	}
+ 
+ 	// Similar to above we want to see the final substitution string after
+ 	// ini parsing, especially to help spot missing newlines. TODO: Add an
+ 	// option to automatically add newlines after every ini line.
+-	LogInfo("--------- final pcre2 replace string used after ini parsing ---------\n");
+-	LogInfo("%s\n", regex_pattern->replace.c_str());
+-	LogInfo("---------------------------------------------------------------------\n");
++	LogDebug("--------- final pcre2 replace string used after ini parsing ---------\n");
++	LogDebug("%s\n", regex_pattern->replace.c_str());
++	LogDebug("---------------------------------------------------------------------\n");
+ 
+ 	regex_pattern->do_replace = true;
+ 	return true;
+@@ -2561,7 +2634,7 @@ static void ParseShaderRegexSections()
+ 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
+ 	for (i = lower; i != upper; i++) {
+ 		section_id = &i->first;
+-		LogInfo("[%S]\n", section_id->c_str());
++		LogDebug("[%S]\n", section_id->c_str());
+ 
+ 		hash = hash_ini_section(hash, section_id);
+ 
+@@ -2859,7 +2932,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
+ 		{
+ 			if (id[j] <= 0) break;
+ 			override->iterations.push_back(id[j]);
+-			LogInfo("  Iteration=%d\n", id[j]);
++			LogDebug("  Iteration=%d\n", id[j]);
+ 		}
+ 	}
+ 
+@@ -2925,7 +2998,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 	if (!setting.size() || !setting.compare(L"0")) {
+ 		*val = 0;
+ 		*mask = 0xffffffff;
+-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 		return true;
+ 	}
+ 
+@@ -2934,7 +3007,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 	if (ret != 0 && ret != EOF && (len1 == setting.length() || len2 == setting.length())) {
+ 		if (ret == 2)
+ 			*mask = 0xffffffff;
+-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 		return true;
+ 	}
+ 
+@@ -2976,7 +3049,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 
+ 	if (!use_mask)
+ 		*mask = 0xffffffff;
+-	LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++	LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 
+ 	return true;
+ }
+@@ -3124,7 +3197,7 @@ static void ParseTextureOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
+@@ -3845,7 +3918,7 @@ static void ParseCustomShaderSections()
+ 
+ 		// FIXME: This will be logged in lower case. It would be better
+ 		// to use the original case, but not a big deal:
+-		LogInfoW(L"[%s]\n", shader_id->c_str());
++		LogDebugW(L"[%s]\n", shader_id->c_str());
+ 
+ 		failed = false;
+ 
+@@ -3943,7 +4016,7 @@ static void ParseExplicitCommandListSections()
+ 
+ 		// FIXME: This will be logged in lower case. It would be better
+ 		// to use the original case, but not a big deal:
+-		LogInfoW(L"[%s]\n", section_id->c_str());
++		LogDebugW(L"[%s]\n", section_id->c_str());
+ 		ParseCommandList(section_id->c_str(), &command_list_section->command_list, &command_list_section->post_command_list, NULL);
+ 	}
+ }
+@@ -4092,7 +4165,22 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -1276,7 +1752,7 @@ index 2c88983..102c159 100644
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4162,6 +4243,21 @@ void LoadConfigFile()
+@@ -4162,6 +4250,21 @@ void LoadConfigFile()
  	G->SCREEN_WIDTH = GetIniInt(L"Device", L"width", -1, NULL);
  	G->SCREEN_HEIGHT = GetIniInt(L"Device", L"height", -1, NULL);
  	G->SCREEN_REFRESH = GetIniInt(L"Device", L"refresh_rate", -1, NULL);
@@ -1298,7 +1774,7 @@ index 2c88983..102c159 100644
  	G->SCREEN_UPSCALING = GetIniInt(L"Device", L"upscaling", 0, NULL);
  	G->UPSCALE_MODE = GetIniInt(L"Device", L"upscale_mode", 0, NULL);
  
-@@ -4478,6 +4574,21 @@ void SavePersistentSettings()
+@@ -4478,6 +4581,21 @@ void SavePersistentSettings()
  {
  	FILE *f;
  
@@ -1320,7 +1796,7 @@ index 2c88983..102c159 100644
  	if (!G->user_config_dirty)
  		return;
  	G->user_config_dirty = 0;
-@@ -4513,6 +4624,9 @@ static void WipeUserConfig()
+@@ -4513,6 +4631,9 @@ static void WipeUserConfig()
  	G->gWipeUserConfig = false;
  	G->user_config_dirty = 0;
  
@@ -1331,7 +1807,7 @@ index 2c88983..102c159 100644
  }
  
 diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
-index 994124c..e6b529b 100644
+index 994124cd..e6b529b7 100644
 --- a/DirectX11/Overlay.cpp
 +++ b/DirectX11/Overlay.cpp
 @@ -692,6 +692,10 @@ void Overlay::DrawNotices(float *y)
@@ -1423,7 +1899,7 @@ index 994124c..e6b529b 100644
 +	LeaveCriticalSection(&notices.lock);
 +}
 diff --git a/DirectX11/Overlay.h b/DirectX11/Overlay.h
-index e261940..4fd6650 100644
+index e2619402..4fd66509 100644
 --- a/DirectX11/Overlay.h
 +++ b/DirectX11/Overlay.h
 @@ -31,8 +31,12 @@ class OverlayNotice {
@@ -1447,9 +1923,108 @@ index e261940..4fd6650 100644
 +// TrueTriple: aviso LOG_WARNING (se ve fuera de caza) centrado y que reemplaza
 +// al anterior del mismo tipo (tipo > 0).
 +void LogOverlayTrueTriple(int tipo, const char *fmt, ...);
-diff --git a/b/DirectX11/TrueTripleMarca.h b/DirectX11/TrueTripleMarca.h
+diff --git a/DirectX11/Override.cpp b/DirectX11/Override.cpp
+index 1496adf0..1e0c09fa 100644
+--- a/DirectX11/Override.cpp
++++ b/DirectX11/Override.cpp
+@@ -9,6 +9,12 @@
+ #include <strsafe.h>
+ #include <algorithm>
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ PresetOverrideMap presetOverrides;
+ 
+ OverrideTransition CurrentTransition;
+@@ -149,7 +155,7 @@ struct KeyOverrideCycleParam
+ 	void log(const wchar_t *name)
+ 	{
+ 		if (!cur.empty())
+-			LogInfoNoNL(" %S=%s", name, cur.c_str());
++			LogDebugNoNL(" %S=%s", name, cur.c_str());
+ 	}
+ 
+ 	float as_float(float default)
+@@ -313,7 +319,7 @@ void KeyOverrideCycle::ParseIniSection(LPCWSTR section)
+ 		if (!not_done)
+ 			break;
+ 
+-		LogInfoNoNL("  Cycle %i:", i);
++		LogDebugNoNL("  Cycle %i:", i);
+ 		params.clear();
+ 		for (j = param_bufs.begin(); j != param_bufs.end(); j++) {
+ 			val = j->second.as_float(FLT_MAX);
+@@ -343,7 +349,7 @@ void KeyOverrideCycle::ParseIniSection(LPCWSTR section)
+ 		release_transition_type.log(L"release_transition_type");
+ 		condition.log(L"condition");
+ 		run.log(L"run");
+-		LogInfo("\n");
++		LogDebug("\n");
+ 
+ 		presets.push_back(KeyOverride(KeyOverrideType::CYCLE, &params, &vars,
+ 			separation.as_float(FLT_MAX), convergence.as_float(FLT_MAX),
+@@ -628,7 +634,7 @@ static void _ScheduleTransition(struct OverrideTransitionParam *transition,
+ 		char *name, float current, float val, ULONGLONG now, int time,
+ 		TransitionType transition_type)
+ {
+-	LogInfoNoNL(" %s: %#.2g -> %#.2g", name, current, val);
++	LogDebugNoNL(" %s: %#.2g -> %#.2g", name, current, val);
+ 	transition->start = current;
+ 	transition->target = val;
+ 	transition->activation_time = now;
+@@ -640,7 +646,7 @@ static void _ScheduleTransition(struct OverrideTransitionParam *transition,
+ 		const wchar_t *name, float current, float val, ULONGLONG now, int time,
+ 		TransitionType transition_type)
+ {
+-	LogInfoNoNL(" %S: %#.2g -> %#.2g", name, current, val);
++	LogDebugNoNL(" %S: %#.2g -> %#.2g", name, current, val);
+ 	transition->start = current;
+ 	transition->target = val;
+ 	transition->activation_time = now;
+diff --git a/DirectX11/ShaderRegex.cpp b/DirectX11/ShaderRegex.cpp
+index a40077a8..7ca46faf 100644
+--- a/DirectX11/ShaderRegex.cpp
++++ b/DirectX11/ShaderRegex.cpp
+@@ -6,6 +6,12 @@
+ #include <algorithm>
+ #include <iterator>
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ ShaderRegexGroups shader_regex_groups;
+ std::vector<ShaderRegexGroup*> shader_regex_group_index;
+ uint32_t shader_regex_hash;
+@@ -532,7 +538,8 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
+ 			goto out;
+ 		group = shader_regex_group_index[match_ids[i]];
+ 
+-		LogInfo("ShaderRegexCache: %S %016I64x matches [%S]\n", shader_type, hash, group->ini_section.c_str());
++		LogInfo("ShaderRegexCache: %S %016I64x matches\n", shader_type, hash);
++		LogDebug("  [%S]\n", group->ini_section.c_str());
+ 
+ 		if (header->patched && tagline)
+ 			tagline->append(std::wstring(L"[") + group->ini_section + std::wstring(L"]"));
+@@ -672,7 +679,8 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
+ 		if (!match)
+ 			continue;
+ 
+-		LogInfo("ShaderRegex: %s %016I64x matches [%S]\n", shader_model->c_str(), hash, group->ini_section.c_str());
++		LogInfo("ShaderRegex: %s %016I64x matches\n", shader_model->c_str(), hash);
++		LogDebug("  [%S]\n", group->ini_section.c_str());
+ 		patched = patched || patch;
+ 		match_ids.push_back(j);
+ 
+diff --git a/DirectX11/TrueTripleMarca.h b/DirectX11/TrueTripleMarca.h
 new file mode 100644
-index 0000000..5a2e152
+index 00000000..5a2e1520
 --- /dev/null
 +++ b/DirectX11/TrueTripleMarca.h
 @@ -0,0 +1,190 @@
@@ -1644,7 +2219,7 @@ index 0000000..5a2e152
 +
 +} // namespace truetriple
 diff --git a/DirectX11/globals.h b/DirectX11/globals.h
-index 111e77c..b86f9e4 100644
+index 111e77c8..b86f9e4c 100644
 --- a/DirectX11/globals.h
 +++ b/DirectX11/globals.h
 @@ -424,6 +424,10 @@ struct Globals
@@ -1667,3 +2242,29 @@ index 111e77c..b86f9e4 100644
  		SCREEN_FULLSCREEN(0),
  		SCREEN_ALLOW_COMMANDS(false),
  		upscaling_hooks_armed(true),
+diff --git a/DirectX11/input.cpp b/DirectX11/input.cpp
+index 20bc6533..d89a4f97 100644
+--- a/DirectX11/input.cpp
++++ b/DirectX11/input.cpp
+@@ -10,6 +10,12 @@
+ #include "vkeys.h"
+ #include "IniHandler.h"
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ // Set a function pointer to the xinput get state call. By default, set it to
+ // XInputGetState() in whichever xinput we are linked to (xinput9_1_0.dll). If
+ // the d3dx.ini is using the guide button we will try to switch to either
+@@ -464,7 +470,7 @@ void RegisterKeyBinding(LPCWSTR iniKey, const wchar_t *keyName,
+ 	else
+ 		action = new InputAction(button, listener);
+ 
+-	LogInfoW(L"  %s=%s\n", iniKey, keyName);
++	LogDebugW(L"  %s=%s\n", iniKey, keyName);
+ 	actions.push_back(action);
+ }
+ 

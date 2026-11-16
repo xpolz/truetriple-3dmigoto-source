@@ -544,7 +544,7 @@ STDMETHODIMP MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFi
 	// #include <3dmigoto.h>
 	switch (IncludeType) {
 		case D3D_INCLUDE_LOCAL:
-			LogInfo("      #include \"%s\"\n", apath.c_str());
+			LogDebug("      #include \"%s\"\n", apath.c_str()); // TrueTriple: eco del ini, solo con debug=1
 			break;
 		case D3D_INCLUDE_SYSTEM:
 		default:

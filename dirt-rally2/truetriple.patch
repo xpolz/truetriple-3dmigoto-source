@@ -1,8 +1,8 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f..d2f84ed 100644
+index 6758d9f1..6362a66b 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
-@@ -17,8 +17,14 @@
+@@ -17,8 +17,20 @@
  #include "profiling.h"
  #include "Hunting.h"
  #include "cursor.h"
@@ -14,10 +14,16 @@ index 6758d9f..d2f84ed 100644
  #include <D3DCompiler.h>
 +#include "TrueTripleHudLayout.h"
 +#include "TrueTripleShadowFit.h"
++
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
  
  CustomResources customResources;
  CustomShaders customShaders;
-@@ -30,6 +36,46 @@ std::unordered_set<CommandList*> command_lists_profiling;
+@@ -30,6 +42,46 @@ std::unordered_set<CommandList*> command_lists_profiling;
  std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
  std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
  
@@ -64,7 +70,16 @@ index 6758d9f..d2f84ed 100644
  
  // Adds consistent "3DMigoto" prefix to frame analysis log with appropriate
  // level of indentation for the current recursion level. Using a
-@@ -926,6 +972,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+@@ -288,7 +340,7 @@ void optimise_command_lists(HackerDevice *device)
+ 		for (CommandList *command_list : registered_command_lists) {
+ 			for (i = 0; i < command_list->commands.size(); ) {
+ 				if (command_list->commands[i]->noop(command_list->post, ignore_cto_pre, ignore_cto_post)) {
+-					LogInfo("Optimised out %s %S\n",
++					LogDebug("Optimised out %s %S\n",
+ 							command_list->post ? "post" : "pre",
+ 							command_list->commands[i]->ini_line.c_str());
+ 					command_list->commands.erase(command_list->commands.begin() + i);
+@@ -926,6 +978,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
  	if (!wcscmp(key, L"reset_per_frame_limits"))
  		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
@@ -118,10 +133,239 @@ index 6758d9f..d2f84ed 100644
  	if (!wcscmp(key, L"clear"))
  		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -1345,6 +1438,3832 @@ void AbortCommand::run(CommandListState *state)
- 	state->aborted = true;
+@@ -1117,232 +1216,4058 @@ static UINT get_vertex_count_from_current_vb(ID3D11DeviceContext* mOrigContext1)
+ 	return (desc.ByteWidth - offset) / stride;
  }
  
+-static UINT get_index_count_from_current_ib(ID3D11DeviceContext *mOrigContext1)
++static UINT get_index_count_from_current_ib(ID3D11DeviceContext *mOrigContext1)
++{
++	ID3D11Buffer *ib;
++	D3D11_BUFFER_DESC desc;
++	DXGI_FORMAT format;
++	UINT offset;
++
++	mOrigContext1->IAGetIndexBuffer(&ib, &format, &offset);
++	if (!ib)
++		return 0;
++
++	ib->GetDesc(&desc);
++	ib->Release();
++
++	switch(format) {
++		case DXGI_FORMAT_R16_UINT:
++			return (desc.ByteWidth - offset) / 2;
++		case DXGI_FORMAT_R32_UINT:
++			return (desc.ByteWidth - offset) / 4;
++	}
++
++	return 0;
++}
++
++void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
++		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
++		ID3D11Buffer *pBufferForArgs,
++		UINT AlignedByteOffsetForArgs))
++{
++	ID3D11Resource *resource = NULL;
++	ID3D11View *view = NULL;
++	UINT stride = 0;
++	UINT offset = 0;
++	UINT buf_size = 0;
++	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
++	UINT arg = (UINT)args[0].evaluate(state);
++
++	resource = indirect_buffer.GetResource(state, &view, &stride, &offset, &format, NULL);
++	if (view)
++		view->Release();
++
++	if (!resource) {
++		COMMAND_LIST_LOG(state, "[%S] %s(%p, %u) -> INDIRECT BUFFER IS NULL\n",
++				ini_section.c_str(), name, resource, arg);
++		return;
++	}
++
++	COMMAND_LIST_LOG(state, "[%S] %s(%p, %u)\n", ini_section.c_str(), name, resource, arg);
++
++	(state->mOrigContext1->*IndirectDrawCall)((ID3D11Buffer*)resource, arg);
++
++	resource->Release();
++}
++
++void DrawCommand::eval_args(int nargs, INT result[5], CommandListState *state)
++{
++	for (int i = 0; i < nargs; i++)
++		result[i] = (INT)args[i].evaluate(state);
++}
++
++void DrawCommand::run(CommandListState *state)
++{
++	HackerContext *mHackerContext = state->mHackerContext;
++	ID3D11DeviceContext *mOrigContext1 = state->mOrigContext1;
++	DrawCallInfo *info = state->call_info;
++	UINT auto_count = 0;
++	INT eargs[5];
++
++	// If this command list was triggered from something currently skipped
++	// due to hunting, we also skip any custom draw calls, so that if we
++	// are replacing the original draw call we will still be able to see
++	// the object being hunted.
++	if (info && info->hunting_skip) {
++		COMMAND_LIST_LOG(state, "[%S] Draw -> SKIPPED DUE TO HUNTING\n", ini_section.c_str());
++		return;
++	}
++
++	// Ensure IniParams are visible:
++	CommandListFlushState(state);
++
++	Profiling::injected_draw_calls++;
++
++	switch (type) {
++		case DrawCommandType::DRAW:
++			eval_args(2, eargs, state);
++			COMMAND_LIST_LOG(state, "[%S] Draw(%u, %u)\n", ini_section.c_str(), eargs[0], eargs[1]);
++			mOrigContext1->Draw(eargs[0], eargs[1]);
++			break;
++		case DrawCommandType::DRAW_AUTO:
++			COMMAND_LIST_LOG(state, "[%S] DrawAuto()\n", ini_section.c_str());
++			mOrigContext1->DrawAuto();
++			break;
++		case DrawCommandType::DRAW_INDEXED:
++			eval_args(3, eargs, state);
++			COMMAND_LIST_LOG(state, "[%S] DrawIndexed(%u, %u, %i)\n", ini_section.c_str(), eargs[0], eargs[1], (INT)eargs[2]);
++			mOrigContext1->DrawIndexed(eargs[0], eargs[1], (INT)eargs[2]);
++			break;
++		case DrawCommandType::DRAW_INDEXED_INSTANCED:
++			eval_args(5, eargs, state);
++			COMMAND_LIST_LOG(state, "[%S] DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
++			mOrigContext1->DrawIndexedInstanced(eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
++			break;
++		case DrawCommandType::DRAW_INSTANCED:
++			eval_args(4, eargs, state);
++			COMMAND_LIST_LOG(state, "[%S] DrawInstanced(%u, %u, %u, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], eargs[3]);
++			mOrigContext1->DrawInstanced(eargs[0], eargs[1], eargs[2], eargs[3]);
++			break;
++		case DrawCommandType::DISPATCH:
++			eval_args(3, eargs, state);
++			COMMAND_LIST_LOG(state, "[%S] Dispatch(%u, %u, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2]);
++			mOrigContext1->Dispatch(eargs[0], eargs[1], eargs[2]);
++			break;
++		case DrawCommandType::DRAW_INDEXED_INSTANCED_INDIRECT:
++			do_indirect_draw_call(state, "DrawIndexedInstancedIndirect", &ID3D11DeviceContext::DrawIndexedInstancedIndirect);
++			break;
++		case DrawCommandType::DRAW_INSTANCED_INDIRECT:
++			do_indirect_draw_call(state, "DrawInstancedIndirect", &ID3D11DeviceContext::DrawInstancedIndirect);
++			break;
++		case DrawCommandType::DISPATCH_INDIRECT:
++			do_indirect_draw_call(state, "DispatchIndirect", &ID3D11DeviceContext::DispatchIndirect);
++			break;
++		case DrawCommandType::FROM_CALLER:
++			if (!info) {
++				COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> NO ACTIVE DRAW CALL\n", ini_section.c_str());
++				break;
++			}
++			switch (info->type) {
++				case DrawCall::DrawIndexedInstanced:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), info->IndexCount, info->InstanceCount, info->FirstIndex, info->FirstVertex, info->FirstInstance);
++					mOrigContext1->DrawIndexedInstanced(info->IndexCount, info->InstanceCount, info->FirstIndex, info->FirstVertex, info->FirstInstance);
++					break;
++				case DrawCall::DrawInstanced:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawInstanced(%u, %u, %u, %u)\n", ini_section.c_str(), info->VertexCount, info->InstanceCount, info->FirstVertex, info->FirstInstance);
++					mOrigContext1->DrawInstanced(info->VertexCount, info->InstanceCount, info->FirstVertex, info->FirstInstance);
++					break;
++				case DrawCall::DrawIndexed:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexed(%u, %u, %i)\n", ini_section.c_str(), info->IndexCount, info->FirstIndex, info->FirstVertex);
++					mOrigContext1->DrawIndexed(info->IndexCount, info->FirstIndex, info->FirstVertex);
++					break;
++				case DrawCall::Draw:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> Draw(%u, %u)\n", ini_section.c_str(), info->VertexCount, info->FirstVertex);
++					mOrigContext1->Draw(info->VertexCount, info->FirstVertex);
++					break;
++				case DrawCall::DrawInstancedIndirect:
++					if (!info->indirect_buffer) {
++						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DrawInstancedIndirect missing args\n");
++						break;
++					}
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawInstancedIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
++					mOrigContext1->DrawInstancedIndirect(*info->indirect_buffer, info->args_offset);
++					break;
++				case DrawCall::DrawIndexedInstancedIndirect:
++					if (!info->indirect_buffer) {
++						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DrawIndexedInstancedIndirect missing args\n");
++						break;
++					}
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexedInstancedIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
++					mOrigContext1->DrawIndexedInstancedIndirect(*info->indirect_buffer, info->args_offset);
++					break;
++				case DrawCall::DispatchIndirect:
++					if (!info->indirect_buffer) {
++						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DispatchIndirect missing args\n");
++						break;
++					}
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DispatchIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
++					mOrigContext1->DispatchIndirect(*info->indirect_buffer, info->args_offset);
++					break;
++				case DrawCall::Dispatch:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> Dispatch(%u, %u, %u)\n", ini_section.c_str(), info->ThreadGroupCountX, info->ThreadGroupCountY, info->ThreadGroupCountZ);
++					mOrigContext1->Dispatch(info->ThreadGroupCountX, info->ThreadGroupCountY, info->ThreadGroupCountZ);
++					break;
++				case DrawCall::DrawAuto:
++					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawAuto()\n", ini_section.c_str());
++					mOrigContext1->DrawAuto();
++					break;
++				default:
++					LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> unknown draw call type\n");
++					break;
++			}
++			break;
++		case DrawCommandType::AUTO_VERTEX_COUNT:
++			auto_count = get_vertex_count_from_current_vb(mOrigContext1);
++			COMMAND_LIST_LOG(state, "[%S] draw = auto -> Draw(%u, 0)\n", ini_section.c_str(), auto_count);
++			if (auto_count)
++				mOrigContext1->Draw(auto_count, 0);
++			else
++				COMMAND_LIST_LOG(state, "  Unable to determine vertex count\n");
++			break;
++		case DrawCommandType::AUTO_INDEX_COUNT:
++			auto_count = get_index_count_from_current_ib(mOrigContext1);
++			COMMAND_LIST_LOG(state, "[%S] drawindexed = auto -> DrawIndexed(%u, 0, 0)\n", ini_section.c_str(), auto_count);
++			if (auto_count)
++				mOrigContext1->DrawIndexed(auto_count, 0, 0);
++			else
++				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
++			break;
++		case DrawCommandType::AUTO_INDEX_INSTANCE_COUNT:
++			if (!info) {
++				COMMAND_LIST_LOG(state, "[%S] drawindexedinstanced = auto -> NO ACTIVE DRAW CALL\n", ini_section.c_str());
++				break;
++			}
++			auto_count = get_index_count_from_current_ib(mOrigContext1);
++			COMMAND_LIST_LOG(state, "[%S] drawindexedinstanced = auto -> DrawIndexedInstanced(%u, %u, 0, 0, %u)\n", ini_section.c_str(), auto_count, info->InstanceCount, info->FirstInstance);
++			if (auto_count)
++				mOrigContext1->DrawIndexedInstanced(auto_count, info->InstanceCount, 0, 0, info->FirstInstance);
++			else
++				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
++			break;
++	}
++}
++
++void SkipCommand::run(CommandListState *state)
++{
++	COMMAND_LIST_LOG(state, "[%S] handling = skip\n", ini_section.c_str());
++
++	if (state->call_info)
++		state->call_info->skip = true;
++	else
++		COMMAND_LIST_LOG(state, "  No active draw call to skip\n");
++}
++
++void AbortCommand::run(CommandListState *state)
++{
++	COMMAND_LIST_LOG(state, "[%S] handling = abort\n", ini_section.c_str());
++
++	state->aborted = true;
++}
++
 +// Save/restore of the game's own scissor rects around our per-region redraws.
 +// Without this, our last set_scissor leaks into the game's UI drawing (which uses
 +// scissor rects for panel clipping) and breaks menus while the triple is active.
@@ -3461,16 +3705,31 @@ index 6758d9f..d2f84ed 100644
 +// mismo valor que el VS del pasto resta a cada instancia antes de proyectar.
 +// Devuelve 0 si todavia no hay camara capturada.
 +int TripleGetCameraPos(float *out3)
-+{
+ {
+-	ID3D11Buffer *ib;
+-	D3D11_BUFFER_DESC desc;
+-	DXGI_FORMAT format;
+-	UINT offset;
+-
+-	mOrigContext1->IAGetIndexBuffer(&ib, &format, &offset);
+-	if (!ib)
 +	if (!g_triple_cam_valid || g_triple_cam_size < 144)
-+		return 0;
+ 		return 0;
 +	const float *f = (const float *)g_triple_cam_buf;
 +	out3[0] = f[32];
 +	out3[1] = f[33];
 +	out3[2] = f[34];
 +	return 1;
 +}
-+
+ 
+-	ib->GetDesc(&desc);
+-	ib->Release();
+-
+-	switch(format) {
+-		case DXGI_FORMAT_R16_UINT:
+-			return (desc.ByteWidth - offset) / 2;
+-		case DXGI_FORMAT_R32_UINT:
+-			return (desc.ByteWidth - offset) / 4;
 +// Proyecta un punto de mundo con la MISMA relativeViewProjection de la camara
 +// principal que usa el motor. Solo diagnostico: trabaja sobre la copia del
 +// constant buffer ya capturada y nunca escribe memoria del juego.
@@ -3498,9 +3757,23 @@ index 6758d9f..d2f84ed 100644
 +				s += A[k * 4 + row] * B[col * 4 + k];
 +			R[col * 4 + row] = s;
 +		}
-+	}
-+}
-+
+ 	}
+-
+-	return 0;
+ }
+ 
+-void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
+-		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
+-		ID3D11Buffer *pBufferForArgs,
+-		UINT AlignedByteOffsetForArgs))
+-{
+-	ID3D11Resource *resource = NULL;
+-	ID3D11View *view = NULL;
+-	UINT stride = 0;
+-	UINT offset = 0;
+-	UINT buf_size = 0;
+-	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+-	UINT arg = (UINT)args[0].evaluate(state);
 +// Inversa general 4x4 (column-major m[col*4+row], igual convencion que el juego:
 +// cada registro del cbuffer es una COLUMNA, como se ve en el ASM
 +// "clip = cb3[9]*x + cb3[10]*y + cb3[11]*z + cb3[12]").
@@ -3550,7 +3823,10 @@ index 6758d9f..d2f84ed 100644
 +		out[i] = inv[i] * det;
 +	return true;
 +}
-+
+ 
+-	resource = indirect_buffer.GetResource(state, &view, &stride, &offset, &format, NULL);
+-	if (view)
+-		view->Release();
 +// Construye P_region (view-space del juego -> clip de la region i) desde la
 +// geometria viva (constantes K en IniParams) y el near REAL de la camara.
 +// Deducida de compute_matrices.py; equivale exactamente a lo que hace el ASM:
@@ -3572,7 +3848,11 @@ index 6758d9f..d2f84ed 100644
 +	{ 0.3350515f, 0.6649485f },   // CENTER 2600 .. 5160
 +	{ 0.6701031f, 1.0000000f },   // RIGHT  5200 .. 7760
 +};
-+
+ 
+-	if (!resource) {
+-		COMMAND_LIST_LOG(state, "[%S] %s(%p, %u) -> INDIRECT BUFFER IS NULL\n",
+-				ini_section.c_str(), name, resource, arg);
+-		return;
 +static void triple_get_frac(int region, float *lo, float *hi)
 +{
 +	if (G->iniParams.size() >= 8 && G->iniParams[6].z > 0.0f) {
@@ -3585,13 +3865,15 @@ index 6758d9f..d2f84ed 100644
 +			case 1: *lo = fcl;  *hi = fcr;  return;
 +			default: *lo = frl; *hi = 1.0f; return;
 +		}
-+	}
+ 	}
 +	*lo = TRIPLE_FRAC[region][0];
 +	*hi = TRIPLE_FRAC[region][1];
 +}
-+
+ 
+-	COMMAND_LIST_LOG(state, "[%S] %s(%p, %u)\n", ini_section.c_str(), name, resource, arg);
 +static void ProcessParamRTSize(CommandListState *state);
-+
+ 
+-	(state->mOrigContext1->*IndirectDrawCall)((ID3D11Buffer*)resource, arg);
 +// Consulta ROBUSTA del tamano del render target.
 +// ProcessParamRTSize (la que alimenta la variable rt_width del ini) solo acepta
 +// vistas D3D11_RTV_DIMENSION_TEXTURE2D / TEXTURE2DMS y sale dejando rt_width en
@@ -3605,7 +3887,9 @@ index 6758d9f..d2f84ed 100644
 +	ID3D11Resource *res = NULL;
 +	D3D11_RESOURCE_DIMENSION dim;
 +	bool ok = false;
-+
+ 
+-	resource->Release();
+-}
 +	state->mOrigContext1->OMGetRenderTargets(1, &view, NULL);
 +	if (!view)
 +		return false;
@@ -3613,7 +3897,11 @@ index 6758d9f..d2f84ed 100644
 +	view->Release();
 +	if (!res)
 +		return false;
-+
+ 
+-void DrawCommand::eval_args(int nargs, INT result[5], CommandListState *state)
+-{
+-	for (int i = 0; i < nargs; i++)
+-		result[i] = (INT)args[i].evaluate(state);
 +	res->GetType(&dim);
 +	if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
 +		D3D11_TEXTURE2D_DESC d;
@@ -3624,10 +3912,16 @@ index 6758d9f..d2f84ed 100644
 +	}
 +	res->Release();
 +	return ok;
-+}
-+
+ }
+ 
+-void DrawCommand::run(CommandListState *state)
 +static void triple_build_pregion(float *P, int region, float nearz)
-+{
+ {
+-	HackerContext *mHackerContext = state->mHackerContext;
+-	ID3D11DeviceContext *mOrigContext1 = state->mOrigContext1;
+-	DrawCallInfo *info = state->call_info;
+-	UINT auto_count = 0;
+-	INT eargs[5];
 +	memset(P, 0, 16 * sizeof(float));
 +	if (region == 1) {                 // CENTER
 +		P[0]  = TRIPLE_KXC;            // col0.row0
@@ -3669,7 +3963,13 @@ index 6758d9f..d2f84ed 100644
 +		}
 +		return;
 +	}
-+
+ 
+-	// If this command list was triggered from something currently skipped
+-	// due to hunting, we also skip any custom draw calls, so that if we
+-	// are replacing the original draw call we will still be able to see
+-	// the object being hunted.
+-	if (info && info->hunting_skip) {
+-		COMMAND_LIST_LOG(state, "[%S] Draw -> SKIPPED DUE TO HUNTING\n", ini_section.c_str());
 +	// triple_scissor: solo el rectangulo del tercio, como FRACCION del render
 +	// target real. Independiente de la resolucion. No toca ningun cbuffer.
 +	if (scissor_only) {
@@ -3684,9 +3984,11 @@ index 6758d9f..d2f84ed 100644
 +			r.bottom = (LONG)(rh + 0.5f);
 +			ctx->RSSetScissorRects(1, &r);
 +		}
-+		return;
-+	}
-+
+ 		return;
+ 	}
+ 
+-	// Ensure IniParams are visible:
+-	CommandListFlushState(state);
 +	// Se loguea UNA vez por cada combinacion distinta de (id de shader, tamano de
 +	// RT), asi se ve exactamente CUALES de los 15 pases se estan corrigiendo, a que
 +	// resolucion, y con que near de camara — sin inundar el log.
@@ -3708,10 +4010,54 @@ index 6758d9f..d2f84ed 100644
 +				(int)g_triple_cam_valid);
 +		}
 +	}
-+
+ 
+-	Profiling::injected_draw_calls++;
 +	if (!g_triple_cam_valid)
 +		return;  // main camera not captured yet
-+
+ 
+-	switch (type) {
+-		case DrawCommandType::DRAW:
+-			eval_args(2, eargs, state);
+-			COMMAND_LIST_LOG(state, "[%S] Draw(%u, %u)\n", ini_section.c_str(), eargs[0], eargs[1]);
+-			mOrigContext1->Draw(eargs[0], eargs[1]);
+-			break;
+-		case DrawCommandType::DRAW_AUTO:
+-			COMMAND_LIST_LOG(state, "[%S] DrawAuto()\n", ini_section.c_str());
+-			mOrigContext1->DrawAuto();
+-			break;
+-		case DrawCommandType::DRAW_INDEXED:
+-			eval_args(3, eargs, state);
+-			COMMAND_LIST_LOG(state, "[%S] DrawIndexed(%u, %u, %i)\n", ini_section.c_str(), eargs[0], eargs[1], (INT)eargs[2]);
+-			mOrigContext1->DrawIndexed(eargs[0], eargs[1], (INT)eargs[2]);
+-			break;
+-		case DrawCommandType::DRAW_INDEXED_INSTANCED:
+-			eval_args(5, eargs, state);
+-			COMMAND_LIST_LOG(state, "[%S] DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
+-			mOrigContext1->DrawIndexedInstanced(eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
+-			break;
+-		case DrawCommandType::DRAW_INSTANCED:
+-			eval_args(4, eargs, state);
+-			COMMAND_LIST_LOG(state, "[%S] DrawInstanced(%u, %u, %u, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], eargs[3]);
+-			mOrigContext1->DrawInstanced(eargs[0], eargs[1], eargs[2], eargs[3]);
+-			break;
+-		case DrawCommandType::DISPATCH:
+-			eval_args(3, eargs, state);
+-			COMMAND_LIST_LOG(state, "[%S] Dispatch(%u, %u, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2]);
+-			mOrigContext1->Dispatch(eargs[0], eargs[1], eargs[2]);
+-			break;
+-		case DrawCommandType::DRAW_INDEXED_INSTANCED_INDIRECT:
+-			do_indirect_draw_call(state, "DrawIndexedInstancedIndirect", &ID3D11DeviceContext::DrawIndexedInstancedIndirect);
+-			break;
+-		case DrawCommandType::DRAW_INSTANCED_INDIRECT:
+-			do_indirect_draw_call(state, "DrawInstancedIndirect", &ID3D11DeviceContext::DrawInstancedIndirect);
+-			break;
+-		case DrawCommandType::DISPATCH_INDIRECT:
+-			do_indirect_draw_call(state, "DispatchIndirect", &ID3D11DeviceContext::DispatchIndirect);
+-			break;
+-		case DrawCommandType::FROM_CALLER:
+-			if (!info) {
+-				COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> NO ACTIVE DRAW CALL\n", ini_section.c_str());
+-				break;
 +	// v1.13: NADA de Get* aca. Los metodos Get* de ID3D11DeviceContext no son
 +	// fiables en contextos diferidos (DiRT usa 7) — fue la causa exacta del
 +	// desastre de v1.5b. Para restaurar usamos g_triple_orig_cb, una copia sin
@@ -3723,7 +4069,59 @@ index 6758d9f..d2f84ed 100644
 +		if (g_triple_cb_size != g_triple_cam_size) {
 +			for (int i = 0; i < 3; i++) {
 +				if (g_triple_region_cb[i]) { g_triple_region_cb[i]->Release(); g_triple_region_cb[i] = NULL; }
-+			}
+ 			}
+-			switch (info->type) {
+-				case DrawCall::DrawIndexedInstanced:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), info->IndexCount, info->InstanceCount, info->FirstIndex, info->FirstVertex, info->FirstInstance);
+-					mOrigContext1->DrawIndexedInstanced(info->IndexCount, info->InstanceCount, info->FirstIndex, info->FirstVertex, info->FirstInstance);
+-					break;
+-				case DrawCall::DrawInstanced:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawInstanced(%u, %u, %u, %u)\n", ini_section.c_str(), info->VertexCount, info->InstanceCount, info->FirstVertex, info->FirstInstance);
+-					mOrigContext1->DrawInstanced(info->VertexCount, info->InstanceCount, info->FirstVertex, info->FirstInstance);
+-					break;
+-				case DrawCall::DrawIndexed:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexed(%u, %u, %i)\n", ini_section.c_str(), info->IndexCount, info->FirstIndex, info->FirstVertex);
+-					mOrigContext1->DrawIndexed(info->IndexCount, info->FirstIndex, info->FirstVertex);
+-					break;
+-				case DrawCall::Draw:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> Draw(%u, %u)\n", ini_section.c_str(), info->VertexCount, info->FirstVertex);
+-					mOrigContext1->Draw(info->VertexCount, info->FirstVertex);
+-					break;
+-				case DrawCall::DrawInstancedIndirect:
+-					if (!info->indirect_buffer) {
+-						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DrawInstancedIndirect missing args\n");
+-						break;
+-					}
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawInstancedIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
+-					mOrigContext1->DrawInstancedIndirect(*info->indirect_buffer, info->args_offset);
+-					break;
+-				case DrawCall::DrawIndexedInstancedIndirect:
+-					if (!info->indirect_buffer) {
+-						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DrawIndexedInstancedIndirect missing args\n");
+-						break;
+-					}
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexedInstancedIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
+-					mOrigContext1->DrawIndexedInstancedIndirect(*info->indirect_buffer, info->args_offset);
+-					break;
+-				case DrawCall::DispatchIndirect:
+-					if (!info->indirect_buffer) {
+-						LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> DispatchIndirect missing args\n");
+-						break;
+-					}
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DispatchIndirect(0x%p, %u)\n", ini_section.c_str(), *info->indirect_buffer, info->args_offset);
+-					mOrigContext1->DispatchIndirect(*info->indirect_buffer, info->args_offset);
+-					break;
+-				case DrawCall::Dispatch:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> Dispatch(%u, %u, %u)\n", ini_section.c_str(), info->ThreadGroupCountX, info->ThreadGroupCountY, info->ThreadGroupCountZ);
+-					mOrigContext1->Dispatch(info->ThreadGroupCountX, info->ThreadGroupCountY, info->ThreadGroupCountZ);
+-					break;
+-				case DrawCall::DrawAuto:
+-					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawAuto()\n", ini_section.c_str());
+-					mOrigContext1->DrawAuto();
+-					break;
+-				default:
+-					LogOverlay(LOG_DIRE, "BUG: draw = from_caller -> unknown draw call type\n");
+-					break;
 +			if (g_triple_orig_cb) { g_triple_orig_cb->Release(); g_triple_orig_cb = NULL; }
 +			g_triple_cb_size = g_triple_cam_size;
 +
@@ -3802,7 +4200,28 @@ index 6758d9f..d2f84ed 100644
 +						Mi[0], Mi[1], Mi[2], Mi[3], Mii[0], Mii[1], Mii[2], Mii[3]);
 +					trdbg++;
 +				}
-+			}
+ 			}
+-			break;
+-		case DrawCommandType::AUTO_VERTEX_COUNT:
+-			auto_count = get_vertex_count_from_current_vb(mOrigContext1);
+-			COMMAND_LIST_LOG(state, "[%S] draw = auto -> Draw(%u, 0)\n", ini_section.c_str(), auto_count);
+-			if (auto_count)
+-				mOrigContext1->Draw(auto_count, 0);
+-			else
+-				COMMAND_LIST_LOG(state, "  Unable to determine vertex count\n");
+-			break;
+-		case DrawCommandType::AUTO_INDEX_COUNT:
+-			auto_count = get_index_count_from_current_ib(mOrigContext1);
+-			COMMAND_LIST_LOG(state, "[%S] drawindexed = auto -> DrawIndexed(%u, 0, 0)\n", ini_section.c_str(), auto_count);
+-			if (auto_count)
+-				mOrigContext1->DrawIndexed(auto_count, 0, 0);
+-			else
+-				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
+-			break;
+-		case DrawCommandType::AUTO_INDEX_INSTANCE_COUNT:
+-			if (!info) {
+-				COMMAND_LIST_LOG(state, "[%S] drawindexedinstanced = auto -> NO ACTIVE DRAW CALL\n", ini_section.c_str());
+-				break;
 +			g_triple_valid = ok_pg;
 +			g_triple_frame = G->frame_no;
 +		}
@@ -3831,11 +4250,19 @@ index 6758d9f..d2f84ed 100644
 +				LogInfo("TRIPLE fullscreen pass: rt=%.0fx%.0f region=%d scissor=%ld..%ld\n",
 +					rw, rh, region, r.left, r.right);
 +				trrt++;
-+			}
+ 			}
+-			auto_count = get_index_count_from_current_ib(mOrigContext1);
+-			COMMAND_LIST_LOG(state, "[%S] drawindexedinstanced = auto -> DrawIndexedInstanced(%u, %u, 0, 0, %u)\n", ini_section.c_str(), auto_count, info->InstanceCount, info->FirstInstance);
+-			if (auto_count)
+-				mOrigContext1->DrawIndexedInstanced(auto_count, info->InstanceCount, 0, 0, info->FirstInstance);
+-			else
+-				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
+-			break;
 +		}
-+	}
-+}
-+
+ 	}
+ }
+ 
+-void SkipCommand::run(CommandListState *state)
 +// ---- triple_params: texturas de IniParams pre-armadas por region ------------
 +// 4 juegos (region 0/1/2 y 3 = passthrough), POR CONTEXTO (thread_local, la
 +// leccion de los contextos diferidos). Se refrescan una vez por frame desde
@@ -3847,11 +4274,16 @@ index 6758d9f..d2f84ed 100644
 +static thread_local unsigned g_triple_par_frame = 0xFFFFFFFF;
 +
 +void TripleParamsCommand::run(CommandListState *state)
-+{
+ {
+-	COMMAND_LIST_LOG(state, "[%S] handling = skip\n", ini_section.c_str());
 +	ID3D11DeviceContext1 *ctx = state->mOrigContext1;
 +	ID3D11Device1 *dev = state->mOrigDevice1;
 +	UINT n = (UINT)G->iniParams.size();
-+
+ 
+-	if (state->call_info)
+-		state->call_info->skip = true;
+-	else
+-		COMMAND_LIST_LOG(state, "  No active draw call to skip\n");
 +	if (!n || G->IniParamsReg < 0)
 +		return;
 +
@@ -3923,10 +4355,14 @@ index 6758d9f..d2f84ed 100644
 +		ctx->VSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
 +		ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
 +	}
-+}
-+
+ }
+ 
+-void AbortCommand::run(CommandListState *state)
 +void TripleRestoreCommand::run(CommandListState *state)
-+{
+ {
+-	COMMAND_LIST_LOG(state, "[%S] handling = abort\n", ini_section.c_str());
+-
+-	state->aborted = true;
 +	// Rebind la copia INTACTA de la camara (mismo contenido que tenia el juego en
 +	// este frame). No usamos Get*/save por ser inseguro en contextos diferidos.
 +	if (g_triple_valid && g_triple_orig_cb) {
@@ -3946,13 +4382,113 @@ index 6758d9f..d2f84ed 100644
 +			state->mOrigContext1->RSSetScissorRects(1, &r);
 +		}
 +	}
-+}
-+
+ }
+ 
  PerDrawStereoOverrideCommand::PerDrawStereoOverrideCommand(bool restore_on_post) :
- 		staging_type(false),
- 		val(FLT_MAX),
+@@ -1875,7 +5800,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
+ 	bool found = false;
+ 	FILETIME timestamp;
+ 
+-	LogInfo("  %cs=%S\n", type, filename);
++	LogDebug("  %cs=%S\n", type, filename);
+ 
+ 	switch(type) {
+ 		case 'v':
+@@ -3176,7 +7101,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
+ 	if (!static_evaluate(&val, device))
+ 		return false;
+ 
+-	LogInfo("Statically evaluated %S as %f\n",
++	LogDebug("Statically evaluated %S as %f\n",
+ 		lookup_enum_name(ParamOverrideTypeNames, type), val);
+ 
+ 	type = ParamOverrideType::VALUE;
+@@ -3847,9 +7772,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
+ 		return making_progress;
+ 
+ 	// FIXME: Pretty print rather than dumping syntax tree
+-	LogInfoNoNL("Statically evaluated \"");
+-	_log_token(dynamic_cast<CommandListToken*>(this));
+-	LogInfo("\" as %f\n", static_val);
++	if (gLogDebug) {
++		LogInfoNoNL("Statically evaluated \"");
++		_log_token(dynamic_cast<CommandListToken*>(this));
++		LogInfo("\" as %f\n", static_val);
++	}
+ 	static_val_str = std::to_wstring(static_val);
+ 
+ 	operand = make_shared<CommandListOperand>(token_pos, static_val_str.c_str());
+@@ -4250,17 +8177,19 @@ static ResourceType* GetResourceFromPool(
+ 			return resource;
+ 		}
+ 
+-		LogInfo("Device mismatch, discarding %S from resource pool\n", ini_line->c_str());
++		LogInfo("Device mismatch, discarding cached resource from resource pool\n");
++		LogDebug("  %S\n", ini_line->c_str());
+ 		resource_pool->cache.erase(pool_i);
+ 		resource->Release();
+ 	}
+ 
+-	LogInfo("Creating cached resource %S\n", ini_line->c_str());
++	LogDebug("Creating cached resource %S\n", ini_line->c_str());
+ 	Profiling::resources_created++;
+ 
+ 	hr = (state->mOrigDevice1->*CreateResource)(desc, NULL, &resource);
+ 	if (FAILED(hr)) {
+-		LogInfo("Resource copy failed %S: 0x%x\n", ini_line->c_str(), hr);
++		LogInfo("Resource copy failed: 0x%x\n", hr);
++		LogDebug("  %S\n", ini_line->c_str());
+ 		LogResourceDesc(desc);
+ 		src_resource->GetDesc(&old_desc);
+ 		LogInfo("Original resource was:\n");
+@@ -4565,7 +8494,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
+ 
+ 	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)buffer;
+@@ -4592,7 +8521,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture1D(&desc, NULL, &tex1d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex1d;
+@@ -4618,7 +8547,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture2D(&desc, NULL, &tex2d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex2d;
+@@ -4644,7 +8573,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
+ 
+ 	hr = mOrigDevice1->CreateTexture3D(&desc, NULL, &tex3d);
+ 	if (SUCCEEDED(hr)) {
+-		LogInfo("Substantiated custom %S [%S], bind_flags=0x%03x\n",
++		LogDebug("Substantiated custom %S [%S], bind_flags=0x%03x\n",
+ 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
+ 		LogDebugResourceDesc(&desc);
+ 		resource = (ID3D11Resource*)tex3d;
+@@ -5107,7 +9036,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
+ 	// TODO: Option to discard individual resources instead of transfer
+ 	// TODO: Option to discard all custom resources and re-run [Constants]
+ 	//       on new device (for convoluted startup sequences)
+-	LogInfo("Device mismatch, transferring [%S] to new device\n", name.c_str());
++	LogInfo("Device mismatch, transferring custom resource to new device\n");
++	LogDebug("  [%S]\n", name.c_str());
+ 	new_resource = inter_device_resource_transfer(
+ 			mOrigDevice1, mOrigContext1, resource, &name);
+ 
 diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
-index 142cbbf..bb6a192 100644
+index 142cbbf4..bb6a192c 100644
 --- a/DirectX11/CommandList.h
 +++ b/DirectX11/CommandList.h
 @@ -26,6 +26,17 @@ class HackerContext;
@@ -4066,7 +4602,7 @@ index 142cbbf..bb6a192 100644
  enum class CustomResourceType {
  	INVALID,
 diff --git a/DirectX11/D3D11Wrapper.cpp b/DirectX11/D3D11Wrapper.cpp
-index 9829f2b..eb2dec7 100644
+index 9829f2b1..eb2dec7e 100644
 --- a/DirectX11/D3D11Wrapper.cpp
 +++ b/DirectX11/D3D11Wrapper.cpp
 @@ -6,6 +6,10 @@
@@ -4201,7 +4737,7 @@ index 9829f2b..eb2dec7 100644
  // the reference as a normal ID3D11Device.
  // In the no platform_update case, the mOrigDevice1 will actually be an ID3D11Device.
 diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
-index a0a8d70..8cf88b3 100644
+index a0a8d701..8cf88b36 100644
 --- a/DirectX11/HackerContext.cpp
 +++ b/DirectX11/HackerContext.cpp
 @@ -14,6 +14,11 @@
@@ -5829,7 +6365,7 @@ index a0a8d70..8cf88b3 100644
  	BeforeDraw(c);
  
 diff --git a/DirectX11/HackerContext.h b/DirectX11/HackerContext.h
-index 33c26e1..7ae1a9d 100644
+index 33c26e18..7ae1a9d4 100644
 --- a/DirectX11/HackerContext.h
 +++ b/DirectX11/HackerContext.h
 @@ -119,6 +119,11 @@ private:
@@ -5860,7 +6396,7 @@ index 33c26e1..7ae1a9d 100644
  	UINT64 mCurrentHullShader;
  	UINT64 mCurrentDomainShader;
 diff --git a/DirectX11/HackerDXGI.cpp b/DirectX11/HackerDXGI.cpp
-index 82cfd09..1f8cbbe 100644
+index 82cfd092..1f8cbbe7 100644
 --- a/DirectX11/HackerDXGI.cpp
 +++ b/DirectX11/HackerDXGI.cpp
 @@ -539,6 +539,8 @@ STDMETHODIMP HackerSwapChain::GetDevice(
@@ -5885,9 +6421,18 @@ index 82cfd09..1f8cbbe 100644
  			Profiling::end(&profiling_state, &Profiling::present_overhead);
  	}
 diff --git a/DirectX11/Hunting.cpp b/DirectX11/Hunting.cpp
-index b1c7861..f92d054 100644
+index b1c7861d..b424f5d1 100644
 --- a/DirectX11/Hunting.cpp
 +++ b/DirectX11/Hunting.cpp
+@@ -544,7 +544,7 @@ STDMETHODIMP MigotoIncludeHandler::Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFi
+ 	// #include <3dmigoto.h>
+ 	switch (IncludeType) {
+ 		case D3D_INCLUDE_LOCAL:
+-			LogInfo("      #include \"%s\"\n", apath.c_str());
++			LogDebug("      #include \"%s\"\n", apath.c_str()); // TrueTriple: eco del ini, solo con debug=1
+ 			break;
+ 		case D3D_INCLUDE_SYSTEM:
+ 		default:
 @@ -1235,6 +1235,8 @@ static void RevertMissingShaders()
  		// the processed flag so that any updated patterns in the ini
  		// will be [re]applied:
@@ -5898,10 +6443,10 @@ index b1c7861..f92d054 100644
  }
  
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983..337a57c 100644
+index 2c88983b..7d975597 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
-@@ -19,12 +19,18 @@
+@@ -19,12 +19,25 @@
  #include "cursor.h"
  
  #include "shellscalingapi.h"
@@ -5919,12 +6464,46 @@ index 2c88983..337a57c 100644
 -// TODO: Remove this #define after we switch to C++17 and remove 'experimental'
 -#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
 -#include <experimental/filesystem>
++
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
 +// NOTE: <experimental/filesystem> was removed in the VS2026 (v145) toolset.
 +// The experimental namespace was unused here, so the include was dropped.
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -846,6 +852,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
+@@ -464,7 +477,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
+ 	}
+ 
+ 	if (!ret)
+-		LogInfo("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
++		LogDebug("        condition = false, skipping \"%S\"\n", ini_namespace->c_str());
+ 
+ 	return !!ret;
+ }
+@@ -474,7 +487,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+ 	size_t first, last, delim;
+ 	wstring key, val;
+ 
+-	LogInfo("      %S\n", wline->c_str());
++	LogDebug("      %S\n", wline->c_str());
+ 
+ 	// Key / Val pair
+ 	delim = wline->find(L"=");
+@@ -491,7 +504,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+ 		}
+ 
+ 		if (!_wcsicmp(key.c_str(), L"namespace")) {
+-			LogInfo("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
++			LogDebug("        Renaming namespace \"%S\" -> \"%S\"\n", ini_namespace->c_str(), val.c_str());
+ 			*ini_namespace = val;
+ 			return true;
+ 		}
+@@ -846,6 +859,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
  	return _GetIniSection(&ini_sections, key_vals, section);
  }
  
@@ -5965,7 +6544,104 @@ index 2c88983..337a57c 100644
  // This emulates the behaviour of the old GetPrivateProfileString API to
  // facilitate switching to our own ini parser. Later we might consider changing
  // the return values (e.g. return found/not found instead of string length),
-@@ -1276,6 +1316,14 @@ static void ParseIncludedIniFiles()
+@@ -951,7 +998,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 	int rc = GetIniString(section, key, def, ret, size);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%S\n", key, ret);
++		LogDebug("  %S=%S\n", key, ret);
+ 
+ 	return rc;
+ }
+@@ -961,7 +1008,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+ 	bool rc = GetIniString(section, key, def, ret);
+ 
+ 	if (rc)
+-		LogInfo("  %S=%s\n", key, ret->c_str());
++		LogDebug("  %S=%s\n", key, ret->c_str());
+ 
+ 	return rc;
+ }
+@@ -983,7 +1030,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%f\n", key, ret);
++			LogDebug("  %S=%f\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1008,7 +1055,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%d\n", key, ret);
++			LogDebug("  %S=%d\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1025,13 +1072,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
+ 
+ 	if (GetIniString(section, key, 0, val, 32)) {
+ 		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
+-			LogInfo("  %S=1\n", key);
++			LogDebug("  %S=1\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return true;
+ 		}
+ 		if (!_wcsicmp(val, L"0") || !_wcsicmp(val, L"false") || !_wcsicmp(val, L"no") || !_wcsicmp(val, L"off")) {
+-			LogInfo("  %S=0\n", key);
++			LogDebug("  %S=0\n", key);
+ 			if (found)
+ 				*found = true;
+ 			return false;
+@@ -1060,7 +1107,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%016llx\n", key, ret);
++			LogDebug("  %S=%016llx\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1083,7 +1130,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
+ 		} else {
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%x\n", key, ret);
++			LogDebug("  %S=%x\n", key, ret);
+ 		}
+ 	}
+ 
+@@ -1127,7 +1174,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
+ 			ret = ParseEnum(val, prefix, names, names_len, first);
+ 			if (found)
+ 				*found = true;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} catch (EnumParseError) {
+ 			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
+ 		}
+@@ -1155,7 +1202,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%S\n", key, val);
++			LogDebug("  %S=%S\n", key, val);
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%S\n", key, val);
+ 		}
+@@ -1188,7 +1235,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+ 		if (tmp_found) {
+ 			if (found)
+ 				*found = tmp_found;
+-			LogInfo("  %S=%s\n", key, val.c_str());
++			LogDebug("  %S=%s\n", key, val.c_str());
+ 		} else {
+ 			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
+ 		}
+@@ -1276,6 +1323,14 @@ static void ParseIncludedIniFiles()
  	// ini_sections data structure:
  	GetUserConfigPath(migoto_path);
  
@@ -5980,7 +6656,25 @@ index 2c88983..337a57c 100644
  	// Do this before removing [Include] from ini_sections. TODO: Allow
  	// recursively included files to modify the exclude mid-recursion:
  	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
-@@ -1334,9 +1382,17 @@ static void ParseIncludedIniFiles()
+@@ -1296,7 +1351,7 @@ static void ParseIncludedIniFiles()
+ 
+ 		for (i = include_sections.begin(); i != include_sections.end(); i++) {
+ 			section_id = i->first.c_str();
+-			LogInfo("[%S]\n", section_id);
++			LogDebug("[%S]\n", section_id);
+ 
+ 			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
+ 
+@@ -1304,7 +1359,7 @@ static void ParseIncludedIniFiles()
+ 			for (entry = section->begin(); entry < section->end(); entry++) {
+ 				key = &entry->first;
+ 				val = &entry->second;
+-				LogInfo("  %S=%S\n", key->c_str(), val->c_str());
++				LogDebug("  %S=%S\n", key->c_str(), val->c_str());
+ 
+ 				rel_path = namespace_path + *val;
+ 
+@@ -1334,9 +1389,17 @@ static void ParseIncludedIniFiles()
  
  	free_globbing_vector(exclude);
  
@@ -5999,7 +6693,7 @@ index 2c88983..337a57c 100644
  	if (attrib != INVALID_FILE_ATTRIBUTES)
  		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
  }
-@@ -1345,7 +1401,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1408,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -6008,7 +6702,16 @@ index 2c88983..337a57c 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1370,12 +1426,29 @@ static void RegisterPresetKeyBindings()
+@@ -1356,7 +1419,7 @@ static void RegisterPresetKeyBindings()
+ 	for (i = lower; i != upper; i++) {
+ 		const wchar_t *id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		keys = GetIniStringMultipleKeys(id, L"Key");
+ 		back = GetIniStringMultipleKeys(id, L"Back");
+@@ -1370,12 +1433,29 @@ static void RegisterPresetKeyBindings()
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
  
@@ -6039,7 +6742,7 @@ index 2c88983..337a57c 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1456,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1463,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -6048,7 +6751,188 @@ index 2c88983..337a57c 100644
  	}
  }
  
-@@ -4092,7 +4165,21 @@ void LoadConfigFile()
+@@ -1418,7 +1498,7 @@ static void ParsePresetOverrideSections()
+ 		const wchar_t *id = i->first.c_str();
+ 		preset = &i->second;
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		// Read parameters from ini
+ 		preset->ParseIniSection(id);
+@@ -1756,7 +1836,7 @@ static void ParseResourceSections()
+ 	lower = ini_sections.lower_bound(wstring(L"Resource"));
+ 	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
+ 	for (i = lower; i != upper; i++) {
+-		LogInfoW(L"[%s]\n", i->first.c_str());
++		LogDebugW(L"[%s]\n", i->first.c_str());
+ 
+ 		// Convert section name to lower case so our keys will be
+ 		// consistent in the unordered_map:
+@@ -1803,7 +1883,7 @@ static void ParseResourceSections()
+ 			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
+ 				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
+ 			} else {
+-				LogInfo("  format=%s\n", TexFormatStr(custom_resource->override_format));
++				LogDebug("  format=%s\n", TexFormatStr(custom_resource->override_format));
+ 			}
+ 		}
+ 
+@@ -1959,7 +2039,7 @@ static void ParseCommandList(const wchar_t *id,
+ 		}
+ 
+ 		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
+-			LogInfo("  %S\n", raw_line->c_str());
++			LogDebug("  %S\n", raw_line->c_str());
+ 			continue;
+ 		}
+ 
+@@ -2113,9 +2193,9 @@ static void ParseConstantsSection()
+ 			persistent_variables.emplace_back(&inserted.first->second);
+ 
+ 		if (val->empty())
+-			LogInfo("  global %S\n", name.c_str());
++			LogDebug("  global %S\n", name.c_str());
+ 		else
+-			LogInfo("  global %S=%f\n", name.c_str(), fval);
++			LogDebug("  global %S=%f\n", name.c_str(), fval);
+ 
+ 		// Remove this line from the ini section data structures so the
+ 		// command list won't consider it in the 2nd pass:
+@@ -2266,7 +2346,7 @@ static void ParseShaderOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
+@@ -2411,7 +2491,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		pattern.append(aline);
+ 	}
+ 
+@@ -2420,9 +2500,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+ 	// stripped, so that if there is a problem the user can see exactly
+ 	// what we used. This will look ugly, but will make errors like missing
+ 	// \n or \s+ easier to spot.
+-	LogInfo("--------- final pcre2 regex pattern used after ini parsing ---------\n");
+-	LogInfo("%s\n", pattern.c_str());
+-	LogInfo("--------------------------------------------------------------------\n");
++	LogDebug("--------- final pcre2 regex pattern used after ini parsing ---------\n");
++	LogDebug("%s\n", pattern.c_str());
++	LogDebug("--------------------------------------------------------------------\n");
+ 
+ 	regex_pattern = &regex_group->patterns[*pattern_id];
+ 	if (!regex_pattern->compile(&pattern))
+@@ -2456,7 +2536,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		regex_group->declarations.push_back(aline);
+ 	}
+ 
+@@ -2486,16 +2566,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
+ 		// job for another day
+ 		wline = &entry->raw_line;
+ 		aline = std::string(wline->begin(), wline->end());
+-		LogInfo("  %s\n", aline.c_str());
++		LogDebug("  %s\n", aline.c_str());
+ 		regex_pattern->replace.append(aline);
+ 	}
+ 
+ 	// Similar to above we want to see the final substitution string after
+ 	// ini parsing, especially to help spot missing newlines. TODO: Add an
+ 	// option to automatically add newlines after every ini line.
+-	LogInfo("--------- final pcre2 replace string used after ini parsing ---------\n");
+-	LogInfo("%s\n", regex_pattern->replace.c_str());
+-	LogInfo("---------------------------------------------------------------------\n");
++	LogDebug("--------- final pcre2 replace string used after ini parsing ---------\n");
++	LogDebug("%s\n", regex_pattern->replace.c_str());
++	LogDebug("---------------------------------------------------------------------\n");
+ 
+ 	regex_pattern->do_replace = true;
+ 	return true;
+@@ -2561,7 +2641,7 @@ static void ParseShaderRegexSections()
+ 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
+ 	for (i = lower; i != upper; i++) {
+ 		section_id = &i->first;
+-		LogInfo("[%S]\n", section_id->c_str());
++		LogDebug("[%S]\n", section_id->c_str());
+ 
+ 		hash = hash_ini_section(hash, section_id);
+ 
+@@ -2859,7 +2939,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
+ 		{
+ 			if (id[j] <= 0) break;
+ 			override->iterations.push_back(id[j]);
+-			LogInfo("  Iteration=%d\n", id[j]);
++			LogDebug("  Iteration=%d\n", id[j]);
+ 		}
+ 	}
+ 
+@@ -2925,7 +3005,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 	if (!setting.size() || !setting.compare(L"0")) {
+ 		*val = 0;
+ 		*mask = 0xffffffff;
+-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 		return true;
+ 	}
+ 
+@@ -2934,7 +3014,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 	if (ret != 0 && ret != EOF && (len1 == setting.length() || len2 == setting.length())) {
+ 		if (ret == 2)
+ 			*mask = 0xffffffff;
+-		LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++		LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 		return true;
+ 	}
+ 
+@@ -2976,7 +3056,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+ 
+ 	if (!use_mask)
+ 		*mask = 0xffffffff;
+-	LogInfo("    Using: 0x%08x / 0x%08x\n", *val, *mask);
++	LogDebug("    Using: 0x%08x / 0x%08x\n", *val, *mask);
+ 
+ 	return true;
+ }
+@@ -3124,7 +3204,7 @@ static void ParseTextureOverrideSections()
+ 	for (i = lower; i != upper; i++) {
+ 		id = i->first.c_str();
+ 
+-		LogInfo("[%S]\n", id);
++		LogDebug("[%S]\n", id);
+ 
+ 		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
+ 		if (!found) {
+@@ -3845,7 +3925,7 @@ static void ParseCustomShaderSections()
+ 
+ 		// FIXME: This will be logged in lower case. It would be better
+ 		// to use the original case, but not a big deal:
+-		LogInfoW(L"[%s]\n", shader_id->c_str());
++		LogDebugW(L"[%s]\n", shader_id->c_str());
+ 
+ 		failed = false;
+ 
+@@ -3943,7 +4023,7 @@ static void ParseExplicitCommandListSections()
+ 
+ 		// FIXME: This will be logged in lower case. It would be better
+ 		// to use the original case, but not a big deal:
+-		LogInfoW(L"[%s]\n", section_id->c_str());
++		LogDebugW(L"[%s]\n", section_id->c_str());
+ 		ParseCommandList(section_id->c_str(), &command_list_section->command_list, &command_list_section->post_command_list, NULL);
+ 	}
+ }
+@@ -4092,7 +4172,21 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -6071,7 +6955,7 @@ index 2c88983..337a57c 100644
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4478,6 +4565,21 @@ void SavePersistentSettings()
+@@ -4478,6 +4572,21 @@ void SavePersistentSettings()
  {
  	FILE *f;
  
@@ -6093,7 +6977,7 @@ index 2c88983..337a57c 100644
  	if (!G->user_config_dirty)
  		return;
  	G->user_config_dirty = 0;
-@@ -4513,6 +4615,9 @@ static void WipeUserConfig()
+@@ -4513,6 +4622,9 @@ static void WipeUserConfig()
  	G->gWipeUserConfig = false;
  	G->user_config_dirty = 0;
  
@@ -6103,9 +6987,9 @@ index 2c88983..337a57c 100644
  	DeleteFile(G->user_config.c_str());
  }
  
-diff --git a/b/DirectX11/OrthoFrustumProbe.h b/DirectX11/OrthoFrustumProbe.h
+diff --git a/DirectX11/OrthoFrustumProbe.h b/DirectX11/OrthoFrustumProbe.h
 new file mode 100644
-index 0000000..a263b4c
+index 00000000..a263b4c6
 --- /dev/null
 +++ b/DirectX11/OrthoFrustumProbe.h
 @@ -0,0 +1,56 @@
@@ -6166,7 +7050,7 @@ index 0000000..a263b4c
 +    return true;
 +}
 diff --git a/DirectX11/Overlay.cpp b/DirectX11/Overlay.cpp
-index 994124c..828e0a1 100644
+index 994124cd..828e0a14 100644
 --- a/DirectX11/Overlay.cpp
 +++ b/DirectX11/Overlay.cpp
 @@ -4,6 +4,7 @@
@@ -7773,7 +8657,7 @@ index 994124c..828e0a1 100644
  		mSpriteBatch->End();
  	}
 diff --git a/DirectX11/Overlay.h b/DirectX11/Overlay.h
-index e261940..fbb5bea 100644
+index e2619402..fbb5beab 100644
 --- a/DirectX11/Overlay.h
 +++ b/DirectX11/Overlay.h
 @@ -103,6 +103,16 @@ private:
@@ -7793,9 +8677,108 @@ index e261940..fbb5bea 100644
  	void DrawRectangle(float x, float y, float w, float h, float r, float g, float b, float opacity);
  	void DrawOutlinedString(DirectX::SpriteFont *font, wchar_t const *text, DirectX::XMFLOAT2 const &position, DirectX::FXMVECTOR color);
  
-diff --git a/b/DirectX11/TrueTripleCmaaLock.cpp b/DirectX11/TrueTripleCmaaLock.cpp
+diff --git a/DirectX11/Override.cpp b/DirectX11/Override.cpp
+index 1496adf0..1e0c09fa 100644
+--- a/DirectX11/Override.cpp
++++ b/DirectX11/Override.cpp
+@@ -9,6 +9,12 @@
+ #include <strsafe.h>
+ #include <algorithm>
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ PresetOverrideMap presetOverrides;
+ 
+ OverrideTransition CurrentTransition;
+@@ -149,7 +155,7 @@ struct KeyOverrideCycleParam
+ 	void log(const wchar_t *name)
+ 	{
+ 		if (!cur.empty())
+-			LogInfoNoNL(" %S=%s", name, cur.c_str());
++			LogDebugNoNL(" %S=%s", name, cur.c_str());
+ 	}
+ 
+ 	float as_float(float default)
+@@ -313,7 +319,7 @@ void KeyOverrideCycle::ParseIniSection(LPCWSTR section)
+ 		if (!not_done)
+ 			break;
+ 
+-		LogInfoNoNL("  Cycle %i:", i);
++		LogDebugNoNL("  Cycle %i:", i);
+ 		params.clear();
+ 		for (j = param_bufs.begin(); j != param_bufs.end(); j++) {
+ 			val = j->second.as_float(FLT_MAX);
+@@ -343,7 +349,7 @@ void KeyOverrideCycle::ParseIniSection(LPCWSTR section)
+ 		release_transition_type.log(L"release_transition_type");
+ 		condition.log(L"condition");
+ 		run.log(L"run");
+-		LogInfo("\n");
++		LogDebug("\n");
+ 
+ 		presets.push_back(KeyOverride(KeyOverrideType::CYCLE, &params, &vars,
+ 			separation.as_float(FLT_MAX), convergence.as_float(FLT_MAX),
+@@ -628,7 +634,7 @@ static void _ScheduleTransition(struct OverrideTransitionParam *transition,
+ 		char *name, float current, float val, ULONGLONG now, int time,
+ 		TransitionType transition_type)
+ {
+-	LogInfoNoNL(" %s: %#.2g -> %#.2g", name, current, val);
++	LogDebugNoNL(" %s: %#.2g -> %#.2g", name, current, val);
+ 	transition->start = current;
+ 	transition->target = val;
+ 	transition->activation_time = now;
+@@ -640,7 +646,7 @@ static void _ScheduleTransition(struct OverrideTransitionParam *transition,
+ 		const wchar_t *name, float current, float val, ULONGLONG now, int time,
+ 		TransitionType transition_type)
+ {
+-	LogInfoNoNL(" %S: %#.2g -> %#.2g", name, current, val);
++	LogDebugNoNL(" %S: %#.2g -> %#.2g", name, current, val);
+ 	transition->start = current;
+ 	transition->target = val;
+ 	transition->activation_time = now;
+diff --git a/DirectX11/ShaderRegex.cpp b/DirectX11/ShaderRegex.cpp
+index a40077a8..7ca46faf 100644
+--- a/DirectX11/ShaderRegex.cpp
++++ b/DirectX11/ShaderRegex.cpp
+@@ -6,6 +6,12 @@
+ #include <algorithm>
+ #include <iterator>
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ ShaderRegexGroups shader_regex_groups;
+ std::vector<ShaderRegexGroup*> shader_regex_group_index;
+ uint32_t shader_regex_hash;
+@@ -532,7 +538,8 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
+ 			goto out;
+ 		group = shader_regex_group_index[match_ids[i]];
+ 
+-		LogInfo("ShaderRegexCache: %S %016I64x matches [%S]\n", shader_type, hash, group->ini_section.c_str());
++		LogInfo("ShaderRegexCache: %S %016I64x matches\n", shader_type, hash);
++		LogDebug("  [%S]\n", group->ini_section.c_str());
+ 
+ 		if (header->patched && tagline)
+ 			tagline->append(std::wstring(L"[") + group->ini_section + std::wstring(L"]"));
+@@ -672,7 +679,8 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
+ 		if (!match)
+ 			continue;
+ 
+-		LogInfo("ShaderRegex: %s %016I64x matches [%S]\n", shader_model->c_str(), hash, group->ini_section.c_str());
++		LogInfo("ShaderRegex: %s %016I64x matches\n", shader_model->c_str(), hash);
++		LogDebug("  [%S]\n", group->ini_section.c_str());
+ 		patched = patched || patch;
+ 		match_ids.push_back(j);
+ 
+diff --git a/DirectX11/TrueTripleCmaaLock.cpp b/DirectX11/TrueTripleCmaaLock.cpp
 new file mode 100644
-index 0000000..f475c45
+index 00000000..f475c45f
 --- /dev/null
 +++ b/DirectX11/TrueTripleCmaaLock.cpp
 @@ -0,0 +1,246 @@
@@ -8045,9 +9028,9 @@ index 0000000..f475c45
 +	}
 +}
 +}
-diff --git a/b/DirectX11/TrueTripleCmaaLock.h b/DirectX11/TrueTripleCmaaLock.h
+diff --git a/DirectX11/TrueTripleCmaaLock.h b/DirectX11/TrueTripleCmaaLock.h
 new file mode 100644
-index 0000000..0cfd83f
+index 00000000..0cfd83fa
 --- /dev/null
 +++ b/DirectX11/TrueTripleCmaaLock.h
 @@ -0,0 +1,30 @@
@@ -8081,9 +9064,9 @@ index 0000000..0cfd83f
 +Result Remove();
 +const wchar_t *Describe(Result result);
 +}
-diff --git a/b/DirectX11/TrueTripleHudLayout.h b/DirectX11/TrueTripleHudLayout.h
+diff --git a/DirectX11/TrueTripleHudLayout.h b/DirectX11/TrueTripleHudLayout.h
 new file mode 100644
-index 0000000..e479219
+index 00000000..e4792193
 --- /dev/null
 +++ b/DirectX11/TrueTripleHudLayout.h
 @@ -0,0 +1,118 @@
@@ -8205,9 +9188,9 @@ index 0000000..e479219
 +    return flushed;
 +}
 +}
-diff --git a/b/DirectX11/TrueTripleMarca.h b/DirectX11/TrueTripleMarca.h
+diff --git a/DirectX11/TrueTripleMarca.h b/DirectX11/TrueTripleMarca.h
 new file mode 100644
-index 0000000..5a2e152
+index 00000000..5a2e1520
 --- /dev/null
 +++ b/DirectX11/TrueTripleMarca.h
 @@ -0,0 +1,190 @@
@@ -8401,9 +9384,9 @@ index 0000000..5a2e152
 +}
 +
 +} // namespace truetriple
-diff --git a/b/DirectX11/TrueTripleShadowFit.h b/DirectX11/TrueTripleShadowFit.h
+diff --git a/DirectX11/TrueTripleShadowFit.h b/DirectX11/TrueTripleShadowFit.h
 new file mode 100644
-index 0000000..9af0a86
+index 00000000..9af0a867
 --- /dev/null
 +++ b/DirectX11/TrueTripleShadowFit.h
 @@ -0,0 +1,144 @@
@@ -8551,9 +9534,9 @@ index 0000000..9af0a86
 +    return flushed;
 +}
 +}
-diff --git a/b/DirectX11/TrueTripleShadowTrace.h b/DirectX11/TrueTripleShadowTrace.h
+diff --git a/DirectX11/TrueTripleShadowTrace.h b/DirectX11/TrueTripleShadowTrace.h
 new file mode 100644
-index 0000000..a10aee4
+index 00000000..a10aee4d
 --- /dev/null
 +++ b/DirectX11/TrueTripleShadowTrace.h
 @@ -0,0 +1,230 @@
@@ -8787,9 +9770,9 @@ index 0000000..a10aee4
 +    void Clear() { for (auto& b : cb) b.Reset(); memset(first, 0, sizeof(first)); memset(count, 0, sizeof(count)); }
 +};
 +}
-diff --git a/b/DirectX11/TrueTripleTaaLock.cpp b/DirectX11/TrueTripleTaaLock.cpp
+diff --git a/DirectX11/TrueTripleTaaLock.cpp b/DirectX11/TrueTripleTaaLock.cpp
 new file mode 100644
-index 0000000..32fd295
+index 00000000..32fd2951
 --- /dev/null
 +++ b/DirectX11/TrueTripleTaaLock.cpp
 @@ -0,0 +1,222 @@
@@ -9015,9 +9998,9 @@ index 0000000..32fd295
 +	}
 +}
 +}
-diff --git a/b/DirectX11/TrueTripleTaaLock.h b/DirectX11/TrueTripleTaaLock.h
+diff --git a/DirectX11/TrueTripleTaaLock.h b/DirectX11/TrueTripleTaaLock.h
 new file mode 100644
-index 0000000..872fcd1
+index 00000000..872fcd16
 --- /dev/null
 +++ b/DirectX11/TrueTripleTaaLock.h
 @@ -0,0 +1,30 @@
@@ -9051,9 +10034,9 @@ index 0000000..872fcd1
 +Result Remove();
 +const wchar_t *Describe(Result result);
 +}
-diff --git a/b/DirectX11/VisibilityProbe.h b/DirectX11/VisibilityProbe.h
+diff --git a/DirectX11/VisibilityProbe.h b/DirectX11/VisibilityProbe.h
 new file mode 100644
-index 0000000..dd11733
+index 00000000..dd11733c
 --- /dev/null
 +++ b/DirectX11/VisibilityProbe.h
 @@ -0,0 +1,166 @@
@@ -9223,8 +10206,34 @@ index 0000000..dd11733
 +        InterlockedCompareExchange(&untracked, 0, 0), (void *)ctx, mode);
 +}
 +} // namespace
+diff --git a/DirectX11/input.cpp b/DirectX11/input.cpp
+index 20bc6533..d89a4f97 100644
+--- a/DirectX11/input.cpp
++++ b/DirectX11/input.cpp
+@@ -10,6 +10,12 @@
+ #include "vkeys.h"
+ #include "IniHandler.h"
+ 
++// TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
++// (clave=valor, nombres de seccion, teclas, variables, cuerpos de ShaderRegex,
++// lineas de command list) va con LogDebug y no con LogInfo: con [Logging]
++// calls=1 y debug=0 (produccion) el log no trae el ini; con debug=1 sale todo
++// igual que siempre. Avisos y errores no cambian.
++
+ // Set a function pointer to the xinput get state call. By default, set it to
+ // XInputGetState() in whichever xinput we are linked to (xinput9_1_0.dll). If
+ // the d3dx.ini is using the guide button we will try to switch to either
+@@ -464,7 +470,7 @@ void RegisterKeyBinding(LPCWSTR iniKey, const wchar_t *keyName,
+ 	else
+ 		action = new InputAction(button, listener);
+ 
+-	LogInfoW(L"  %s=%s\n", iniKey, keyName);
++	LogDebugW(L"  %s=%s\n", iniKey, keyName);
+ 	actions.push_back(action);
+ }
+ 
 diff --git a/DirectX11/profiling.cpp b/DirectX11/profiling.cpp
-index 1e28262..56c46fc 100644
+index 1e282627..56c46fc5 100644
 --- a/DirectX11/profiling.cpp
 +++ b/DirectX11/profiling.cpp
 @@ -434,6 +434,13 @@ void Profiling::update_txt()
