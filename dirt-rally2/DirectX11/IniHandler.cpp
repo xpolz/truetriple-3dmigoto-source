@@ -20,6 +20,7 @@
 
 #include "shellscalingapi.h"
 #include "TrueTripleMarca.h"
+#include "TrueTripleReposo.h"
 
 // TrueTriple: la decision de la marca de sesion, tomada UNA vez por proceso en
 // LoadConfigFile (-1 = todavia no, 0 = reposo, 1 = sesion). Vive aca arriba
@@ -27,6 +28,10 @@
 // WipeUserConfig: en reposo d3dx_user.ini no se lee, no se guarda y no se
 // borra (truetriple::SesionUsaUserConfig, 11/11/2026).
 static int tt_sesion = -1;
+// El motivo de esa decision (truetriple::MarcaMotivo) y el detalle que arma el
+// verificador de la marca firmada (v2, 16/11/2026), para la linea del log.
+static const char *tt_motivo = "";
+static char tt_detalle[truetriple::kMarcaDetalleMax] = "";
 
 #include <filesystem>
 
@@ -4178,12 +4183,22 @@ void LoadConfigFile()
 	// decision vale tambien para la recarga (ReloadConfig vuelve a pasar por
 	// aca), asi que una recarga no habilita el mod a mitad de partida ni lo
 	// apaga si la marca vence mientras se juega.
-	if (tt_sesion < 0)
-		tt_sesion = truetriple::MarcaDeSesionValida(L"dr2", time(NULL)) ? 1 : 0;
+	//
+	// Desde el 16/11/2026 la marca va FIRMADA (v2: ed25519 y atada a la PC).
+	// MarcaVerificarLocal devuelve el estado y el log deja el motivo del reposo
+	// y un detalle corto. El texto "TrueTriple: sin sesion" queda literal y
+	// seguido: lo buscan los scripts de build y el plugin en el binario.
+	if (tt_sesion < 0) {
+		const truetriple::MarcaEstado tt_estado = truetriple::MarcaVerificarLocal(
+			"dr2", (long long)time(NULL), tt_detalle, sizeof(tt_detalle));
+		tt_motivo = truetriple::MarcaMotivo(tt_estado);
+		tt_sesion = (tt_estado == truetriple::kMarcaOk) ? 1 : 0;
+	}
 	if (tt_sesion) {
+		LogInfo("TrueTriple: sesion abierta (%s)\n", tt_motivo);
 		ParseIniFile(iniFile);
 	} else {
-		LogInfo("TrueTriple: sin sesion, el mod queda en reposo\n");
+		LogInfo("TrueTriple: sin sesion (%s), el mod queda en reposo [%s]\n", tt_motivo, tt_detalle);
 		ini_sections.clear();
 		ParseIniExcerpt(truetriple::kIniReposo);
 	}

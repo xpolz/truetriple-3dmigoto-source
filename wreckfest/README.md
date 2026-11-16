@@ -2,13 +2,14 @@
 
 Fuente modificada de 3Dmigoto del mod TrueTriple para **Wreckfest** (ejecutable de 64 bits, `Wreckfest_x64.exe`).
 
-- `d3d11.dll` (x64), SHA-256 `d74a6908d6a2abb06eae6f45db8bcc76115273971816baf848b10d2c5cb19bb4`.
-- Fuente exacta: etiqueta `wreckfest-dll-d74a6908`.
-- Paquete del launcher 0.2.10 (16/11/2026) en adelante: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB. `nvapi64.dll` distribuido: `e56391badc1c3c283f40509d70bdfefb918caeac9f1a48c2b9aa9ea13a34e33d` (sin cambios desde la app suelta).
+- `d3d11.dll` (x64), SHA-256 `3dd73520a1484f2e2333c2a4dbe7068a145b562a64c1aa8bb6301df6e61c7fad`.
+- Fuente exacta: etiqueta `wreckfest-dll-3dd73520`.
+- Paquete del launcher 0.2.11 (16/11/2026) en adelante: la marca de sesión va firmada (`TrueTripleMarca.h` v2 verifica una firma ed25519 con la clave pública que trae adentro; `TrueTripleReposo.h` es nuevo; `IniHandler.cpp` deja en el log el motivo del reposo). Desde la `d74a6908` el eco del `d3dx.ini` al log va con `LogDebug` y la dll no lleva la ruta del PDB. `nvapi64.dll` distribuido: `e56391badc1c3c283f40509d70bdfefb918caeac9f1a48c2b9aa9ea13a34e33d` (sin cambios desde la app suelta).
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `d74a6908…9bb4` | paquete del launcher 0.2.10 en adelante | etiqueta `wreckfest-dll-d74a6908` |
+| `3dd73520…7fad` | paquete del launcher 0.2.11 en adelante (marca de sesión firmada: `TrueTripleMarca.h` v2 y `TrueTripleReposo.h`) | etiqueta `wreckfest-dll-3dd73520` |
+| `d74a6908…9bb4` | paquete del launcher 0.2.10 | etiqueta `wreckfest-dll-d74a6908` |
 | `881ad15d…c8b5` | paquetes del launcher 0.2.3 a 0.2.9 | etiqueta `wreckfest-dll-881ad15d` |
 | `63b42a12…fa6d` | paquete del launcher 0.2.2 | etiqueta `wreckfest-dll-63b42a12` |
 | `0a987102…1fd4` | paquete del launcher 0.2.1 | etiqueta `wreckfest-dll-0a987102` |

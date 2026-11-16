@@ -51,3 +51,15 @@ cuerpos de ShaderRegex, líneas de command list, "Optimised out", "Statically ev
 "Creating cached resource"). Con `debug=0` el log conserva versión, avisos y errores; con
 `debug=1` sale todo. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
 `1065e51aa92d3645bd27ec33d5f1442d244f62260f4268d863d1000b769def0b`; `nvapi.dll`: `3daebb8d871718421ad1f9900fddc9d1801f860b52c4ef40e101220a42c35490`. Etiqueta `dr1-dll-1065e51a`.
+
+## dll `314b989e` (16/11/2026): la marca de sesión va firmada
+
+`TrueTripleMarca.h` pasa a la versión 2: la marca `%LOCALAPPDATA%\TrueTriple\sesion-dr1.json`
+lleva una firma ed25519 y la huella de la PC, y la cabecera las verifica con la clave pública
+que trae adentro (ed25519, SHA-512 y SHA-256 de TweetNaCl, de dominio público), además de la
+frescura de siempre. `TrueTripleReposo.h` (nuevo en esta carpeta) recibe el ini de reposo
+embebido y `SesionUsaUserConfig`, que estaban en la cabecera anterior. `IniHandler.cpp`: el
+punto de lectura llama a `truetriple::MarcaVerificarLocal("dr1", ...)` y el log dice el
+motivo del reposo (`TrueTriple: sin sesion (<motivo>), el mod queda en reposo [<detalle>]`) o
+`TrueTriple: sesion abierta (ok)`. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
+`314b989ef17c7f5c0f0fb33174eaff1ea46575130ff6cae0de85600bafb95dcb`; `nvapi.dll`: `8ee053b2bab6dd9e38660047a1c1456163214c3cd49e1106253946def09c6d09`. Etiqueta `dr1-dll-314b989e`.

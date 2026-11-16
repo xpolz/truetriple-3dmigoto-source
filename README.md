@@ -13,9 +13,9 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.11 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `ed02623fc5e7b499b504603f58432c7181e6e2ac09b353b782e5150990dff951` | etiqueta `dr2-dll-ed02623f` (anteriores en la tabla de abajo) |
-| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.11 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `1065e51aa92d3645bd27ec33d5f1442d244f62260f4268d863d1000b769def0b` | etiqueta `dr1-dll-1065e51a` (anteriores en la tabla de abajo) |
-| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.10 (dll del 16/11/2026: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB) | `d74a6908d6a2abb06eae6f45db8bcc76115273971816baf848b10d2c5cb19bb4` | etiqueta `wreckfest-dll-d74a6908` (anteriores en [`wreckfest/README.md`](wreckfest/README.md)) |
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.12 (dll del 16/11/2026 con la marca de sesión firmada: `TrueTripleMarca.h` v2 verifica una firma ed25519 y `TrueTripleReposo.h` es nuevo) | `4836ed0a1ae88be91a8c7b35846adc95c598f8e46ed7b6edd83d63386b280daf` | etiqueta `dr2-dll-4836ed0a` (anteriores en la tabla de abajo) |
+| [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.12 (dll del 16/11/2026 con la marca de sesión firmada: `TrueTripleMarca.h` v2 verifica una firma ed25519 y `TrueTripleReposo.h` es nuevo) | `314b989ef17c7f5c0f0fb33174eaff1ea46575130ff6cae0de85600bafb95dcb` | etiqueta `dr1-dll-314b989e` (anteriores en la tabla de abajo) |
+| [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.11 (dll del 16/11/2026 con la marca de sesión firmada: `TrueTripleMarca.h` v2 verifica una firma ed25519 y `TrueTripleReposo.h` es nuevo) | `3dd73520a1484f2e2333c2a4dbe7068a145b562a64c1aa8bb6301df6e61c7fad` | etiqueta `wreckfest-dll-3dd73520` (anteriores en [`wreckfest/README.md`](wreckfest/README.md)) |
 
 **La fuente exacta de cada dll que se distribuyó** es una etiqueta de este repo; `main`
 avanza con lo que va a compilar la próxima dll. Todas las dll de DiRT Rally 2.0 entregadas
@@ -23,7 +23,8 @@ hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `ed02623f…f951` | paquete del launcher 1.9.11 (16/11/2026) en adelante: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (`IniHandler.cpp`, `CommandList.cpp`, `Hunting.cpp` y, nuevos acá, `Override.cpp`, `input.cpp` y `ShaderRegex.cpp`); `nvapi64.dll` `d11b8848…5acf` | etiqueta `dr2-dll-ed02623f` |
+| `4836ed0a…0daf` | paquete del launcher 1.9.12 (16/11/2026) en adelante: marca de sesión firmada (`TrueTripleMarca.h` v2, `TrueTripleReposo.h` nuevo e `IniHandler.cpp`); `nvapi64.dll` `cc7746c4…72a8` | etiqueta `dr2-dll-4836ed0a` |
+| `ed02623f…f951` | paquete del launcher 1.9.11 (16/11/2026): el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (`IniHandler.cpp`, `CommandList.cpp`, `Hunting.cpp` y, nuevos acá, `Override.cpp`, `input.cpp` y `ShaderRegex.cpp`); `nvapi64.dll` `d11b8848…5acf` | etiqueta `dr2-dll-ed02623f` |
 | `eb261ec8…d145` | paquetes del launcher 1.9.2 a 1.9.10 (11/11/2026): con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi64.dll` `7d7eeefa…fe75` | etiqueta `dr2-dll-eb261ec8` |
 | `854516be…7b02` | paquete del launcher 1.9.1 (11/11/2026): en reposo no lee ni guarda `d3dx_user.ini` (antes lo vaciaba al salir y borraba los presets de asiento); `nvapi64.dll` `e7ddc8e1…9321` | etiqueta `dr2-dll-854516be` |
 | `486d34f7…f9cb` | paquetes del launcher 1.8.9 a 1.9.0 (10/11/2026): marca de sesión (`TrueTripleMarca.h`); `nvapi64.dll` `dc4b96a8…5f46` | etiqueta `dr2-dll-486d34f7` |
@@ -35,7 +36,8 @@ Todas las dll de DiRT Rally (DR1, x86) entregadas hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `1065e51a…ef0b` | paquete del launcher 1.7.11 (16/11/2026) en adelante: el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (lo que faltaba: `CommandList.cpp`, `Override.cpp`, `input.cpp`, `ShaderRegex.cpp` y el resto de `IniHandler.cpp`); `nvapi.dll` `3daebb8d…5490` | etiqueta `dr1-dll-1065e51a` |
+| `314b989e…5dcb` | paquete del launcher 1.7.12 (16/11/2026) en adelante: marca de sesión firmada (`TrueTripleMarca.h` v2, `TrueTripleReposo.h` nuevo e `IniHandler.cpp`); `nvapi.dll` `8ee053b2…6d09` | etiqueta `dr1-dll-314b989e` |
+| `1065e51a…ef0b` | paquete del launcher 1.7.11 (16/11/2026): el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (lo que faltaba: `CommandList.cpp`, `Override.cpp`, `input.cpp`, `ShaderRegex.cpp` y el resto de `IniHandler.cpp`); `nvapi.dll` `3daebb8d…5490` | etiqueta `dr1-dll-1065e51a` |
 | `165accf8…66a7` | paquetes del launcher 1.7.3 a 1.7.10 (11/11/2026): con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `ef4b3fd1…8b72` | etiqueta `dr1-dll-165accf8` |
 | `3b15cb3e…c725` | paquete del launcher 1.7.2 (11/11/2026): en reposo no lee ni guarda `d3dx_user.ini`; `nvapi.dll` `9f437cf7…9766` | etiqueta `dr1-dll-3b15cb3e` |
 | `f7c969bc…239b` | paquete del launcher 1.7.1 (10/11/2026): fuera el diagnóstico de la niebla retirada; `nvapi.dll` `18bd4d54…af32` | etiqueta `dr1-dll-f7c969bc` |
@@ -140,3 +142,14 @@ los `[Key]`, cuerpos de ShaderRegex, líneas de command list, "Optimised out", "
 evaluated", "Creating cached resource") pasó de `LogInfo` a `LogDebug`. Con `[Logging] calls=1`
 y `debug=0` el log conserva la versión, los avisos y los errores; con `debug=1` sale todo como en
 3Dmigoto original.
+
+## La marca de sesión firmada (16/11/2026)
+
+Desde las dll `4836ed0a` (DR2), `314b989e` (DR1) y `3dd73520` (Wreckfest), `TrueTripleMarca.h`
+es la versión 2: la marca de sesión va firmada con ed25519 y atada a la PC. La cabecera trae
+el verificador entero (ed25519, SHA-512 y SHA-256 de TweetNaCl, de dominio público) y la clave
+**pública**; el dll compara además la huella de la PC y la frescura, y deja en el log el motivo
+cuando queda en reposo (`TrueTriple: sin sesion (<motivo>), ...`). `TrueTripleReposo.h` (nuevo)
+lleva el ini de reposo embebido, que antes estaba en la misma cabecera. Todo eso es parte de la
+fuente GPL publicada acá. La clave privada con que la app firma no es parte del dll ni de esta
+fuente: con lo publicado acá se compila un dll idéntico en comportamiento al distribuido.
