@@ -13,7 +13,7 @@ están: son programas o datos aparte que no se enlazan con 3Dmigoto.
 
 | Carpeta | Juego | Versión del mod | SHA-256 del `d3d11.dll` distribuido | Fuente exacta |
 |---|---|---|---|---|
-| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.14, canal de prueba (dll del 18/11/2026: con un solo monitor captura la cámara con el aspecto de la pantalla) | `076f6282abebaa34aca12398b2823e84d7a932767ea0b58e18c037dcc9c6ea3e` | etiqueta `dr2-dll-076f6282` (anteriores en la tabla de abajo) |
+| [`dirt-rally2/`](dirt-rally2/) | DiRT Rally 2.0 | paquete del launcher 1.9.16 (dll del 18/11/2026: con un solo monitor captura la cámara con el aspecto de la pantalla) | `076f6282abebaa34aca12398b2823e84d7a932767ea0b58e18c037dcc9c6ea3e` | etiqueta `dr2-dll-076f6282` (anteriores en la tabla de abajo) |
 | [`dirt-rally1/`](dirt-rally1/) | DiRT Rally (x86) | paquete del launcher 1.7.12 (dll del 16/11/2026 con la marca de sesión firmada: `TrueTripleMarca.h` v2 verifica una firma ed25519 y `TrueTripleReposo.h` es nuevo) | `314b989ef17c7f5c0f0fb33174eaff1ea46575130ff6cae0de85600bafb95dcb` | etiqueta `dr1-dll-314b989e` (anteriores en la tabla de abajo) |
 | [`wreckfest/`](wreckfest/) | Wreckfest | paquete del launcher 0.2.11 (dll del 16/11/2026 con la marca de sesión firmada: `TrueTripleMarca.h` v2 verifica una firma ed25519 y `TrueTripleReposo.h` es nuevo) | `3dd73520a1484f2e2333c2a4dbe7068a145b562a64c1aa8bb6301df6e61c7fad` | etiqueta `wreckfest-dll-3dd73520` (anteriores en [`wreckfest/README.md`](wreckfest/README.md)) |
 
@@ -23,7 +23,7 @@ hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
-| `076f6282…ea3e` | paquete del launcher 1.9.14 (18/11/2026, canal de prueba): con un solo monitor (`$mono = 1`) la cámara principal se captura con el aspecto de la pantalla (`CommandList.cpp`); `nvapi64.dll` `ae4218ef…6b96` | etiqueta `dr2-dll-076f6282` |
+| `076f6282…ea3e` | paquete del launcher 1.9.14 (18/11/2026, canal de prueba) y 1.9.16 en adelante (estable): con un solo monitor (`$mono = 1`) la cámara principal se captura con el aspecto de la pantalla (`CommandList.cpp`); `nvapi64.dll` `ae4218ef…6b96` | etiqueta `dr2-dll-076f6282` |
 | `4836ed0a…0daf` | paquetes del launcher 1.9.12 a 1.9.13 (16/11/2026): marca de sesión firmada (`TrueTripleMarca.h` v2, `TrueTripleReposo.h` nuevo e `IniHandler.cpp`); `nvapi64.dll` `cc7746c4…72a8` | etiqueta `dr2-dll-4836ed0a` |
 | `ed02623f…f951` | paquete del launcher 1.9.11 (16/11/2026): el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (`IniHandler.cpp`, `CommandList.cpp`, `Hunting.cpp` y, nuevos acá, `Override.cpp`, `input.cpp` y `ShaderRegex.cpp`); `nvapi64.dll` `d11b8848…5acf` | etiqueta `dr2-dll-ed02623f` |
 | `eb261ec8…d145` | paquetes del launcher 1.9.2 a 1.9.10 (11/11/2026): con sesión pero sin variables persist en el ini, no lee ni guarda `d3dx_user.ini`; `nvapi64.dll` `7d7eeefa…fe75` | etiqueta `dr2-dll-eb261ec8` |
