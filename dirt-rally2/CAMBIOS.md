@@ -75,3 +75,12 @@ punto de lectura llama a `truetriple::MarcaVerificarLocal("dr2", ...)` y el log 
 motivo del reposo (`TrueTriple: sin sesion (<motivo>), el mod queda en reposo [<detalle>]`) o
 `TrueTriple: sesion abierta (ok)`. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
 `4836ed0a1ae88be91a8c7b35846adc95c598f8e46ed7b6edd83d63386b280daf`; `nvapi64.dll`: `cc7746c4787dde26ac3e5608c223adca5f1dfddf030ab97da63957400b7272a8`. Etiqueta `dr2-dll-4836ed0a`.
+
+## dll `076f6282` (18/11/2026): un solo monitor captura la cámara
+
+`CommandList.cpp`, `TripleCaptureCameraCB`: con `$mono = 1` (opción "Un solo monitor") la
+cámara principal es la que tiene el aspecto de la pantalla (ancho/alto del swapchain, con 3%
+de margen) en vez del aspecto de triple (3.6 a 12). Sin eso no se capturaba ninguna cámara
+con un monitor: el estabilizador no recibía cabeceo, rolido ni altura y los pases de pantalla
+completa no se corregían. Con `$mono = 0` el comportamiento es el de antes. Compilada con
+`LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll: `076f6282abebaa34aca12398b2823e84d7a932767ea0b58e18c037dcc9c6ea3e`; `nvapi64.dll`: `ae4218ef417a2ae3fd15069a0415d44c60d50827416852e870c6e841799e6b96`. Etiqueta `dr2-dll-076f6282`.

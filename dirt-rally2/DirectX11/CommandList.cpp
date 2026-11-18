@@ -4336,7 +4336,29 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 	// Ahora cubre de 3x 5:4 (3.75) a 3x 32:9 (10.67) con margen. El piso 3.6
 	// sigue excluyendo los espejos del juego, que son 768x256 = 3.0 exacto, y
 	// el envmap, que es 1.0.
-	if (f[51] < 0.5f && aspect > 3.6f && aspect < 12.0f) {
+	//
+	// MONITOR SIMPLE (plantilla 77, arreglo del 18/11/2026). Con `$mono = 1`
+	// el juego dibuja con el aspecto de UN monitor (16:9 da 1.78) y el gate
+	// del triple no dejaba pasar NINGUNA camara: sin captura no se publicaban
+	// el cabeceo, el rolido ni la altura (fila 9), asi que el estabilizador
+	// recibia siempre lo mismo y la camara quedaba clavada al auto; tampoco
+	// x9 ("se vio una camara de conduccion"), y el agua y las particulas
+	// quedaban sin el asiento ni el campo del resto del mundo. Juan lo vio en
+	// pista: "la estabilizacion no funciona, la camara esta fija al auto".
+	// En mono la camara principal es la que tiene el aspecto de la PANTALLA
+	// (ancho/alto del swapchain), con 3% de margen. Los espejos (3.0) y el
+	// envmap (1.0) siguen afuera salvo una pantalla de ese mismo aspecto, y
+	// la lista negra de abajo sigue filtrando el frontend como en el triple.
+	// Con `$mono = 0` el gate es el de siempre, bit a bit.
+	bool es_principal = aspect > 3.6f && aspect < 12.0f;
+	if (TripleReadIniGlobal(L"$mono").fval > 0.5f) {
+		float rw = (float)G->mResolutionInfo.width;
+		float rh = (float)G->mResolutionInfo.height;
+		float esperado = (rh >= 1.0f) ? rw / rh : 0.0f;
+		es_principal = esperado > 0.5f &&
+			aspect > esperado * 0.97f && aspect < esperado * 1.03f;
+	}
+	if (f[51] < 0.5f && es_principal) {
 		memcpy(g_triple_cam_buf, data, size);
 		g_triple_cam_size = size;
 		g_triple_cam_valid = true;

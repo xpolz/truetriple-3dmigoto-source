@@ -1,5 +1,5 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f1..6362a66b 100644
+index 6758d9f1..206f8731 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
 @@ -17,8 +17,20 @@
@@ -133,7 +133,7 @@ index 6758d9f1..6362a66b 100644
  	if (!wcscmp(key, L"clear"))
  		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -1117,232 +1216,4058 @@ static UINT get_vertex_count_from_current_vb(ID3D11DeviceContext* mOrigContext1)
+@@ -1117,232 +1216,4080 @@ static UINT get_vertex_count_from_current_vb(ID3D11DeviceContext* mOrigContext1)
  	return (desc.ByteWidth - offset) / stride;
  }
  
@@ -3258,7 +3258,29 @@ index 6758d9f1..6362a66b 100644
 +	// Ahora cubre de 3x 5:4 (3.75) a 3x 32:9 (10.67) con margen. El piso 3.6
 +	// sigue excluyendo los espejos del juego, que son 768x256 = 3.0 exacto, y
 +	// el envmap, que es 1.0.
-+	if (f[51] < 0.5f && aspect > 3.6f && aspect < 12.0f) {
++	//
++	// MONITOR SIMPLE (plantilla 77, arreglo del 18/11/2026). Con `$mono = 1`
++	// el juego dibuja con el aspecto de UN monitor (16:9 da 1.78) y el gate
++	// del triple no dejaba pasar NINGUNA camara: sin captura no se publicaban
++	// el cabeceo, el rolido ni la altura (fila 9), asi que el estabilizador
++	// recibia siempre lo mismo y la camara quedaba clavada al auto; tampoco
++	// x9 ("se vio una camara de conduccion"), y el agua y las particulas
++	// quedaban sin el asiento ni el campo del resto del mundo. Juan lo vio en
++	// pista: "la estabilizacion no funciona, la camara esta fija al auto".
++	// En mono la camara principal es la que tiene el aspecto de la PANTALLA
++	// (ancho/alto del swapchain), con 3% de margen. Los espejos (3.0) y el
++	// envmap (1.0) siguen afuera salvo una pantalla de ese mismo aspecto, y
++	// la lista negra de abajo sigue filtrando el frontend como en el triple.
++	// Con `$mono = 0` el gate es el de siempre, bit a bit.
++	bool es_principal = aspect > 3.6f && aspect < 12.0f;
++	if (TripleReadIniGlobal(L"$mono").fval > 0.5f) {
++		float rw = (float)G->mResolutionInfo.width;
++		float rh = (float)G->mResolutionInfo.height;
++		float esperado = (rh >= 1.0f) ? rw / rh : 0.0f;
++		es_principal = esperado > 0.5f &&
++			aspect > esperado * 0.97f && aspect < esperado * 1.03f;
++	}
++	if (f[51] < 0.5f && es_principal) {
 +		memcpy(g_triple_cam_buf, data, size);
 +		g_triple_cam_size = size;
 +		g_triple_cam_valid = true;
@@ -4385,7 +4407,7 @@ index 6758d9f1..6362a66b 100644
  }
  
  PerDrawStereoOverrideCommand::PerDrawStereoOverrideCommand(bool restore_on_post) :
-@@ -1875,7 +5800,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
+@@ -1875,7 +5822,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
  	bool found = false;
  	FILETIME timestamp;
  
@@ -4394,7 +4416,7 @@ index 6758d9f1..6362a66b 100644
  
  	switch(type) {
  		case 'v':
-@@ -3176,7 +7101,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
+@@ -3176,7 +7123,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
  	if (!static_evaluate(&val, device))
  		return false;
  
@@ -4403,7 +4425,7 @@ index 6758d9f1..6362a66b 100644
  		lookup_enum_name(ParamOverrideTypeNames, type), val);
  
  	type = ParamOverrideType::VALUE;
-@@ -3847,9 +7772,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
+@@ -3847,9 +7794,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
  		return making_progress;
  
  	// FIXME: Pretty print rather than dumping syntax tree
@@ -4418,7 +4440,7 @@ index 6758d9f1..6362a66b 100644
  	static_val_str = std::to_wstring(static_val);
  
  	operand = make_shared<CommandListOperand>(token_pos, static_val_str.c_str());
-@@ -4250,17 +8177,19 @@ static ResourceType* GetResourceFromPool(
+@@ -4250,17 +8199,19 @@ static ResourceType* GetResourceFromPool(
  			return resource;
  		}
  
@@ -4441,7 +4463,7 @@ index 6758d9f1..6362a66b 100644
  		LogResourceDesc(desc);
  		src_resource->GetDesc(&old_desc);
  		LogInfo("Original resource was:\n");
-@@ -4565,7 +8494,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
+@@ -4565,7 +8516,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
  
  	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
  	if (SUCCEEDED(hr)) {
@@ -4450,7 +4472,7 @@ index 6758d9f1..6362a66b 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)buffer;
-@@ -4592,7 +8521,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
+@@ -4592,7 +8543,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture1D(&desc, NULL, &tex1d);
  	if (SUCCEEDED(hr)) {
@@ -4459,7 +4481,7 @@ index 6758d9f1..6362a66b 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex1d;
-@@ -4618,7 +8547,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
+@@ -4618,7 +8569,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture2D(&desc, NULL, &tex2d);
  	if (SUCCEEDED(hr)) {
@@ -4468,7 +4490,7 @@ index 6758d9f1..6362a66b 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex2d;
-@@ -4644,7 +8573,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
+@@ -4644,7 +8595,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture3D(&desc, NULL, &tex3d);
  	if (SUCCEEDED(hr)) {
@@ -4477,7 +4499,7 @@ index 6758d9f1..6362a66b 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex3d;
-@@ -5107,7 +9036,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
+@@ -5107,7 +9058,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
  	// TODO: Option to discard individual resources instead of transfer
  	// TODO: Option to discard all custom resources and re-run [Constants]
  	//       on new device (for convoluted startup sequences)
