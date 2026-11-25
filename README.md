@@ -23,6 +23,7 @@ hasta hoy:
 
 | SHA-256 del `d3d11.dll` | Con qué se entregó | Fuente exacta |
 |---|---|---|
+| `fc84c6e3…4c46` | versión de prueba de DR2 sobre la 1.9.18 (25/11/2026, canal de prueba): tres opciones de rendimiento que se prenden desde la app y una línea de medición cada 10 s; la fuente está solo en la etiqueta (rama `prueba/dr2-amd-casillas`), `dirt-rally2/` de `main` sigue siendo la de la estable; `nvapi64.dll` sin cambios (`ae4218ef…6b96`) | etiqueta `dr2-dll-fc84c6e3` |
 | `076f6282…ea3e` | paquete del launcher 1.9.14 (18/11/2026, canal de prueba) y 1.9.16 en adelante (estable): con un solo monitor (`$mono = 1`) la cámara principal se captura con el aspecto de la pantalla (`CommandList.cpp`); `nvapi64.dll` `ae4218ef…6b96` | etiqueta `dr2-dll-076f6282` |
 | `4836ed0a…0daf` | paquetes del launcher 1.9.12 a 1.9.13 (16/11/2026): marca de sesión firmada (`TrueTripleMarca.h` v2, `TrueTripleReposo.h` nuevo e `IniHandler.cpp`); `nvapi64.dll` `cc7746c4…72a8` | etiqueta `dr2-dll-4836ed0a` |
 | `ed02623f…f951` | paquete del launcher 1.9.11 (16/11/2026): el eco del `d3dx.ini` al log va con `LogDebug`, y la dll ya no lleva la ruta del PDB (`IniHandler.cpp`, `CommandList.cpp`, `Hunting.cpp` y, nuevos acá, `Override.cpp`, `input.cpp` y `ShaderRegex.cpp`); `nvapi64.dll` `d11b8848…5acf` | etiqueta `dr2-dll-ed02623f` |
