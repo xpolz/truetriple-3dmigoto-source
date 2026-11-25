@@ -1,8 +1,17 @@
 diff --git a/DirectX11/CommandList.cpp b/DirectX11/CommandList.cpp
-index 6758d9f1..206f8731 100644
+index 6758d9f1..9440bafb 100644
 --- a/DirectX11/CommandList.cpp
 +++ b/DirectX11/CommandList.cpp
-@@ -17,8 +17,20 @@
+@@ -3,6 +3,8 @@
+ #include "lock.h"
+ 
+ #include "CommandList.h"
++#include "TrueTripleDiag.h"
++#include "TrueTriplePrueba.h"
+ 
+ #include <DDSTextureLoader.h>
+ #include <WICTextureLoader.h>
+@@ -17,8 +19,20 @@
  #include "profiling.h"
  #include "Hunting.h"
  #include "cursor.h"
@@ -23,12 +32,96 @@ index 6758d9f1..206f8731 100644
  
  CustomResources customResources;
  CustomShaders customShaders;
-@@ -30,6 +42,46 @@ std::unordered_set<CommandList*> command_lists_profiling;
+@@ -30,6 +44,134 @@ std::unordered_set<CommandList*> command_lists_profiling;
  std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
  std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
  
++// ---- Variables del ini leidas UNA vez por cuadro (diag/dr2-amd-map-unmap) ----
++//
++// TripleReadIniGlobal toma el candado global de 3Dmigoto (G->mCriticalSection)
++// y arma un std::wstring (malloc) para buscar en el mapa. Se llamaba varias
++// veces por cada Map de un constant buffer de 256 a 320 bytes, en los 7 hilos
++// de dibujo del juego, aunque F7 tuviera el triple apagado. Las variables de
++// esta lista son ajustes de la partida (las cambian la app, las teclas o el
++// [Present]), no cosas que el ini cambie en el medio de un cuadro: se copian
++// una vez por cuadro, la primera vez que alguien las pide, y el resto del
++// cuadro se leen sin candado. Cualquier otro nombre sigue por el camino de
++// siempre. TripleWriteIniGlobal actualiza tambien la copia.
++static const wchar_t *const kTtCacheNombres[] = {
++	L"$cull_widen", L"$mono", L"$replay_auto_off", L"$replay_force",
++	L"$en_replay", L"$shadow_practice014", L"$cull_site", L"$cull_hfov",
++};
++#define TT_CACHE_N ((int)(sizeof(kTtCacheNombres) / sizeof(kTtCacheNombres[0])))
++// bit 33 = cargado, bit 32 = existe, bits 0-31 = el float.
++static volatile LONG64 g_tt_cache_val[TT_CACHE_N];
++static volatile LONG g_tt_cache_cuadro = -1;
++
++static int tt_cache_indice(const wchar_t *name)
++{
++	if (!name || name[0] != L'$')
++		return -1;
++	for (int i = 0; i < TT_CACHE_N; i++)
++		if (name == kTtCacheNombres[i] || wcscmp(name, kTtCacheNombres[i]) == 0)
++			return i;
++	return -1;
++}
++
++static LONG64 tt_cache_empacar(bool found, float v)
++{
++	UINT32 bits = 0;
++	memcpy(&bits, &v, sizeof(bits));
++	return (1LL << 33) | (found ? (1LL << 32) : 0) | (LONG64)bits;
++}
++
++// Con el candado tomado.
++static void tt_cache_llenar()
++{
++	static const std::wstring *claves = NULL;
++	if (!claves) {
++		std::wstring *c = new std::wstring[TT_CACHE_N];
++		for (int i = 0; i < TT_CACHE_N; i++)
++			c[i] = kTtCacheNombres[i];
++		claves = c;
++	}
++	for (int i = 0; i < TT_CACHE_N; i++) {
++		auto it = command_list_globals.find(claves[i]);
++		bool found = it != command_list_globals.end();
++		InterlockedExchange64(&g_tt_cache_val[i], tt_cache_empacar(found, found ? it->second.fval : 0.0f));
++	}
++}
++
++static void tt_cache_refrescar_si_toca()
++{
++	LONG cuadro = (LONG)G->frame_no;
++	LONG antes = g_tt_cache_cuadro;
++	if (antes == cuadro)
++		return;
++	// Un solo hilo refresca por cuadro; los demas siguen con la copia anterior.
++	if (InterlockedCompareExchange(&g_tt_cache_cuadro, cuadro, antes) != antes)
++		return;
++	EnterCriticalSectionPretty(&G->mCriticalSection);
++	tt_cache_llenar();
++	LeaveCriticalSection(&G->mCriticalSection);
++}
++
 +TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
 +{
++	// Version de prueba: la copia por cuadro solo con la casilla LIVIANO; sin
++	// ella, cada lectura toma el candado como en la estable.
++	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
++	if (i >= 0) {
++		tt_cache_refrescar_si_toca();
++		LONG64 v = g_tt_cache_val[i];
++		if (v & (1LL << 33)) {
++			TripleIniSnapshot c = { (v & (1LL << 32)) != 0, fallback };
++			if (c.found) {
++				UINT32 bits = (UINT32)(v & 0xFFFFFFFFLL);
++				memcpy(&c.fval, &bits, sizeof(bits));
++			}
++			return c;
++		}
++	}
++	ttdiag::Sumar(ttdiag::INI_CANDADO, 1);
 +	EnterCriticalSectionPretty(&G->mCriticalSection);
 +	auto it = command_list_globals.find(name);
 +	TripleIniSnapshot value = { it != command_list_globals.end(), fallback };
@@ -39,9 +132,13 @@ index 6758d9f1..206f8731 100644
 +
 +void TripleWriteIniGlobal(const wchar_t *name, float value)
 +{
++	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
 +	EnterCriticalSectionPretty(&G->mCriticalSection);
 +	auto it = command_list_globals.find(name);
-+	if (it != command_list_globals.end()) it->second.fval = value;
++	bool found = it != command_list_globals.end();
++	if (found) it->second.fval = value;
++	if (i >= 0 && (g_tt_cache_val[i] & (1LL << 33)))
++		InterlockedExchange64(&g_tt_cache_val[i], tt_cache_empacar(found, found ? value : 0.0f));
 +	LeaveCriticalSection(&G->mCriticalSection);
 +}
 +
@@ -70,7 +167,7 @@ index 6758d9f1..206f8731 100644
  
  // Adds consistent "3DMigoto" prefix to frame analysis log with appropriate
  // level of indentation for the current recursion level. Using a
-@@ -288,7 +340,7 @@ void optimise_command_lists(HackerDevice *device)
+@@ -288,7 +430,7 @@ void optimise_command_lists(HackerDevice *device)
  		for (CommandList *command_list : registered_command_lists) {
  			for (i = 0; i < command_list->commands.size(); ) {
  				if (command_list->commands[i]->noop(command_list->post, ignore_cto_pre, ignore_cto_post)) {
@@ -79,7 +176,7 @@ index 6758d9f1..206f8731 100644
  							command_list->post ? "post" : "pre",
  							command_list->commands[i]->ini_line.c_str());
  					command_list->commands.erase(command_list->commands.begin() + i);
-@@ -926,6 +978,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
+@@ -926,6 +1068,53 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
  	if (!wcscmp(key, L"reset_per_frame_limits"))
  		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
@@ -133,52 +230,14 @@ index 6758d9f1..206f8731 100644
  	if (!wcscmp(key, L"clear"))
  		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
  
-@@ -1117,232 +1216,4080 @@ static UINT get_vertex_count_from_current_vb(ID3D11DeviceContext* mOrigContext1)
- 	return (desc.ByteWidth - offset) / stride;
- }
+@@ -1158,191 +1347,4075 @@ void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
+ 	if (view)
+ 		view->Release();
  
--static UINT get_index_count_from_current_ib(ID3D11DeviceContext *mOrigContext1)
-+static UINT get_index_count_from_current_ib(ID3D11DeviceContext *mOrigContext1)
-+{
-+	ID3D11Buffer *ib;
-+	D3D11_BUFFER_DESC desc;
-+	DXGI_FORMAT format;
-+	UINT offset;
-+
-+	mOrigContext1->IAGetIndexBuffer(&ib, &format, &offset);
-+	if (!ib)
-+		return 0;
-+
-+	ib->GetDesc(&desc);
-+	ib->Release();
-+
-+	switch(format) {
-+		case DXGI_FORMAT_R16_UINT:
-+			return (desc.ByteWidth - offset) / 2;
-+		case DXGI_FORMAT_R32_UINT:
-+			return (desc.ByteWidth - offset) / 4;
-+	}
-+
-+	return 0;
-+}
-+
-+void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
-+		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
-+		ID3D11Buffer *pBufferForArgs,
-+		UINT AlignedByteOffsetForArgs))
-+{
-+	ID3D11Resource *resource = NULL;
-+	ID3D11View *view = NULL;
-+	UINT stride = 0;
-+	UINT offset = 0;
-+	UINT buf_size = 0;
-+	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-+	UINT arg = (UINT)args[0].evaluate(state);
-+
-+	resource = indirect_buffer.GetResource(state, &view, &stride, &offset, &format, NULL);
-+	if (view)
-+		view->Release();
-+
+-	if (!resource) {
+-		COMMAND_LIST_LOG(state, "[%S] %s(%p, %u) -> INDIRECT BUFFER IS NULL\n",
+-				ini_section.c_str(), name, resource, arg);
+-		return;
 +	if (!resource) {
 +		COMMAND_LIST_LOG(state, "[%S] %s(%p, %u) -> INDIRECT BUFFER IS NULL\n",
 +				ini_section.c_str(), name, resource, arg);
@@ -3232,14 +3291,31 @@ index 6758d9f1..206f8731 100644
 +	// Se actualiza antes de filtrar el buffer: el estado pertenece al renderer,
 +	// no a una camara concreta. [Present] lo recibe en `$en_replay` y lo usa en
 +	// el frame siguiente; los caminos C++ de culling leen el flag inmediatamente.
-+	tt_replay_update();
-+	TTVisibilityProbe::tick();
++	//
++	// diag/dr2-amd-map-unmap: esto corria en CADA constant buffer de 256 a 320
++	// bytes que el juego escribe (cientos o miles por cuadro, en 7 hilos), con
++	// varias lecturas del ini por llamada. Son cosas de una vez por cuadro: el
++	// detector de replay, el latido de la sonda de visibilidad, instalar los
++	// ganchos de culling si el ini los pide y el reporte cada 2 s. Ahora las
++	// hace el primer hilo que llega en cada cuadro.
++	{
++		static volatile LONG s_prologo_cuadro = -1;
++		LONG cuadro = (LONG)G->frame_no;
++		LONG antes = s_prologo_cuadro;
++		// Version de prueba: una vez por cuadro solo con LIVIANO; sin la
++		// casilla corre en cada constant buffer, como en la estable.
++		if (!ttprueba::Activa(ttprueba::LIVIANO) || (antes != cuadro &&
++		    InterlockedCompareExchange(&s_prologo_cuadro, cuadro, antes) == antes)) {
++			tt_replay_update();
++			TTVisibilityProbe::tick();
 +
-+	// 2026-09-05: relay de call sites, instalado SOLO si $cull_widen trae el bit 16 o 32
-+	// (con 0 no se toca un byte del exe). El bit 32 abre unicamente CS10, la query de la
-+	// vista principal, sin compuerta de FOV. Ver docs/CULLING-GHIDRA-2026-09-05.md.
-+	bf_instalar_si_pedido();
-+	bf_reportar();
++			// 2026-09-05: relay de call sites, instalado SOLO si $cull_widen trae el bit 16 o 32
++			// (con 0 no se toca un byte del exe). El bit 32 abre unicamente CS10, la query de la
++			// vista principal, sin compuerta de FOV. Ver docs/CULLING-GHIDRA-2026-09-05.md.
++			bf_instalar_si_pedido();
++			bf_reportar();
++		}
++	}
 +
 +	if (!data || size < 208 || size > sizeof(g_triple_cam_buf))
 +		return;
@@ -3727,31 +3803,16 @@ index 6758d9f1..206f8731 100644
 +// mismo valor que el VS del pasto resta a cada instancia antes de proyectar.
 +// Devuelve 0 si todavia no hay camara capturada.
 +int TripleGetCameraPos(float *out3)
- {
--	ID3D11Buffer *ib;
--	D3D11_BUFFER_DESC desc;
--	DXGI_FORMAT format;
--	UINT offset;
--
--	mOrigContext1->IAGetIndexBuffer(&ib, &format, &offset);
--	if (!ib)
++{
 +	if (!g_triple_cam_valid || g_triple_cam_size < 144)
- 		return 0;
++		return 0;
 +	const float *f = (const float *)g_triple_cam_buf;
 +	out3[0] = f[32];
 +	out3[1] = f[33];
 +	out3[2] = f[34];
 +	return 1;
 +}
- 
--	ib->GetDesc(&desc);
--	ib->Release();
--
--	switch(format) {
--		case DXGI_FORMAT_R16_UINT:
--			return (desc.ByteWidth - offset) / 2;
--		case DXGI_FORMAT_R32_UINT:
--			return (desc.ByteWidth - offset) / 4;
++
 +// Proyecta un punto de mundo con la MISMA relativeViewProjection de la camara
 +// principal que usa el motor. Solo diagnostico: trabaja sobre la copia del
 +// constant buffer ya capturada y nunca escribe memoria del juego.
@@ -3780,22 +3841,9 @@ index 6758d9f1..206f8731 100644
 +			R[col * 4 + row] = s;
 +		}
  	}
--
--	return 0;
- }
++}
  
--void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
--		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
--		ID3D11Buffer *pBufferForArgs,
--		UINT AlignedByteOffsetForArgs))
--{
--	ID3D11Resource *resource = NULL;
--	ID3D11View *view = NULL;
--	UINT stride = 0;
--	UINT offset = 0;
--	UINT buf_size = 0;
--	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
--	UINT arg = (UINT)args[0].evaluate(state);
+-	COMMAND_LIST_LOG(state, "[%S] %s(%p, %u)\n", ini_section.c_str(), name, resource, arg);
 +// Inversa general 4x4 (column-major m[col*4+row], igual convencion que el juego:
 +// cada registro del cbuffer es una COLUMNA, como se ve en el ASM
 +// "clip = cb3[9]*x + cb3[10]*y + cb3[11]*z + cb3[12]").
@@ -3846,9 +3894,7 @@ index 6758d9f1..206f8731 100644
 +	return true;
 +}
  
--	resource = indirect_buffer.GetResource(state, &view, &stride, &offset, &format, NULL);
--	if (view)
--		view->Release();
+-	(state->mOrigContext1->*IndirectDrawCall)((ID3D11Buffer*)resource, arg);
 +// Construye P_region (view-space del juego -> clip de la region i) desde la
 +// geometria viva (constantes K en IniParams) y el near REAL de la camara.
 +// Deducida de compute_matrices.py; equivale exactamente a lo que hace el ASM:
@@ -3871,10 +3917,7 @@ index 6758d9f1..206f8731 100644
 +	{ 0.6701031f, 1.0000000f },   // RIGHT  5200 .. 7760
 +};
  
--	if (!resource) {
--		COMMAND_LIST_LOG(state, "[%S] %s(%p, %u) -> INDIRECT BUFFER IS NULL\n",
--				ini_section.c_str(), name, resource, arg);
--		return;
+-	resource->Release();
 +static void triple_get_frac(int region, float *lo, float *hi)
 +{
 +	if (G->iniParams.size() >= 8 && G->iniParams[6].z > 0.0f) {
@@ -3887,15 +3930,14 @@ index 6758d9f1..206f8731 100644
 +			case 1: *lo = fcl;  *hi = fcr;  return;
 +			default: *lo = frl; *hi = 1.0f; return;
 +		}
- 	}
++	}
 +	*lo = TRIPLE_FRAC[region][0];
 +	*hi = TRIPLE_FRAC[region][1];
-+}
+ }
  
--	COMMAND_LIST_LOG(state, "[%S] %s(%p, %u)\n", ini_section.c_str(), name, resource, arg);
+-void DrawCommand::eval_args(int nargs, INT result[5], CommandListState *state)
 +static void ProcessParamRTSize(CommandListState *state);
- 
--	(state->mOrigContext1->*IndirectDrawCall)((ID3D11Buffer*)resource, arg);
++
 +// Consulta ROBUSTA del tamano del render target.
 +// ProcessParamRTSize (la que alimenta la variable rt_width del ini) solo acepta
 +// vistas D3D11_RTV_DIMENSION_TEXTURE2D / TEXTURE2DMS y sale dejando rt_width en
@@ -3904,14 +3946,14 @@ index 6758d9f1..206f8731 100644
 +// mascara de sombras. Aca miramos el RECURSO, no la vista, asi que sirve para
 +// arrays y cualquier dimension de vista.
 +static bool triple_get_rt_size(CommandListState *state, float *w, float *h)
-+{
+ {
+-	for (int i = 0; i < nargs; i++)
+-		result[i] = (INT)args[i].evaluate(state);
 +	ID3D11RenderTargetView *view = NULL;
 +	ID3D11Resource *res = NULL;
 +	D3D11_RESOURCE_DIMENSION dim;
 +	bool ok = false;
- 
--	resource->Release();
--}
++
 +	state->mOrigContext1->OMGetRenderTargets(1, &view, NULL);
 +	if (!view)
 +		return false;
@@ -3919,11 +3961,7 @@ index 6758d9f1..206f8731 100644
 +	view->Release();
 +	if (!res)
 +		return false;
- 
--void DrawCommand::eval_args(int nargs, INT result[5], CommandListState *state)
--{
--	for (int i = 0; i < nargs; i++)
--		result[i] = (INT)args[i].evaluate(state);
++
 +	res->GetType(&dim);
 +	if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
 +		D3D11_TEXTURE2D_DESC d;
@@ -3996,7 +4034,22 @@ index 6758d9f1..206f8731 100644
 +	// target real. Independiente de la resolucion. No toca ningun cbuffer.
 +	if (scissor_only) {
 +		float rw = 0.0f, rh = 0.0f;
-+		if (region >= 0 && region < 3 && triple_get_rt_size(state, &rw, &rh)) {
++		// Version de prueba, casilla REDIBUJO: el render target es el mismo
++		// en los 3 tercios del objeto; se mide en el primero (el custom
++		// shader del redibujo pone tt_rt_w en -1 al empezar).
++		bool tt_medido = false;
++		if (state->tt_en_redibujo && state->tt_rt_w > 0.0f) {
++			rw = state->tt_rt_w;
++			rh = state->tt_rt_h;
++			tt_medido = true;
++		} else if (region >= 0 && region < 3 && triple_get_rt_size(state, &rw, &rh)) {
++			tt_medido = true;
++			if (state->tt_en_redibujo) {
++				state->tt_rt_w = rw;
++				state->tt_rt_h = rh;
++			}
++		}
++		if (region >= 0 && region < 3 && tt_medido) {
 +			float flo, fhi;
 +			triple_get_frac(region, &flo, &fhi);
 +			D3D11_RECT r;
@@ -4375,7 +4428,11 @@ index 6758d9f1..206f8731 100644
 +
 +	if (g_triple_par_srv[idx]) {
 +		ctx->VSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
-+		ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
++		// Version de prueba, casilla REDIBUJO: sin domain shader puesto por el
++		// juego (sin teselado) no hay quien lea el slot del DS.
++		HackerContext *hc = state->mHackerContext;
++		if (!(ttprueba::Activa(ttprueba::REDIBUJO) && hc && !hc->mCurrentDomainShaderHandle))
++			ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
 +	}
  }
  
@@ -4407,7 +4464,15 @@ index 6758d9f1..206f8731 100644
  }
  
  PerDrawStereoOverrideCommand::PerDrawStereoOverrideCommand(bool restore_on_post) :
-@@ -1875,7 +5822,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
+@@ -1757,6 +5830,7 @@ CustomShader::CustomShader() :
+ 	stencil_ref(0), stencil_ref_mask(~0),
+ 	rs_override(0), rs_state(NULL),
+ 	topology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED),
++	tt_redibujo(false),
+ 	substantiated(false),
+ 	max_executions_per_frame(0),
+ 	frame_no(0),
+@@ -1875,7 +5949,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
  	bool found = false;
  	FILETIME timestamp;
  
@@ -4416,7 +4481,168 @@ index 6758d9f1..206f8731 100644
  
  	switch(type) {
  		case 'v':
-@@ -3176,7 +7123,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
+@@ -2211,6 +6285,83 @@ void CustomShader::merge_rasterizer_states(ID3D11RasterizerState *src_state, ID3
+ 	mOrigDevice1->CreateRasterizerState(&rs_desc, &rs_state);
+ }
+ 
++// ---- Version de prueba, casilla RASTER (TrueTriplePrueba.h) ---------------
++// rasterizer_state_merge = true crea un estado nuevo con
++// ID3D11Device::CreateRasterizerState en CADA corrida del custom shader: en el
++// redibujo del triple es una vez por objeto, unas 900 por cuadro, desde los 7
++// hilos del juego, y cada una toma el candado del dispositivo (el juego lo crea
++// sin SINGLETHREADED, asi que es el mismo candado que usa el contexto
++// inmediato). Ademas escribe custom_shader->rs_state, que comparten todos los
++// hilos. Aca el estado combinado se crea una vez por (custom shader, estado
++// del juego) y se reusa, por hilo, sin tocar el miembro compartido. Es la
++// misma cuenta que merge_rasterizer_states: la descripcion del ini con los
++// campos de la mascara tomados del estado del juego.
++struct TtRsCache {
++	const CustomShader *cs;
++	D3D11_RASTERIZER_DESC src;
++	ID3D11RasterizerState *st;
++};
++#define TT_RS_CACHE_N 32
++static thread_local TtRsCache tt_rs_cache[TT_RS_CACHE_N];
++static thread_local int tt_rs_cache_n = 0;
++static thread_local int tt_rs_cache_prox = 0;
++static thread_local LONG tt_rs_cache_gen = 0;
++
++static ID3D11RasterizerState *tt_rs_combinado(CustomShader *cs, ID3D11RasterizerState *src_state, ID3D11Device *dev)
++{
++	D3D11_RASTERIZER_DESC src_desc;
++	if (src_state) {
++		src_state->GetDesc(&src_desc);
++	} else {
++		src_desc.FillMode = D3D11_FILL_SOLID;
++		src_desc.CullMode = D3D11_CULL_BACK;
++		src_desc.FrontCounterClockwise = FALSE;
++		src_desc.DepthBias = 0;
++		src_desc.SlopeScaledDepthBias = 0.0f;
++		src_desc.DepthBiasClamp = 0.0f;
++		src_desc.DepthClipEnable = TRUE;
++		src_desc.ScissorEnable = FALSE;
++		src_desc.MultisampleEnable = FALSE;
++		src_desc.AntialiasedLineEnable = FALSE;
++	}
++	// Ini recargado: los CustomShader son otros (y un puntero puede
++	// repetirse), asi que este hilo vacia su cache.
++	LONG gen = ttprueba::g_generacion;
++	if (gen != tt_rs_cache_gen) {
++		for (int i = 0; i < tt_rs_cache_n; i++)
++			if (tt_rs_cache[i].st)
++				tt_rs_cache[i].st->Release();
++		tt_rs_cache_n = 0;
++		tt_rs_cache_prox = 0;
++		tt_rs_cache_gen = gen;
++	}
++	for (int i = 0; i < tt_rs_cache_n; i++) {
++		TtRsCache &e = tt_rs_cache[i];
++		if (e.cs == cs && !memcmp(&e.src, &src_desc, sizeof(src_desc)))
++			return e.st;
++	}
++	D3D11_RASTERIZER_DESC desc = cs->rs_desc;
++	memcpy_masked_merge(&desc, &src_desc, &cs->rs_mask, sizeof(D3D11_RASTERIZER_DESC));
++	ID3D11RasterizerState *st = NULL;
++	if (FAILED(dev->CreateRasterizerState(&desc, &st)) || !st)
++		return NULL;
++	int k;
++	if (tt_rs_cache_n < TT_RS_CACHE_N) {
++		k = tt_rs_cache_n++;
++	} else {
++		// Lleno: se reemplaza en ronda. Un contexto que lo tenga puesto
++		// guarda su propia referencia, asi que soltarlo aca es seguro.
++		k = tt_rs_cache_prox;
++		tt_rs_cache_prox = (tt_rs_cache_prox + 1) % TT_RS_CACHE_N;
++		if (tt_rs_cache[k].st)
++			tt_rs_cache[k].st->Release();
++	}
++	tt_rs_cache[k].cs = cs;
++	tt_rs_cache[k].src = src_desc;
++	tt_rs_cache[k].st = st;
++	return st;
++}
++
+ struct saved_shader_inst
+ {
+ 	ID3D11ClassInstance *instances[256];
+@@ -2321,8 +6472,15 @@ void RunCustomShaderCommand::run(CommandListState *state)
+ 	}
+ 	if (custom_shader->rs_override) {
+ 		mOrigContext1->RSGetState(&saved_rs);
+-		custom_shader->merge_rasterizer_states(saved_rs, mOrigDevice1);
+-		mOrigContext1->RSSetState(custom_shader->rs_state);
++		ID3D11RasterizerState *tt_rs = NULL;
++		if (custom_shader->rs_override == 2 && ttprueba::Activa(ttprueba::RASTER))
++			tt_rs = tt_rs_combinado(custom_shader, saved_rs, mOrigDevice1);
++		if (tt_rs) {
++			mOrigContext1->RSSetState(tt_rs);
++		} else {
++			custom_shader->merge_rasterizer_states(saved_rs, mOrigDevice1);
++			mOrigContext1->RSSetState(custom_shader->rs_state);
++		}
+ 	}
+ 	if (custom_shader->topology != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
+ 		mOrigContext1->IAGetPrimitiveTopology(&saved_topology);
+@@ -2332,12 +6490,25 @@ void RunCustomShaderCommand::run(CommandListState *state)
+ 		mOrigContext1->PSGetSamplers(0, num_sampler, saved_sampler_states);
+ 		mOrigContext1->PSSetSamplers(0, 1, &custom_shader->sampler_state); //just one slot for the moment TODO: allow more via *.ini file
+ 	}
++	// Version de prueba, casilla REDIBUJO: el redibujo del triple solo
++	// bindea la textura de parametros, pone el scissor y dibuja; no cambia
++	// render targets, UAVs ni viewports, asi que no hace falta guardarlos y
++	// reponerlos en cada objeto (en AMD, sin listas de comandos del driver,
++	// el runtime repite esas llamadas en el hilo que ejecuta las listas).
++	const bool tt_sin_om = custom_shader->tt_redibujo && ttprueba::Activa(ttprueba::REDIBUJO);
++	if (!tt_sin_om) {
+ 	// We save off the viewports unconditionally for now. We could
+ 	// potentially skip this by flagging if a command list may alter them,
+ 	// but that probably wouldn't buy us anything:
+ 	mOrigContext1->RSGetViewports(&num_viewports, saved_viewports);
+ 	// Likewise, save off all RTVs, UAVs and DSVs unconditionally:
+ 	save_om_state(state->mOrigContext1, &om_state);
++	}
++	if (tt_sin_om) {
++		state->tt_rt_w = -1;
++		state->tt_rt_h = -1;
++		state->tt_en_redibujo = true;
++	}
+ 
+ 	// Run the command lists. This should generally include a draw or
+ 	// dispatch call, or call out to another command list which does.
+@@ -2349,6 +6520,11 @@ void RunCustomShaderCommand::run(CommandListState *state)
+ 	state->post = true;
+ 	_RunCommandList(&custom_shader->post_command_list, state);
+ 	state->post = saved_post;
++	if (tt_sin_om) {
++		state->tt_en_redibujo = false;
++		state->tt_rt_w = -1;
++		state->tt_rt_h = -1;
++	}
+ 
+ 	// Finally restore the original shaders
+ 	if (custom_shader->vs_override)
+@@ -2374,8 +6550,10 @@ void RunCustomShaderCommand::run(CommandListState *state)
+ 	if (custom_shader->sampler_override)
+ 		mOrigContext1->PSSetSamplers(0, num_sampler, saved_sampler_states);
+ 
++	if (!tt_sin_om) {
+ 	mOrigContext1->RSSetViewports(num_viewports, saved_viewports);
+ 	restore_om_state(mOrigContext1, &om_state);
++	}
+ 
+ 	if (saved_vs)
+ 		saved_vs->Release();
+@@ -2610,6 +6788,9 @@ CommandListState::CommandListState() :
+ 	mOrigContext1(NULL),
+ 	rt_width(-1),
+ 	rt_height(-1),
++	tt_rt_w(-1),
++	tt_rt_h(-1),
++	tt_en_redibujo(false),
+ 	call_info(NULL),
+ 	this_target(NULL),
+ 	resource(NULL),
+@@ -3176,7 +7357,7 @@ bool CommandListOperand::optimise(HackerDevice *device, std::shared_ptr<CommandL
  	if (!static_evaluate(&val, device))
  		return false;
  
@@ -4425,7 +4651,7 @@ index 6758d9f1..206f8731 100644
  		lookup_enum_name(ParamOverrideTypeNames, type), val);
  
  	type = ParamOverrideType::VALUE;
-@@ -3847,9 +7794,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
+@@ -3847,9 +8028,11 @@ bool CommandListOperator::optimise(HackerDevice *device, std::shared_ptr<Command
  		return making_progress;
  
  	// FIXME: Pretty print rather than dumping syntax tree
@@ -4440,7 +4666,7 @@ index 6758d9f1..206f8731 100644
  	static_val_str = std::to_wstring(static_val);
  
  	operand = make_shared<CommandListOperand>(token_pos, static_val_str.c_str());
-@@ -4250,17 +8199,19 @@ static ResourceType* GetResourceFromPool(
+@@ -4250,17 +8433,19 @@ static ResourceType* GetResourceFromPool(
  			return resource;
  		}
  
@@ -4463,7 +4689,7 @@ index 6758d9f1..206f8731 100644
  		LogResourceDesc(desc);
  		src_resource->GetDesc(&old_desc);
  		LogInfo("Original resource was:\n");
-@@ -4565,7 +8516,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
+@@ -4565,7 +8750,7 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf,
  
  	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
  	if (SUCCEEDED(hr)) {
@@ -4472,7 +4698,7 @@ index 6758d9f1..206f8731 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)buffer;
-@@ -4592,7 +8543,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
+@@ -4592,7 +8777,7 @@ void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture1D(&desc, NULL, &tex1d);
  	if (SUCCEEDED(hr)) {
@@ -4481,7 +4707,7 @@ index 6758d9f1..206f8731 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex1d;
-@@ -4618,7 +8569,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
+@@ -4618,7 +8803,7 @@ void CustomResource::SubstantiateTexture2D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture2D(&desc, NULL, &tex2d);
  	if (SUCCEEDED(hr)) {
@@ -4490,7 +4716,7 @@ index 6758d9f1..206f8731 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex2d;
-@@ -4644,7 +8595,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
+@@ -4644,7 +8829,7 @@ void CustomResource::SubstantiateTexture3D(ID3D11Device *mOrigDevice1)
  
  	hr = mOrigDevice1->CreateTexture3D(&desc, NULL, &tex3d);
  	if (SUCCEEDED(hr)) {
@@ -4499,7 +4725,7 @@ index 6758d9f1..206f8731 100644
  				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), desc.BindFlags);
  		LogDebugResourceDesc(&desc);
  		resource = (ID3D11Resource*)tex3d;
-@@ -5107,7 +9058,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
+@@ -5107,7 +9292,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
  	// TODO: Option to discard individual resources instead of transfer
  	// TODO: Option to discard all custom resources and re-run [Constants]
  	//       on new device (for convoluted startup sequences)
@@ -4510,7 +4736,7 @@ index 6758d9f1..206f8731 100644
  			mOrigDevice1, mOrigContext1, resource, &name);
  
 diff --git a/DirectX11/CommandList.h b/DirectX11/CommandList.h
-index 142cbbf4..bb6a192c 100644
+index 142cbbf4..f2f1bf37 100644
 --- a/DirectX11/CommandList.h
 +++ b/DirectX11/CommandList.h
 @@ -26,6 +26,17 @@ class HackerContext;
@@ -4531,7 +4757,29 @@ index 142cbbf4..bb6a192c 100644
  class CommandListState {
  public:
  	HackerDevice *mHackerDevice;
-@@ -379,6 +390,91 @@ public:
+@@ -37,6 +48,10 @@ public:
+ 	// common case we are going to store both width & height in separate
+ 	// ini params:
+ 	float rt_width, rt_height;
++	// Version de prueba, casilla REDIBUJO: el tamano del render target que
++	// mide triple_scissor, una vez por objeto (los 3 tercios lo comparten).
++	float tt_rt_w, tt_rt_h;
++	bool tt_en_redibujo;
+ 	DrawCallInfo *call_info;
+ 	bool post;
+ 	bool aborted;
+@@ -326,6 +341,10 @@ public:
+ 
+ 	int max_executions_per_frame;
+ 	unsigned frame_no;
++
++	// Version de prueba (TrueTriplePrueba.h): la seccion es
++	// [CustomShaderTripleRedraw], el redibujo de cada objeto en los 3 tercios.
++	bool tt_redibujo;
+ 	int executions_this_frame;
+ 
+ 	CustomShader();
+@@ -379,6 +398,91 @@ public:
  	void run(CommandListState*) override;
  };
  
@@ -4759,7 +5007,7 @@ index 9829f2b1..eb2dec7e 100644
  // the reference as a normal ID3D11Device.
  // In the no platform_update case, the mOrigDevice1 will actually be an ID3D11Device.
 diff --git a/DirectX11/HackerContext.cpp b/DirectX11/HackerContext.cpp
-index a0a8d701..8cf88b36 100644
+index a0a8d701..d467a87c 100644
 --- a/DirectX11/HackerContext.cpp
 +++ b/DirectX11/HackerContext.cpp
 @@ -14,6 +14,11 @@
@@ -4774,7 +5022,257 @@ index a0a8d701..8cf88b36 100644
  #include "log.h"
  #include "Globals.h"
  
-@@ -71,7 +76,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
+@@ -24,6 +29,249 @@
+ #include "ShaderRegex.h"
+ #include "FrameAnalysis.h"
+ #include "profiling.h"
++#include "TrueTripleDiag.h"
++
++// Los diagnosticos viejos de Map/Unmap/UpdateSubresource (censos de buffers,
++// volcados del pasto y de las zonas, copias de constant buffers para medir
++// FOV y sombras, el espia de buffers dinamicos). Solo escriben en el log y
++// algunos toman un spinlock global en cada Map de los 7 contextos del juego.
++// Apagados desde la rama diag/dr2-amd-map-unmap; con 1 vuelven tal cual.
++// Version de prueba (TrueTriplePrueba.h): corren como en la estable salvo
++// con la casilla LIVIANO.
++#include "TrueTriplePrueba.h"
++#define TT_VIEJOS_ACTIVOS (!ttprueba::Activa(ttprueba::LIVIANO))
++
++// ---- Diagnostico de rendimiento (TrueTripleDiag.h) ----------------------------------------------
++#if TT_DIAG_INSTRUMENTAR
++#include <stdio.h>
++#include <time.h>
++
++namespace ttdiag {
++
++#define TT_DIAG_MAX_HILOS 256
++static Hilo *g_hilos[TT_DIAG_MAX_HILOS];
++static volatile LONG g_nhilos = 0;
++static thread_local Hilo *tls_hilo = NULL;
++// Los hilos que pasan del tope cuentan aca (con carreras: es solo un aviso).
++static Hilo g_hilo_sobrante;
++
++Hilo *HiloActual()
++{
++	Hilo *h = tls_hilo;
++	if (h)
++		return h;
++	h = (Hilo *)_aligned_malloc(sizeof(Hilo), 64);
++	if (!h)
++		h = &g_hilo_sobrante;
++	else {
++		memset((void *)h, 0, sizeof(Hilo));
++		LONG i = InterlockedIncrement(&g_nhilos) - 1;
++		if (i < TT_DIAG_MAX_HILOS)
++			g_hilos[i] = h;
++		else
++			h = &g_hilo_sobrante;
++	}
++	tls_hilo = h;
++	return h;
++}
++
++static void sumar_todo(LONG64 out[N])
++{
++	for (int k = 0; k < N; k++)
++		out[k] = g_hilo_sobrante.c[k];
++	LONG n = InterlockedCompareExchange(&g_nhilos, 0, 0);
++	if (n > TT_DIAG_MAX_HILOS)
++		n = TT_DIAG_MAX_HILOS;
++	for (LONG i = 0; i < n; i++) {
++		Hilo *h = g_hilos[i];
++		if (!h)
++			continue;
++		for (int k = 0; k < N; k++)
++			out[k] += h->c[k];
++	}
++}
++
++static wchar_t g_ruta[MAX_PATH];
++
++static void armar_ruta()
++{
++	HMODULE yo = NULL;
++	g_ruta[0] = 0;
++	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++			(LPCWSTR)&armar_ruta, &yo))
++		return;
++	DWORD n = GetModuleFileNameW(yo, g_ruta, MAX_PATH);
++	if (!n || n >= MAX_PATH) {
++		g_ruta[0] = 0;
++		return;
++	}
++	wchar_t *barra = wcsrchr(g_ruta, L'\\');
++	if (!barra || (size_t)(barra - g_ruta) + 24 >= MAX_PATH) {
++		g_ruta[0] = 0;
++		return;
++	}
++	wcscpy_s(barra + 1, MAX_PATH - (barra + 1 - g_ruta), L"TrueTriple_diag.txt");
++}
++
++static void escribir(const char *linea)
++{
++	// Version de prueba: tambien al d3d11_log.txt, que es lo que adjunta
++	// "Informar un error" (la cola de 128 KiB).
++	LogInfo("TTDIAG %s", linea[0] == '\n' ? linea + 1 : linea);
++	if (!g_ruta[0])
++		return;
++	FILE *f = NULL;
++	if (_wfopen_s(&f, g_ruta, L"a") || !f)
++		return;
++	fputs(linea, f);
++	fclose(f);
++}
++
++static char variante()
++{
++#if TT_DIAG_VACIO
++	return 'A';
++#else
++	return 'P';	// version de prueba con casillas (TrueTriplePrueba.h)
++#endif
++}
++
++// Una vez: que placa es y si el driver arma las listas de comandos de DX11
++// por su cuenta (DriverCommandLists). Si no, el runtime las emula y repite
++// cada llamada de los contextos diferidos en el hilo que las ejecuta.
++void InfoDispositivo(ID3D11Device *dev)
++{
++	if (!dev)
++		return;
++	D3D11_FEATURE_DATA_THREADING th = {};
++	HRESULT hr = dev->CheckFeatureSupport(D3D11_FEATURE_THREADING, &th, sizeof(th));
++	char placa[160] = "?";
++	UINT vendor = 0;
++	IDXGIDevice *dxgi = NULL;
++	if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) && dxgi) {
++		IDXGIAdapter *ad = NULL;
++		if (SUCCEEDED(dxgi->GetAdapter(&ad)) && ad) {
++			DXGI_ADAPTER_DESC d;
++			if (SUCCEEDED(ad->GetDesc(&d))) {
++				vendor = d.VendorId;
++				WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, placa, sizeof(placa), NULL, NULL);
++			}
++			ad->Release();
++		}
++		dxgi->Release();
++	}
++	char l[400];
++	_snprintf_s(l, sizeof(l), _TRUNCATE,
++		"placa=%s vendor=0x%04x driver_command_lists=%d concurrent_creates=%d (hr=0x%08x) | opciones=%s\n",
++		placa, vendor, SUCCEEDED(hr) ? (int)th.DriverCommandLists : -1,
++		SUCCEEDED(hr) ? (int)th.DriverConcurrentCreates : -1, (unsigned)hr, ttprueba::Texto());
++	escribir(l);
++}
++
++void Cuadro(unsigned long long tsc_acciones, unsigned long long tsc_present)
++{
++	// Solo lo llama el hilo de Present: lo de aca no necesita candado.
++	static bool arrancado = false;
++	static LARGE_INTEGER qpf, qpc0, qpc_inicio;
++	static unsigned long long tsc0 = 0;
++	static LONG64 antes[N];
++	static unsigned long long cuadros = 0, acc_acciones = 0, acc_present = 0;
++	static float ms_max = 0.0f;
++	static unsigned long long tsc_cuadro_ant = 0;
++
++	LARGE_INTEGER ahora;
++	QueryPerformanceCounter(&ahora);
++	unsigned long long tsc = __rdtsc();
++	if (!arrancado) {
++		arrancado = true;
++		QueryPerformanceFrequency(&qpf);
++		qpc0 = ahora;
++		qpc_inicio = ahora;
++		tsc0 = tsc;
++		tsc_cuadro_ant = tsc;
++		sumar_todo(antes);
++		armar_ruta();
++		char l[512];
++		time_t t = time(NULL);
++		struct tm lt;
++		localtime_s(&lt, &t);
++		_snprintf_s(l, sizeof(l), _TRUNCATE,
++			"\n=== TrueTriple test build %c, %04d-%02d-%02d %02d:%02d, session=%d, opciones=%s ===\n",
++			variante(), lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min,
++			TrueTripleDiagSesion(), ttprueba::Texto());
++		escribir(l);
++		return;
++	}
++
++	cuadros++;
++	acc_acciones += tsc_acciones;
++	acc_present += tsc_present;
++	// El cuadro mas lento del tramo (tirones).
++	unsigned long long dt_cuadro = tsc - tsc_cuadro_ant;
++	tsc_cuadro_ant = tsc;
++
++	double seg = (double)(ahora.QuadPart - qpc0.QuadPart) / (double)qpf.QuadPart;
++	double tsc_por_ms = seg > 0.0 ? (double)(tsc - tsc0) / (seg * 1000.0) : 0.0;
++	if (tsc_por_ms > 0.0) {
++		float ms = (float)((double)dt_cuadro / tsc_por_ms);
++		if (ms > ms_max)
++			ms_max = ms;
++	}
++	if (seg < 10.0)
++		return;
++
++	LONG64 suma[N];
++	sumar_todo(suma);
++	LONG64 d[N];
++	for (int k = 0; k < N; k++)
++		d[k] = suma[k] - antes[k];
++
++	double c = (double)cuadros;
++	double ms = tsc_por_ms > 0.0 ? 1.0 / tsc_por_ms : 0.0;
++	float triple = -1.0f;
++#if !TT_DIAG_VACIO
++	triple = TripleReadIniGlobal(L"$triple_on", -1.0f).fval;
++#endif
++	// Una linea corta cada 10 s (cabe en una captura del Bloc de notas):
++	// F7 = $triple_on; fps y ms del cuadro (max = el mas lento); pres = adentro
++	// del Present del driver (alto = esperando a la GPU); acc = el [Present]
++	// del ini; por cuadro: draws, maps, cam = constant buffers de 256-320 bytes,
++	// rd = maps de lectura (la CPU espera a la GPU); ms por cuadro en Map y
++	// Unmap del driver, en lecturas, en nuestro codigo (ext); listas = cuantas
++	// y ms en Execute/FinishCommandList; ini = lecturas del ini con candado.
++	char l[512];
++	_snprintf_s(l, sizeof(l), _TRUNCATE,
++		"%c t=%.0fs F7=%g fps=%.1f ms=%.2f max=%.1f pres=%.2f acc=%.2f | draws=%.0f maps=%.0f cam=%.0f rd=%.1f"
++		" | ms map=%.2f unmap=%.2f rd=%.2f ext=%.2f | exec=%.1f/%.2fms fin=%.1f/%.2fms | ini=%.0f | %s\n",
++		variante(), (double)(ahora.QuadPart - qpc_inicio.QuadPart) / (double)qpf.QuadPart, (double)triple,
++		c / seg, seg * 1000.0 / c, ms_max,
++		(double)acc_present * ms / c, (double)acc_acciones * ms / c,
++		d[DRAWS] / c, d[MAPS] / c, d[MAPS_CAMARA] / c, d[MAPS_LECTURA] / c,
++		d[TSC_MAP_DRIVER] * ms / c, d[TSC_UNMAP_DRIVER] * ms / c, d[TSC_MAP_LECTURA] * ms / c,
++		d[TSC_EXTRAS] * ms / c,
++		d[EXECUTES] / c, d[TSC_EXECUTE] * ms / c, d[FINISHES] / c, d[TSC_FINISH] * ms / c,
++		d[INI_CANDADO] / c, ttprueba::Texto());
++	escribir(l);
++
++	for (int k = 0; k < N; k++)
++		antes[k] = suma[k];
++	cuadros = 0;
++	acc_acciones = 0;
++	acc_present = 0;
++	ms_max = 0.0f;
++	qpc0 = ahora;
++	tsc0 = tsc;
++}
++
++} // namespace ttdiag
++#else
++namespace ttdiag {
++Hilo *HiloActual() { static Hilo h; return &h; }
++void Cuadro(unsigned long long, unsigned long long) {}
++void InfoDispositivo(ID3D11Device *) {}
++}
++#endif
+ 
+ // -----------------------------------------------------------------------------------------------
+ 
+@@ -71,7 +319,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
  	mHackerDevice = NULL;
  
  	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
@@ -4785,7 +5283,7 @@ index a0a8d701..8cf88b36 100644
  	mCurrentVertexShader = 0;
  	mCurrentVertexShaderHandle = NULL;
  	mCurrentPixelShader = 0;
-@@ -725,6 +733,10 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
+@@ -725,6 +976,10 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
  }
  
  
@@ -4796,7 +5294,7 @@ index a0a8d701..8cf88b36 100644
  void HackerContext::BeforeDraw(DrawContext &data)
  {
  	Profiling::State profiling_state;
-@@ -732,6 +744,12 @@ void HackerContext::BeforeDraw(DrawContext &data)
+@@ -732,6 +987,12 @@ void HackerContext::BeforeDraw(DrawContext &data)
  	if (Profiling::mode == Profiling::Mode::SUMMARY)
  		Profiling::start(&profiling_state);
  
@@ -4809,7 +5307,7 @@ index a0a8d701..8cf88b36 100644
  	// If we are not hunting shaders, we should skip all of this shader management for a performance bump.
  	if (G->hunting == HUNTING_MODE_ENABLED)
  	{
-@@ -1103,6 +1121,14 @@ STDMETHODIMP HackerContext::SetPrivateDataInterface(THIS_
+@@ -1103,6 +1364,14 @@ STDMETHODIMP HackerContext::SetPrivateDataInterface(THIS_
  // They need to be here in order to pass along the calls, since there is no proper object where
  // it would normally go to the superclass. 
  
@@ -4824,7 +5322,7 @@ index a0a8d701..8cf88b36 100644
  STDMETHODIMP_(void) HackerContext::VSSetConstantBuffers(THIS_
  	/* [annotation] */
  	__in_range(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - 1)  UINT StartSlot,
-@@ -1111,6 +1137,11 @@ STDMETHODIMP_(void) HackerContext::VSSetConstantBuffers(THIS_
+@@ -1111,6 +1380,11 @@ STDMETHODIMP_(void) HackerContext::VSSetConstantBuffers(THIS_
  	/* [annotation] */
  	__in_ecount(NumBuffers) ID3D11Buffer *const *ppConstantBuffers)
  {
@@ -4836,7 +5334,7 @@ index a0a8d701..8cf88b36 100644
  	mOrigContext1->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
  }
  
-@@ -1289,6 +1320,710 @@ out_profile:
+@@ -1289,6 +1563,710 @@ out_profile:
  		Profiling::end(&profiling_state, &Profiling::map_overhead);
  }
  
@@ -5547,10 +6045,31 @@ index a0a8d701..8cf88b36 100644
  STDMETHODIMP HackerContext::Map(THIS_
  	/* [annotation] */
  	__in  ID3D11Resource *pResource,
-@@ -1307,6 +2042,167 @@ STDMETHODIMP HackerContext::Map(THIS_
+@@ -1303,10 +2281,196 @@ STDMETHODIMP HackerContext::Map(THIS_
+ {
+ 	HRESULT hr;
+ 
++	unsigned long long tt_t0 = ttdiag::Tsc();
+ 	hr = mOrigContext1->Map(pResource, Subresource, MapType, MapFlags, pMappedResource);
++	unsigned long long tt_t1 = ttdiag::Tsc();
++#if TT_DIAG_INSTRUMENTAR
++	ttdiag::Sumar(ttdiag::MAPS, 1);
++	ttdiag::Sumar(ttdiag::TSC_MAP_DRIVER, (LONG64)(tt_t1 - tt_t0));
++	if (MapType == D3D11_MAP_READ || MapType == D3D11_MAP_READ_WRITE) {
++		ttdiag::Sumar(ttdiag::MAPS_LECTURA, 1);
++		ttdiag::Sumar(ttdiag::TSC_MAP_LECTURA, (LONG64)(tt_t1 - tt_t0));
++	} else {
++		ttdiag::Sumar(ttdiag::MAPS_ESCRITURA, 1);
++	}
++#endif
  
  	TrackAndDivertMap(hr, pResource, Subresource, MapType, MapFlags, pMappedResource);
  
++#if TT_DIAG_VACIO
++	return hr;
++#endif
++	unsigned long long tt_x0 = ttdiag::Tsc();
++
 +	// v1.84: ESPIA de buffers dinamicos (diagnostico para la proxima
 +	// iteracion). Cada auto tiene exactamente TRES buffers dinamicos propios
 +	// que el juego actualiza con Map(WRITE_DISCARD) en cada frame, en TODAS
@@ -5569,6 +6088,7 @@ index a0a8d701..8cf88b36 100644
 +	// Sin candado a proposito: el hook corre en los 7 contextos del juego y
 +	// una carrera puede duplicar algun log — tolerable; un mutex en el camino
 +	// de Map no lo es.
++	if (TT_VIEJOS_ACTIVOS) {
 +	if (LogFile && SUCCEEDED(hr) && pResource) {
 +		D3D11_BUFFER_DESC sd;
 +		if (triple_buffer_desc(pResource, &sd) && sd.Usage == D3D11_USAGE_DYNAMIC) {
@@ -5591,9 +6111,11 @@ index a0a8d701..8cf88b36 100644
 +			}
 +		}
 +	}
++	}
 +
 +	if (SUCCEEDED(hr) && pMappedResource && pMappedResource->pData &&
 +	    (MapType == D3D11_MAP_WRITE_DISCARD || MapType == D3D11_MAP_WRITE)) {
++	if (TT_VIEJOS_ACTIVOS) {
 +		D3D11_BUFFER_DESC zone_desc;
 +		if (triple_buffer_desc(pResource, &zone_desc) &&
 +			zone_desc.StructureByteStride == 48 &&
@@ -5604,12 +6126,15 @@ index a0a8d701..8cf88b36 100644
 +			tls_zone_ptr = pMappedResource->pData;
 +			tls_zone_size = zone_desc.ByteWidth;
 +		}
++	}
 +		UINT sz = 0;
 +		if (triple_is_camera_cb_candidate(pResource, &sz)) {
 +			tls_triple_map_res = pResource;
 +			tls_triple_map_ptr = pMappedResource->pData;
 +			tls_triple_map_size = sz;
++			ttdiag::Sumar(ttdiag::MAPS_CAMARA, 1);
 +		}
++	if (TT_VIEJOS_ACTIVOS) {
 +		// v1.47: identificar el buffer de instancias del pasto por su FIRMA, no
 +		// por quien lo bindea. El VS del pasto lo declara como
 +		// `dcl_resource_structured t1, 112`: un structured buffer de stride 112
@@ -5711,14 +6236,28 @@ index a0a8d701..8cf88b36 100644
 +			tls_sniff_n++;
 +		}
 +	}
++	}
 +
++	ttdiag::Sumar(ttdiag::TSC_EXTRAS, (LONG64)(ttdiag::Tsc() - tt_x0));
  	return hr;
  }
  
-@@ -1316,7 +2212,118 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
+@@ -1316,8 +2480,138 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
  	/* [annotation] */
  	__in  UINT Subresource)
  {
++#if TT_DIAG_VACIO
++	TrackAndDivertUnmap(pResource, Subresource);
++	{
++		unsigned long long tt_u0 = ttdiag::Tsc();
++		mOrigContext1->Unmap(pResource, Subresource);
++		ttdiag::Sumar(ttdiag::TSC_UNMAP_DRIVER, (LONG64)(ttdiag::Tsc() - tt_u0));
++	}
++	return;
++#endif
++	unsigned long long tt_e0 = ttdiag::Tsc();
++	LONG64 tt_extras = 0;
++	if (TT_VIEJOS_ACTIVOS) {
 +	if (tls_zone_dump && pResource == tls_zone_res) {
 +		ID3D11Resource *zone_res = tls_zone_res;
 +		void *zone_ptr = tls_zone_ptr;
@@ -5818,8 +6357,11 @@ index a0a8d701..8cf88b36 100644
 +			}
 +		}
 +	}
++	}
++	tt_extras += (LONG64)(ttdiag::Tsc() - tt_e0);
 +
  	TrackAndDivertUnmap(pResource, Subresource);
++	tt_e0 = ttdiag::Tsc();
 +
 +	// Triple-monitor: snoop the camera cb the game just wrote (see Map above).
 +	if (pResource == tls_triple_map_res && tls_triple_map_ptr) {
@@ -5831,10 +6373,15 @@ index a0a8d701..8cf88b36 100644
 +		tls_triple_map_ptr = NULL;
 +	}
 +
++	unsigned long long tt_u0 = ttdiag::Tsc();
++	tt_extras += (LONG64)(tt_u0 - tt_e0);
++	ttdiag::Sumar(ttdiag::TSC_EXTRAS, tt_extras);
  	mOrigContext1->Unmap(pResource, Subresource);
++	ttdiag::Sumar(ttdiag::TSC_UNMAP_DRIVER, (LONG64)(ttdiag::Tsc() - tt_u0));
  }
  
-@@ -1328,6 +2335,14 @@ STDMETHODIMP_(void) HackerContext::PSSetConstantBuffers(THIS_
+ STDMETHODIMP_(void) HackerContext::PSSetConstantBuffers(THIS_
+@@ -1328,6 +2622,14 @@ STDMETHODIMP_(void) HackerContext::PSSetConstantBuffers(THIS_
  	/* [annotation] */
  	__in_ecount(NumBuffers) ID3D11Buffer *const *ppConstantBuffers)
  {
@@ -5849,7 +6396,7 @@ index a0a8d701..8cf88b36 100644
  	 mOrigContext1->PSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
  }
  
-@@ -1551,6 +2566,168 @@ void HackerContext::AfterDispatch(DispatchContext *context)
+@@ -1551,6 +2853,168 @@ void HackerContext::AfterDispatch(DispatchContext *context)
  		RunCommandList(mHackerDevice, this, context->post_commands, &context->call_info, true);
  }
  
@@ -6018,7 +6565,7 @@ index a0a8d701..8cf88b36 100644
  STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
  	/* [annotation] */
  	__in  UINT ThreadGroupCountX,
-@@ -1561,6 +2738,22 @@ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
+@@ -1561,6 +3025,22 @@ STDMETHODIMP_(void) HackerContext::Dispatch(THIS_
  {
  	DispatchContext context{ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
  
@@ -6041,7 +6588,7 @@ index a0a8d701..8cf88b36 100644
  	if (BeforeDispatch(&context))
  		mOrigContext1->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
  	else
-@@ -1577,6 +2770,8 @@ STDMETHODIMP_(void) HackerContext::DispatchIndirect(THIS_
+@@ -1577,6 +3057,8 @@ STDMETHODIMP_(void) HackerContext::DispatchIndirect(THIS_
  {
  	DispatchContext context{&pBufferForArgs, AlignedByteOffsetForArgs};
  
@@ -6050,7 +6597,7 @@ index a0a8d701..8cf88b36 100644
  	if (BeforeDispatch(&context))
  		mOrigContext1->DispatchIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
  	else
-@@ -1607,6 +2802,59 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
+@@ -1607,6 +3089,70 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
  	/* [annotation] */
  	__in_ecount_opt(NumRects)  const D3D11_RECT *pRects)
  {
@@ -6071,7 +6618,18 @@ index a0a8d701..8cf88b36 100644
 +    // array. cull_site=100 tests full-map scissors; 0 preserves the game.
 +    // Keep the original rectangle above for the triple/UI restoration path.
 +    // Restrict this to square R32 depth arrays (3/4 cascades), never screen/UI.
-+    if (NumRects == 1 && pRects) {
++    // Diag/dr2-amd: el sondeo (OMGetRenderTargets + GetResource + QI + GetDesc
++    // en CADA scissor del juego, en los contextos diferidos) solo sirve con
++    // $cull_site = 100, que ninguna tecla ni la app ponen. Se mira primero la
++    // variable (leida una vez por cuadro) y recien despues el resto.
++#if TT_DIAG_VACIO
++    if (false) {
++#else
++    // Version de prueba: el atajo solo con LIVIANO; sin la casilla, como en la
++    // estable (se sondea cada scissor de un rectangulo).
++    if (NumRects == 1 && pRects && (!ttprueba::Activa(ttprueba::LIVIANO) ||
++            TripleReadIniGlobal(L"$cull_site").fval == 100.0f)) {
++#endif
 +        ID3D11DepthStencilView *depthView = nullptr;
 +        mOrigContext1->OMGetRenderTargets(0, nullptr, &depthView);
 +        if (depthView) {
@@ -6110,7 +6668,7 @@ index a0a8d701..8cf88b36 100644
  	 mOrigContext1->RSSetScissorRects(NumRects, pRects);
  }
  
-@@ -1681,6 +2929,9 @@ STDMETHODIMP_(void) HackerContext::CopySubresourceRegion(THIS_
+@@ -1681,6 +3227,9 @@ STDMETHODIMP_(void) HackerContext::CopySubresourceRegion(THIS_
  	D3D11_BOX replaceSrcBox;
  	UINT replaceDstX = DstX;
  
@@ -6120,7 +6678,7 @@ index a0a8d701..8cf88b36 100644
  	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
  		MarkResourceHashContaminated(pDstResource, DstSubresource, pSrcResource, SrcSubresource, 'S', DstX, DstY, DstZ, pSrcBox);
  	}
-@@ -1707,6 +2958,9 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
+@@ -1707,6 +3256,9 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
  	/* [annotation] */
  	__in  ID3D11Resource *pSrcResource)
  {
@@ -6130,7 +6688,7 @@ index a0a8d701..8cf88b36 100644
  	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
  		MarkResourceHashContaminated(pDstResource, 0, pSrcResource, 0, 'C', 0, 0, 0, NULL);
  	}
-@@ -1735,9 +2989,54 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
+@@ -1735,9 +3287,64 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
  		MarkResourceHashContaminated(pDstResource, DstSubresource, NULL, 0, 'U', 0, 0, 0, NULL);
  	}
  
@@ -6141,6 +6699,7 @@ index a0a8d701..8cf88b36 100644
 +	// v1.44/46: los buffers del pasto tambien pueden subir por aca. En ese caso
 +	// pSrcData es memoria PROPIA del juego —donde el culler escribio— y es
 +	// mejor objetivo que un buffer mapeado: persiste entre frames.
++	if (TT_VIEJOS_ACTIVOS) {
 +	if (pDstResource && g_bp_estado == 0 && pSrcData) {
 +		D3D11_BUFFER_DESC gd;
 +		if (triple_buffer_desc(pDstResource, &gd) &&
@@ -6155,8 +6714,15 @@ index a0a8d701..8cf88b36 100644
 +		}
 +	}
 +
++	}
++
 +	const void *triple_src = pSrcData;
 +	void *triple_tmp = NULL;
++	// TripleScanPlanesInCB esta neutralizado desde la v1.74 (devuelve 0 sin
++	// mirar nada) y cb_snap_store solo alimenta mediciones del log: con los
++	// diagnosticos viejos apagados este bloque no cambiaba nada y costaba un
++	// GetDesc y un spinlock global por cada constant buffer.
++	if (TT_VIEJOS_ACTIVOS) {
 +	if (pSrcData && !pDstBox) {
 +		D3D11_BUFFER_DESC bd;
 +		if (triple_buffer_desc(pDstResource, &bd) &&
@@ -6177,6 +6743,8 @@ index a0a8d701..8cf88b36 100644
 +		}
 +	}
 +
++	}
++
 +	 mOrigContext1->UpdateSubresource(pDstResource, DstSubresource, pDstBox, triple_src, SrcRowPitch,
  		SrcDepthPitch);
  
@@ -6186,7 +6754,7 @@ index a0a8d701..8cf88b36 100644
  	// We only update the destination resource hash when the entire
  	// subresource 0 is updated and pDstBox is NULL. We could check if the
  	// pDstBox fills the entire resource, but if the game is using pDstBox
-@@ -1756,6 +3055,14 @@ STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
+@@ -1756,6 +3363,14 @@ STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
  	/* [annotation] */
  	__in  ID3D11UnorderedAccessView *pSrcView)
  {
@@ -6201,7 +6769,20 @@ index a0a8d701..8cf88b36 100644
  	 mOrigContext1->CopyStructureCount(pDstBuffer, DstAlignedByteOffset, pSrcView);
  }
  
-@@ -1849,6 +3156,8 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
+@@ -1841,14 +3456,20 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
+ 	__in  ID3D11CommandList *pCommandList,
+ 	BOOL RestoreContextState)
+ {
+-	if (G->deferred_contexts_enabled)
++	if (G->deferred_contexts_enabled) {
++		unsigned long long tt_c0 = ttdiag::Tsc();
+ 		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
++		ttdiag::Sumar(ttdiag::EXECUTES, 1);
++		ttdiag::Sumar(ttdiag::TSC_EXECUTE, (LONG64)(ttdiag::Tsc() - tt_c0));
++	}
+ 
+ 	if (!RestoreContextState) {
+ 		// This is equivalent to calling ClearState() afterwards, so we
  		// need to rebind the 3DMigoto resources now. See also
  		// FinishCommandList's RestoreDeferredContextState:
  		Bind3DMigotoResources();
@@ -6210,7 +6791,7 @@ index a0a8d701..8cf88b36 100644
  	}
  }
  
-@@ -1956,6 +3265,23 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
+@@ -1956,6 +3577,23 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
  	/* [annotation] */
  	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
  {
@@ -6234,7 +6815,7 @@ index a0a8d701..8cf88b36 100644
  	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
  }
  
-@@ -1969,6 +3295,25 @@ STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
+@@ -1969,6 +3607,25 @@ STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
  	/* [annotation] */
  	__in_ecount(NumUAVs)  const UINT *pUAVInitialCounts)
  {
@@ -6260,7 +6841,7 @@ index a0a8d701..8cf88b36 100644
  	if (ppUnorderedAccessViews) {
  		// TODO: Record stats on unordered access view usage
  		for (UINT i = 0; i < NumUAVs; ++i) {
-@@ -2522,6 +3867,9 @@ STDMETHODIMP_(void) HackerContext::ClearState(THIS)
+@@ -2522,6 +4179,9 @@ STDMETHODIMP_(void) HackerContext::ClearState(THIS)
  {
  	 mOrigContext1->ClearState();
  
@@ -6270,75 +6851,95 @@ index a0a8d701..8cf88b36 100644
  	 // ClearState() will unbind StereoParams and IniParams, so we need to
  	 // rebind them now:
  	 Bind3DMigotoResources();
-@@ -2549,6 +3897,11 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
+@@ -2547,7 +4207,15 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
+ 	/* [annotation] */
+ 	__out_opt  ID3D11CommandList **ppCommandList)
  {
++	unsigned long long tt_f0 = ttdiag::Tsc();
  	BOOL ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
- 
++	ttdiag::Sumar(ttdiag::FINISHES, 1);
++	ttdiag::Sumar(ttdiag::TSC_FINISH, (LONG64)(ttdiag::Tsc() - tt_f0));
++
 +	// TRIPLE: al cerrar la lista, el contexto diferido vuelve al estado por
 +	// defecto -> el rect del juego ya no esta puesto.
 +	if (!RestoreDeferredContextState)
 +		mTripleScissorShadowCount = 0;
-+
+ 
  	if (!RestoreDeferredContextState) {
  		// This is equivalent to calling ClearState() afterwards, so we
- 		// need to rebind the 3DMigoto resources now. See also
-@@ -2789,6 +4142,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexed(THIS_
+@@ -2789,6 +4457,13 @@ STDMETHODIMP_(void) HackerContext::DrawIndexed(THIS_
  	/* [annotation] */
  	__in  INT BaseVertexLocation)
  {
++	ttdiag::Sumar(ttdiag::DRAWS, 1);
++#if !TT_DIAG_VACIO
 +	triple_medir_scatter(mCurrentVertexShader);
 +	triple_medir_sombras(mCurrentPixelShader);
 +	triple_medir_pasto_scatter(mCurrentVertexShader, IndexCount);
 +	triple_medir_zonas(mCurrentVertexShader, IndexCount, 1);
++#endif
  	DrawContext c = DrawContext(DrawCall::DrawIndexed, 0, IndexCount, 0, BaseVertexLocation, StartIndexLocation, 0, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2803,6 +4160,10 @@ STDMETHODIMP_(void) HackerContext::Draw(THIS_
+@@ -2803,6 +4478,13 @@ STDMETHODIMP_(void) HackerContext::Draw(THIS_
  	/* [annotation] */
  	__in  UINT StartVertexLocation)
  {
++	ttdiag::Sumar(ttdiag::DRAWS, 1);
++#if !TT_DIAG_VACIO
 +	triple_medir_scatter(mCurrentVertexShader);
 +	triple_medir_sombras(mCurrentPixelShader);
 +	triple_medir_pasto_scatter(mCurrentVertexShader, VertexCount);
 +	triple_medir_zonas(mCurrentVertexShader, VertexCount, 1);
++#endif
  	DrawContext c = DrawContext(DrawCall::Draw, VertexCount, 0, 0, StartVertexLocation, 0, 0, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2821,6 +4182,11 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
+@@ -2821,6 +4503,15 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
  {
  	mOrigContext1->IASetIndexBuffer(pIndexBuffer, Format, Offset);
  
 +	// Sin gate de hunting: se usa para identificar el auto por su malla en juego
 +	// normal. El hash sale de un mapa poblado al crear el recurso, asi que esto
 +	// es una busqueda y nada mas.
++#if TT_DIAG_VACIO
++	mTripleIB = 0;
++#else
 +	mTripleIB = pIndexBuffer ? GetResourceHash(pIndexBuffer) : 0;
++#endif
 +
  	// This is only used for index buffer hunting nowadays since the
  	// command list checks the hash on demand only when it is needed
  	mCurrentIndexBuffer = 0;
-@@ -2847,6 +4213,10 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstanced(THIS_
+@@ -2847,6 +4538,13 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstanced(THIS_
  	/* [annotation] */
  	__in  UINT StartInstanceLocation)
  {
++	ttdiag::Sumar(ttdiag::DRAWS, 1);
++#if !TT_DIAG_VACIO
 +	triple_medir_scatter(mCurrentVertexShader);
 +	triple_medir_sombras(mCurrentPixelShader);
 +	triple_medir_pasto_scatter(mCurrentVertexShader, IndexCountPerInstance);
 +	triple_medir_zonas(mCurrentVertexShader, IndexCountPerInstance, InstanceCount);
++#endif
  	DrawContext c = DrawContext(DrawCall::DrawIndexedInstanced, 0, IndexCountPerInstance, InstanceCount, BaseVertexLocation, StartIndexLocation, StartInstanceLocation, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2866,6 +4236,10 @@ STDMETHODIMP_(void) HackerContext::DrawInstanced(THIS_
+@@ -2866,6 +4564,13 @@ STDMETHODIMP_(void) HackerContext::DrawInstanced(THIS_
  	/* [annotation] */
  	__in  UINT StartInstanceLocation)
  {
++	ttdiag::Sumar(ttdiag::DRAWS, 1);
++#if !TT_DIAG_VACIO
 +	triple_medir_scatter(mCurrentVertexShader);
 +	triple_medir_sombras(mCurrentPixelShader);
 +	triple_medir_pasto_scatter(mCurrentVertexShader, VertexCountPerInstance);
 +	triple_medir_zonas(mCurrentVertexShader, VertexCountPerInstance, InstanceCount);
++#endif
  	DrawContext c = DrawContext(DrawCall::DrawInstanced, VertexCountPerInstance, 0, InstanceCount, StartVertexLocation, 0, StartInstanceLocation, NULL, 0);
  	BeforeDraw(c);
  
-@@ -2882,6 +4256,25 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
+@@ -2882,6 +4587,29 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
  	/* [annotation] */
  	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
  {
@@ -6347,7 +6948,11 @@ index a0a8d701..8cf88b36 100644
 +	// stride, y adivinar cual es el del pasto por su contenido lleva a
 +	// confundirlo con los del spline de la pista (que tambien son posiciones).
 +	// Con la sombra completa, el draw del pasto dice EXACTAMENTE que usa.
++#if !TT_DIAG_VACIO
 +	if (ppShaderResourceViews) {
++#else
++	if (false) {
++#endif
 +		for (UINT i = 0; i < NumViews; i++) {
 +			UINT slot = StartSlot + i;
 +			if (slot >= 32)
@@ -6364,7 +6969,7 @@ index a0a8d701..8cf88b36 100644
  	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
  }
  
-@@ -2994,6 +4387,12 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstancedIndirect(THIS_
+@@ -2994,6 +4722,12 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstancedIndirect(THIS_
  	/* [annotation] */
  	__in  UINT AlignedByteOffsetForArgs)
  {
@@ -6377,7 +6982,7 @@ index a0a8d701..8cf88b36 100644
  	DrawContext c = DrawContext(DrawCall::DrawIndexedInstancedIndirect, 0, 0, 0, 0, 0, 0, &pBufferForArgs, AlignedByteOffsetForArgs);
  	BeforeDraw(c);
  
-@@ -3008,6 +4407,8 @@ STDMETHODIMP_(void) HackerContext::DrawInstancedIndirect(THIS_
+@@ -3008,6 +4742,8 @@ STDMETHODIMP_(void) HackerContext::DrawInstancedIndirect(THIS_
  	/* [annotation] */
  	__in  UINT AlignedByteOffsetForArgs)
  {
@@ -6418,10 +7023,18 @@ index 33c26e18..7ae1a9d4 100644
  	UINT64 mCurrentHullShader;
  	UINT64 mCurrentDomainShader;
 diff --git a/DirectX11/HackerDXGI.cpp b/DirectX11/HackerDXGI.cpp
-index 82cfd092..1f8cbbe7 100644
+index 82cfd092..9d7d9d5f 100644
 --- a/DirectX11/HackerDXGI.cpp
 +++ b/DirectX11/HackerDXGI.cpp
-@@ -539,6 +539,8 @@ STDMETHODIMP HackerSwapChain::GetDevice(
+@@ -71,6 +71,7 @@
+ #include "CommandList.h"
+ #include "profiling.h"
+ #include "cursor.h" // For InstallHookLate
++#include "TrueTripleDiag.h"
+ 
+ 
+ // -----------------------------------------------------------------------------
+@@ -539,12 +540,15 @@ STDMETHODIMP HackerSwapChain::GetDevice(
  // -----------------------------------------------------------------------------
  /** IDXGISwapChain **/
  
@@ -6430,7 +7043,14 @@ index 82cfd092..1f8cbbe7 100644
  STDMETHODIMP HackerSwapChain::Present(THIS_
  	/* [in] */ UINT SyncInterval,
  	/* [in] */ UINT Flags)
-@@ -560,6 +562,11 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
+ {
+ 	Profiling::State profiling_state = {0};
+ 	bool profiling = false;
++	unsigned long long tt_acc0 = ttdiag::Tsc(), tt_acc1 = tt_acc0;
+ 
+ 	LogDebug("HackerSwapChain::Present(%s@%p) called with\n", type_name(this), this);
+ 	LogDebug("  SyncInterval = %d\n", SyncInterval);
+@@ -560,13 +564,29 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
  		// which enables hunting, and snapshots, and aiming overrides and other inputs
  		RunFrameActions();
  
@@ -6441,7 +7061,56 @@ index 82cfd092..1f8cbbe7 100644
 +
  		if (profiling)
  			Profiling::end(&profiling_state, &Profiling::present_overhead);
++		tt_acc1 = ttdiag::Tsc();
  	}
+ 
+ 	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
++	unsigned long long tt_p0 = ttdiag::Tsc();
+ 	HRESULT hr = mOrigSwapChain1->Present(SyncInterval, Flags);
++	unsigned long long tt_p1 = ttdiag::Tsc();
+ 	get_tls()->hooking_quirk_protection = false;
++	if (!(Flags & DXGI_PRESENT_TEST)) {
++		ttdiag::Cuadro(tt_acc1 - tt_acc0, tt_p1 - tt_p0);
++		static bool tt_info = false;
++		if (!tt_info && mHackerDevice) {
++			tt_info = true;
++			ttdiag::InfoDispositivo(mHackerDevice->GetPassThroughOrigDevice1());
++		}
++	}
+ 
+ 	if (!(Flags & DXGI_PRESENT_TEST)) {
+ 		if (profiling)
+@@ -852,6 +872,7 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
+ 	Profiling::State profiling_state = {0};
+ 	gLogDebug = true;
+ 	bool profiling = false;
++	unsigned long long tt_acc0 = ttdiag::Tsc(), tt_acc1 = tt_acc0;
+ 
+ 	LogDebug("HackerSwapChain::Present1(%s@%p) called\n", type_name(this), this);
+ 	LogDebug("  SyncInterval = %d\n", SyncInterval);
+@@ -869,11 +890,22 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
+ 
+ 		if (profiling)
+ 			Profiling::end(&profiling_state, &Profiling::present_overhead);
++		tt_acc1 = ttdiag::Tsc();
+ 	}
+ 
+ 	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
++	unsigned long long tt_p0 = ttdiag::Tsc();
+ 	HRESULT hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
++	unsigned long long tt_p1 = ttdiag::Tsc();
+ 	get_tls()->hooking_quirk_protection = false;
++	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
++		ttdiag::Cuadro(tt_acc1 - tt_acc0, tt_p1 - tt_p0);
++		static bool tt_info1 = false;
++		if (!tt_info1 && mHackerDevice) {
++			tt_info1 = true;
++			ttdiag::InfoDispositivo(mHackerDevice->GetPassThroughOrigDevice1());
++		}
++	}
+ 
+ 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+ 		if (profiling)
 diff --git a/DirectX11/Hunting.cpp b/DirectX11/Hunting.cpp
 index b1c7861d..b424f5d1 100644
 --- a/DirectX11/Hunting.cpp
@@ -6465,10 +7134,10 @@ index b1c7861d..b424f5d1 100644
  }
  
 diff --git a/DirectX11/IniHandler.cpp b/DirectX11/IniHandler.cpp
-index 2c88983b..ae4017d1 100644
+index 2c88983b..925db965 100644
 --- a/DirectX11/IniHandler.cpp
 +++ b/DirectX11/IniHandler.cpp
-@@ -19,12 +19,30 @@
+@@ -19,12 +19,119 @@
  #include "cursor.h"
  
  #include "shellscalingapi.h"
@@ -6485,6 +7154,95 @@ index 2c88983b..ae4017d1 100644
 +// verificador de la marca firmada (v2, 16/11/2026), para la linea del log.
 +static const char *tt_motivo = "";
 +static char tt_detalle[truetriple::kMarcaDetalleMax] = "";
++
++#include "TrueTripleDiag.h"
++#include "TrueTriplePrueba.h"
++
++// ---- Opciones de la version de prueba (TrueTriplePrueba.h) ----------------
++namespace ttprueba {
++
++volatile LONG g_bits = 0;
++volatile LONG g_generacion = 0;
++static char g_texto[64] = "ninguna";
++
++static void armar_texto(LONG b)
++{
++	g_texto[0] = 0;
++	if (b & LIVIANO)  strcat_s(g_texto, sizeof(g_texto), "liviano ");
++	if (b & RASTER)   strcat_s(g_texto, sizeof(g_texto), "raster ");
++	if (b & REDIBUJO) strcat_s(g_texto, sizeof(g_texto), "redibujo ");
++	size_t n = strlen(g_texto);
++	if (n)
++		g_texto[n - 1] = 0;
++	else
++		strcpy_s(g_texto, sizeof(g_texto), "ninguna");
++}
++
++const char *Texto()
++{
++	return g_texto;
++}
++
++// La linea "#tt-prueba: liviano raster redibujo" del cartel de F3. El archivo
++// lo escribe el plugin en cada Jugar con lo que arma la web (CONTRATO-MENU-F3:
++// las lineas con '#' no se dibujan). Cualquier otra palabra se ignora.
++void Leer()
++{
++	LONG b = 0;
++	wchar_t ruta[MAX_PATH];
++	if (GetModuleFileName(migoto_handle, ruta, MAX_PATH)) {
++		wchar_t *barra = wcsrchr(ruta, L'\\');
++		if (barra && (size_t)(barra + 1 - ruta) + 24 < MAX_PATH) {
++			wcscpy_s(barra + 1, MAX_PATH - (barra + 1 - ruta), L"TrueTriple.menu.txt");
++			FILE *f = NULL;
++			if (!_wfopen_s(&f, ruta, L"rb") && f) {
++				char linea[512];
++				while (fgets(linea, sizeof(linea), f)) {
++					const char *p = linea;
++					if (!strncmp(p, "\xEF\xBB\xBF", 3))
++						p += 3;
++					if (strncmp(p, "#tt-prueba:", 11))
++						continue;
++					p += 11;
++					if (strstr(p, "liviano"))  b |= LIVIANO;
++					if (strstr(p, "raster"))   b |= RASTER;
++					if (strstr(p, "redibujo")) b |= REDIBUJO;
++					break;
++				}
++				fclose(f);
++			}
++		}
++	}
++	InterlockedExchange(&g_bits, b);
++	InterlockedIncrement(&g_generacion);
++	armar_texto(b);
++}
++
++} // namespace ttprueba
++
++int TrueTripleDiagSesion()
++{
++	return tt_sesion;
++}
++
++#if TT_DIAG_VACIO
++// Variante A del dll de diagnostico (TrueTripleDiag.h): 3Dmigoto sin nada
++// nuestro. Como el ini inerte, pero sin log y con una carpeta de shaders que
++// no existe, asi no se carga ningun reemplazo de ShaderFixes. No necesita la
++// marca: no hace nada del mod.
++static const char kIniDiagVacio[] =
++	"[Logging]\n"
++	"calls=0\n"
++	"input=0\n"
++	"debug=0\n"
++	"unbuffered=0\n"
++	"force_cpu_affinity=0\n"
++	"crash=0\n"
++	"[Rendering]\n"
++	"override_directory=TrueTriple_diag_sin_shaders\n"
++	"[Hunting]\n"
++	"hunting=0\n";
++#endif
  
  #include <filesystem>
 -// TODO: We probably don't need this <filesystem> header
@@ -6503,7 +7261,7 @@ index 2c88983b..ae4017d1 100644
  
  #define INI_FILENAME L"d3dx.ini"
  
-@@ -464,7 +482,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
+@@ -464,7 +571,7 @@ bool check_include_condition(wstring *val, const wstring *ini_namespace)
  	}
  
  	if (!ret)
@@ -6512,7 +7270,7 @@ index 2c88983b..ae4017d1 100644
  
  	return !!ret;
  }
-@@ -474,7 +492,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+@@ -474,7 +581,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
  	size_t first, last, delim;
  	wstring key, val;
  
@@ -6521,7 +7279,7 @@ index 2c88983b..ae4017d1 100644
  
  	// Key / Val pair
  	delim = wline->find(L"=");
-@@ -491,7 +509,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
+@@ -491,7 +598,7 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
  		}
  
  		if (!_wcsicmp(key.c_str(), L"namespace")) {
@@ -6530,7 +7288,7 @@ index 2c88983b..ae4017d1 100644
  			*ini_namespace = val;
  			return true;
  		}
-@@ -846,6 +864,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
+@@ -846,6 +953,40 @@ void GetIniSection(IniSectionVector **key_vals, const wchar_t *section)
  	return _GetIniSection(&ini_sections, key_vals, section);
  }
  
@@ -6571,7 +7329,7 @@ index 2c88983b..ae4017d1 100644
  // This emulates the behaviour of the old GetPrivateProfileString API to
  // facilitate switching to our own ini parser. Later we might consider changing
  // the return values (e.g. return found/not found instead of string length),
-@@ -951,7 +1003,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+@@ -951,7 +1092,7 @@ int GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
  	int rc = GetIniString(section, key, def, ret, size);
  
  	if (rc)
@@ -6580,7 +7338,7 @@ index 2c88983b..ae4017d1 100644
  
  	return rc;
  }
-@@ -961,7 +1013,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
+@@ -961,7 +1102,7 @@ static bool GetIniStringAndLog(const wchar_t *section, const wchar_t *key,
  	bool rc = GetIniString(section, key, def, ret);
  
  	if (rc)
@@ -6589,7 +7347,7 @@ index 2c88983b..ae4017d1 100644
  
  	return rc;
  }
-@@ -983,7 +1035,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
+@@ -983,7 +1124,7 @@ float GetIniFloat(const wchar_t *section, const wchar_t *key, float def, bool *f
  		} else {
  			if (found)
  				*found = true;
@@ -6598,7 +7356,7 @@ index 2c88983b..ae4017d1 100644
  		}
  	}
  
-@@ -1008,7 +1060,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
+@@ -1008,7 +1149,7 @@ int GetIniInt(const wchar_t *section, const wchar_t *key, int def, bool *found,
  		} else {
  			if (found)
  				*found = true;
@@ -6607,7 +7365,7 @@ index 2c88983b..ae4017d1 100644
  		}
  	}
  
-@@ -1025,13 +1077,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
+@@ -1025,13 +1166,13 @@ bool GetIniBool(const wchar_t *section, const wchar_t *key, bool def, bool *foun
  
  	if (GetIniString(section, key, 0, val, 32)) {
  		if (!_wcsicmp(val, L"1") || !_wcsicmp(val, L"true") || !_wcsicmp(val, L"yes") || !_wcsicmp(val, L"on")) {
@@ -6623,7 +7381,7 @@ index 2c88983b..ae4017d1 100644
  			if (found)
  				*found = true;
  			return false;
-@@ -1060,7 +1112,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
+@@ -1060,7 +1201,7 @@ static UINT64 GetIniHash(const wchar_t *section, const wchar_t *key, UINT64 def,
  		} else {
  			if (found)
  				*found = true;
@@ -6632,7 +7390,7 @@ index 2c88983b..ae4017d1 100644
  		}
  	}
  
-@@ -1083,7 +1135,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
+@@ -1083,7 +1224,7 @@ static int GetIniHexString(const wchar_t *section, const wchar_t *key, int def,
  		} else {
  			if (found)
  				*found = true;
@@ -6641,7 +7399,7 @@ index 2c88983b..ae4017d1 100644
  		}
  	}
  
-@@ -1127,7 +1179,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
+@@ -1127,7 +1268,7 @@ static int GetIniEnum(const wchar_t *section, const wchar_t *key, int def, bool
  			ret = ParseEnum(val, prefix, names, names_len, first);
  			if (found)
  				*found = true;
@@ -6650,7 +7408,7 @@ index 2c88983b..ae4017d1 100644
  		} catch (EnumParseError) {
  			IniWarning("WARNING: Unrecognised %S=%S\n", key, val);
  		}
-@@ -1155,7 +1207,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+@@ -1155,7 +1296,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
  		if (tmp_found) {
  			if (found)
  				*found = tmp_found;
@@ -6659,7 +7417,7 @@ index 2c88983b..ae4017d1 100644
  		} else {
  			IniWarning("WARNING: Unknown %S=%S\n", key, val);
  		}
-@@ -1188,7 +1240,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
+@@ -1188,7 +1329,7 @@ T GetIniEnumClass(const wchar_t *section, const wchar_t *key, T def, bool *found
  		if (tmp_found) {
  			if (found)
  				*found = tmp_found;
@@ -6668,7 +7426,7 @@ index 2c88983b..ae4017d1 100644
  		} else {
  			IniWarning("WARNING: Unknown %S=%s\n", key, val.c_str());
  		}
-@@ -1276,6 +1328,14 @@ static void ParseIncludedIniFiles()
+@@ -1276,6 +1417,14 @@ static void ParseIncludedIniFiles()
  	// ini_sections data structure:
  	GetUserConfigPath(migoto_path);
  
@@ -6683,7 +7441,7 @@ index 2c88983b..ae4017d1 100644
  	// Do this before removing [Include] from ini_sections. TODO: Allow
  	// recursively included files to modify the exclude mid-recursion:
  	exclude = globbing_vector_to_regex(GetIniStringMultipleKeys(L"Include", L"exclude_recursive"));
-@@ -1296,7 +1356,7 @@ static void ParseIncludedIniFiles()
+@@ -1296,7 +1445,7 @@ static void ParseIncludedIniFiles()
  
  		for (i = include_sections.begin(); i != include_sections.end(); i++) {
  			section_id = i->first.c_str();
@@ -6692,7 +7450,7 @@ index 2c88983b..ae4017d1 100644
  
  			_get_namespaced_section_path(&include_sections, i->first.c_str(), &namespace_path);
  
-@@ -1304,7 +1364,7 @@ static void ParseIncludedIniFiles()
+@@ -1304,7 +1453,7 @@ static void ParseIncludedIniFiles()
  			for (entry = section->begin(); entry < section->end(); entry++) {
  				key = &entry->first;
  				val = &entry->second;
@@ -6701,7 +7459,7 @@ index 2c88983b..ae4017d1 100644
  
  				rel_path = namespace_path + *val;
  
-@@ -1334,9 +1394,17 @@ static void ParseIncludedIniFiles()
+@@ -1334,9 +1483,17 @@ static void ParseIncludedIniFiles()
  
  	free_globbing_vector(exclude);
  
@@ -6720,7 +7478,7 @@ index 2c88983b..ae4017d1 100644
  	if (attrib != INVALID_FILE_ATTRIBUTES)
  		ParseNamespacedIniFile(G->user_config.c_str(), &G->user_config);
  }
-@@ -1345,7 +1413,7 @@ static void RegisterPresetKeyBindings()
+@@ -1345,7 +1502,7 @@ static void RegisterPresetKeyBindings()
  {
  	KeyOverrideType type;
  	shared_ptr<KeyOverrideBase> preset;
@@ -6729,7 +7487,7 @@ index 2c88983b..ae4017d1 100644
  	IniSections::iterator lower, upper, i;
  	vector<wstring> keys;
  	vector<wstring> back;
-@@ -1356,7 +1424,7 @@ static void RegisterPresetKeyBindings()
+@@ -1356,7 +1513,7 @@ static void RegisterPresetKeyBindings()
  	for (i = lower; i != upper; i++) {
  		const wchar_t *id = i->first.c_str();
  
@@ -6738,7 +7496,7 @@ index 2c88983b..ae4017d1 100644
  
  		keys = GetIniStringMultipleKeys(id, L"Key");
  		back = GetIniStringMultipleKeys(id, L"Back");
-@@ -1370,12 +1438,29 @@ static void RegisterPresetKeyBindings()
+@@ -1370,12 +1527,29 @@ static void RegisterPresetKeyBindings()
  		delay = GetIniInt(id, L"delay", 0, NULL);
  		release_delay = GetIniInt(id, L"release_delay", 0, NULL);
  
@@ -6769,7 +7527,7 @@ index 2c88983b..ae4017d1 100644
  		} else {
  			preset = make_shared<KeyOverride>(type);
  		}
-@@ -1383,7 +1468,7 @@ static void RegisterPresetKeyBindings()
+@@ -1383,7 +1557,7 @@ static void RegisterPresetKeyBindings()
  		preset->ParseIniSection(id);
  
  		for (wstring key : keys)
@@ -6778,7 +7536,7 @@ index 2c88983b..ae4017d1 100644
  	}
  }
  
-@@ -1418,7 +1503,7 @@ static void ParsePresetOverrideSections()
+@@ -1418,7 +1592,7 @@ static void ParsePresetOverrideSections()
  		const wchar_t *id = i->first.c_str();
  		preset = &i->second;
  
@@ -6787,7 +7545,7 @@ index 2c88983b..ae4017d1 100644
  
  		// Read parameters from ini
  		preset->ParseIniSection(id);
-@@ -1756,7 +1841,7 @@ static void ParseResourceSections()
+@@ -1756,7 +1930,7 @@ static void ParseResourceSections()
  	lower = ini_sections.lower_bound(wstring(L"Resource"));
  	upper = prefix_upper_bound(ini_sections, wstring(L"Resource"));
  	for (i = lower; i != upper; i++) {
@@ -6796,7 +7554,7 @@ index 2c88983b..ae4017d1 100644
  
  		// Convert section name to lower case so our keys will be
  		// consistent in the unordered_map:
-@@ -1803,7 +1888,7 @@ static void ParseResourceSections()
+@@ -1803,7 +1977,7 @@ static void ParseResourceSections()
  			if (custom_resource->override_format == (DXGI_FORMAT)-1) {
  				IniWarning("WARNING: Unknown format \"%S\"\n", setting);
  			} else {
@@ -6805,7 +7563,7 @@ index 2c88983b..ae4017d1 100644
  			}
  		}
  
-@@ -1959,7 +2044,7 @@ static void ParseCommandList(const wchar_t *id,
+@@ -1959,7 +2133,7 @@ static void ParseCommandList(const wchar_t *id,
  		}
  
  		if (ParseCommandListLine(id, key_ptr, val, raw_line, command_list, explicit_command_list, pre_command_list, post_command_list, &entry->ini_namespace)) {
@@ -6814,7 +7572,7 @@ index 2c88983b..ae4017d1 100644
  			continue;
  		}
  
-@@ -2113,9 +2198,9 @@ static void ParseConstantsSection()
+@@ -2113,9 +2287,9 @@ static void ParseConstantsSection()
  			persistent_variables.emplace_back(&inserted.first->second);
  
  		if (val->empty())
@@ -6826,7 +7584,7 @@ index 2c88983b..ae4017d1 100644
  
  		// Remove this line from the ini section data structures so the
  		// command list won't consider it in the 2nd pass:
-@@ -2266,7 +2351,7 @@ static void ParseShaderOverrideSections()
+@@ -2266,7 +2440,7 @@ static void ParseShaderOverrideSections()
  	for (i = lower; i != upper; i++) {
  		id = i->first.c_str();
  
@@ -6835,7 +7593,7 @@ index 2c88983b..ae4017d1 100644
  
  		hash = GetIniHash(id, L"Hash", 0, &found);
  		if (!found) {
-@@ -2411,7 +2496,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+@@ -2411,7 +2585,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
  		// job for another day
  		wline = &entry->raw_line;
  		aline = std::string(wline->begin(), wline->end());
@@ -6844,7 +7602,7 @@ index 2c88983b..ae4017d1 100644
  		pattern.append(aline);
  	}
  
-@@ -2420,9 +2505,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
+@@ -2420,9 +2594,9 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
  	// stripped, so that if there is a problem the user can see exactly
  	// what we used. This will look ugly, but will make errors like missing
  	// \n or \s+ easier to spot.
@@ -6857,7 +7615,7 @@ index 2c88983b..ae4017d1 100644
  
  	regex_pattern = &regex_group->patterns[*pattern_id];
  	if (!regex_pattern->compile(&pattern))
-@@ -2456,7 +2541,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
+@@ -2456,7 +2630,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
  		// job for another day
  		wline = &entry->raw_line;
  		aline = std::string(wline->begin(), wline->end());
@@ -6866,7 +7624,7 @@ index 2c88983b..ae4017d1 100644
  		regex_group->declarations.push_back(aline);
  	}
  
-@@ -2486,16 +2571,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
+@@ -2486,16 +2660,16 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
  		// job for another day
  		wline = &entry->raw_line;
  		aline = std::string(wline->begin(), wline->end());
@@ -6887,7 +7645,7 @@ index 2c88983b..ae4017d1 100644
  
  	regex_pattern->do_replace = true;
  	return true;
-@@ -2561,7 +2646,7 @@ static void ParseShaderRegexSections()
+@@ -2561,7 +2735,7 @@ static void ParseShaderRegexSections()
  	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
  	for (i = lower; i != upper; i++) {
  		section_id = &i->first;
@@ -6896,7 +7654,7 @@ index 2c88983b..ae4017d1 100644
  
  		hash = hash_ini_section(hash, section_id);
  
-@@ -2859,7 +2944,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
+@@ -2859,7 +3033,7 @@ static void parse_texture_override_common(const wchar_t *id, TextureOverride *ov
  		{
  			if (id[j] <= 0) break;
  			override->iterations.push_back(id[j]);
@@ -6905,7 +7663,7 @@ index 2c88983b..ae4017d1 100644
  		}
  	}
  
-@@ -2925,7 +3010,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+@@ -2925,7 +3099,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
  	if (!setting.size() || !setting.compare(L"0")) {
  		*val = 0;
  		*mask = 0xffffffff;
@@ -6914,7 +7672,7 @@ index 2c88983b..ae4017d1 100644
  		return true;
  	}
  
-@@ -2934,7 +3019,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+@@ -2934,7 +3108,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
  	if (ret != 0 && ret != EOF && (len1 == setting.length() || len2 == setting.length())) {
  		if (ret == 2)
  			*mask = 0xffffffff;
@@ -6923,7 +7681,7 @@ index 2c88983b..ae4017d1 100644
  		return true;
  	}
  
-@@ -2976,7 +3061,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
+@@ -2976,7 +3150,7 @@ static bool parse_masked_flags_field(const wstring setting, unsigned *val, unsig
  
  	if (!use_mask)
  		*mask = 0xffffffff;
@@ -6932,7 +7690,7 @@ index 2c88983b..ae4017d1 100644
  
  	return true;
  }
-@@ -3124,7 +3209,7 @@ static void ParseTextureOverrideSections()
+@@ -3124,7 +3298,7 @@ static void ParseTextureOverrideSections()
  	for (i = lower; i != upper; i++) {
  		id = i->first.c_str();
  
@@ -6941,7 +7699,17 @@ index 2c88983b..ae4017d1 100644
  
  		hash = (uint32_t)GetIniHash(id, L"Hash", 0, &found);
  		if (!found) {
-@@ -3845,7 +3930,7 @@ static void ParseCustomShaderSections()
+@@ -3813,7 +3987,8 @@ static void _EnumerateCustomShaderSections(IniSections::iterator lower, IniSecti
+ 		std::transform(shader_id.begin(), shader_id.end(), shader_id.begin(), ::towlower);
+ 
+ 		// Construct a custom shader in the global list:
+-		customShaders[shader_id];
++		customShaders[shader_id].tt_redibujo =
++			(shader_id == L"customshadertripleredraw");
+ 	}
+ }
+ static void EnumerateCustomShaderSections()
+@@ -3845,7 +4020,7 @@ static void ParseCustomShaderSections()
  
  		// FIXME: This will be logged in lower case. It would be better
  		// to use the original case, but not a big deal:
@@ -6950,7 +7718,7 @@ index 2c88983b..ae4017d1 100644
  
  		failed = false;
  
-@@ -3943,7 +4028,7 @@ static void ParseExplicitCommandListSections()
+@@ -3943,7 +4118,7 @@ static void ParseExplicitCommandListSections()
  
  		// FIXME: This will be logged in lower case. It would be better
  		// to use the original case, but not a big deal:
@@ -6959,7 +7727,7 @@ index 2c88983b..ae4017d1 100644
  		ParseCommandList(section_id->c_str(), &command_list_section->command_list, &command_list_section->post_command_list, NULL);
  	}
  }
-@@ -4092,7 +4177,31 @@ void LoadConfigFile()
+@@ -4092,7 +4267,44 @@ void LoadConfigFile()
  	LogInfo("[Logging]\n");
  	LogInfo("  calls=1\n");
  
@@ -6975,6 +7743,11 @@ index 2c88983b..ae4017d1 100644
 +	// MarcaVerificarLocal devuelve el estado y el log deja el motivo del reposo
 +	// y un detalle corto. El texto "TrueTriple: sin sesion" queda literal y
 +	// seguido: lo buscan los scripts de build y el plugin en el binario.
++#if TT_DIAG_VACIO
++	// Reposo a la fuerza: d3dx_user.ini no se lee ni se toca.
++	tt_sesion = 0;
++	tt_motivo = "diagnostico A";
++#endif
 +	if (tt_sesion < 0) {
 +		const truetriple::MarcaEstado tt_estado = truetriple::MarcaVerificarLocal(
 +			"dr2", (long long)time(NULL), tt_detalle, sizeof(tt_detalle));
@@ -6983,16 +7756,24 @@ index 2c88983b..ae4017d1 100644
 +	}
 +	if (tt_sesion) {
 +		LogInfo("TrueTriple: sesion abierta (%s)\n", tt_motivo);
++		ttprueba::Leer();
++		LogInfo("TrueTriple prueba: opciones = %s (bits=%ld)\n", ttprueba::Texto(), (long)ttprueba::g_bits);
 +		ParseIniFile(iniFile);
 +	} else {
++		InterlockedExchange(&ttprueba::g_bits, 0);
 +		LogInfo("TrueTriple: sin sesion (%s), el mod queda en reposo [%s]\n", tt_motivo, tt_detalle);
 +		ini_sections.clear();
++#if TT_DIAG_VACIO
++		LogInfo("TrueTriple: diagnostico A, 3Dmigoto vacio (sin ini, sin ShaderFixes)\n");
++		ParseIniExcerpt(kIniDiagVacio);
++#else
 +		ParseIniExcerpt(truetriple::kIniReposo);
++#endif
 +	}
  	InsertBuiltInIniSections();
  
  	G->gLogInput = GetIniBool(L"Logging", L"input", false, NULL);
-@@ -4478,6 +4587,21 @@ void SavePersistentSettings()
+@@ -4478,6 +4690,21 @@ void SavePersistentSettings()
  {
  	FILE *f;
  
@@ -7014,7 +7795,7 @@ index 2c88983b..ae4017d1 100644
  	if (!G->user_config_dirty)
  		return;
  	G->user_config_dirty = 0;
-@@ -4513,6 +4637,9 @@ static void WipeUserConfig()
+@@ -4513,6 +4740,9 @@ static void WipeUserConfig()
  	G->gWipeUserConfig = false;
  	G->user_config_dirty = 0;
  
@@ -9101,6 +9882,105 @@ index 00000000..0cfd83fa
 +Result Remove();
 +const wchar_t *Describe(Result result);
 +}
+diff --git a/DirectX11/TrueTripleDiag.h b/DirectX11/TrueTripleDiag.h
+new file mode 100644
+index 00000000..2b2b2510
+--- /dev/null
++++ b/DirectX11/TrueTripleDiag.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++// TrueTriple: dll de DIAGNOSTICO de rendimiento (rama diag/dr2-amd-map-unmap,
++// 24/11/2026, caso de una RX 9070 XT que queda con la GPU al 30-50% con el mod
++// enganchado aunque F7 apague el triple).
++//
++// Nada de esto entra en un build normal: las dos macros valen 0 salvo que el
++// build las pase por la variable de entorno CL (ver tools/build-diag-amd.ps1):
++//
++//   TT_DIAG_INSTRUMENTAR=1  cuenta por cuadro Map/Unmap, draws, listas de
++//                           comandos y el tiempo de Present, y cada 10 s escribe
++//                           una linea en TrueTriple_diag.txt al lado del dll.
++//   TT_DIAG_VACIO=1         variante A: 3Dmigoto "vacio". No carga ningun ini
++//                           de la carpeta (ni el armado ni el inerte), no carga
++//                           ShaderFixes y saltea nuestros agregados en los
++//                           caminos calientes del contexto. Es el intermediario
++//                           solo, para ver si ya eso frena.
++//
++// Sin VACIO, el build con INSTRUMENTAR es la variante B: el dll normal con el
++// arreglo candidato (variables del ini leidas una vez por cuadro y sin los
++// diagnosticos viejos en Map/Unmap) mas los contadores.
++//
++// Los contadores son por hilo (cada contexto diferido del juego es un hilo):
++// sin candados ni atomicos en el camino caliente. El hilo de Present los suma
++// cada 10 s; una lectura corrida en un contador no importa para un promedio.
++
++#ifndef TT_DIAG_INSTRUMENTAR
++#define TT_DIAG_INSTRUMENTAR 0
++#endif
++#ifndef TT_DIAG_VACIO
++#define TT_DIAG_VACIO 0
++#endif
++
++#include <windows.h>
++#include <intrin.h>
++#include <d3d11.h>
++
++namespace ttdiag {
++
++enum Contador {
++	MAPS = 0,          // Map de cualquier tipo
++	MAPS_ESCRITURA,    // WRITE / WRITE_DISCARD / WRITE_NO_OVERWRITE
++	MAPS_LECTURA,      // READ / READ_WRITE: la CPU espera a la GPU si el dato no esta
++	MAPS_CAMARA,       // constant buffer de 256 a 320 bytes mapeado para escribir
++	TSC_MAP_DRIVER,    // ciclos adentro del Map del driver (todos)
++	TSC_MAP_LECTURA,   // ciclos adentro del Map del driver, solo lecturas
++	TSC_UNMAP_DRIVER,  // ciclos adentro del Unmap del driver
++	TSC_EXTRAS,        // ciclos de NUESTRO codigo en Map/Unmap (no el del driver)
++	DRAWS,             // Draw, DrawIndexed, DrawInstanced, DrawIndexedInstanced
++	EXECUTES,          // ExecuteCommandList (contexto inmediato)
++	TSC_EXECUTE,
++	FINISHES,          // FinishCommandList (contextos diferidos)
++	TSC_FINISH,
++	INI_CANDADO,       // lecturas del ini que tomaron el candado global
++	N
++};
++
++struct alignas(64) Hilo {
++	volatile LONG64 c[N];
++};
++
++Hilo *HiloActual();   // HackerContext.cpp
++
++inline void Sumar(Contador k, LONG64 v)
++{
++#if TT_DIAG_INSTRUMENTAR
++	Hilo *h = HiloActual();
++	h->c[k] = h->c[k] + v;
++#else
++	(void)k; (void)v;
++#endif
++}
++
++inline unsigned long long Tsc()
++{
++#if TT_DIAG_INSTRUMENTAR
++	return __rdtsc();
++#else
++	return 0;
++#endif
++}
++
++// Llamado desde HackerSwapChain::Present/Present1, una vez por cuadro, con los
++// ciclos que tardaron RunFrameActions (nuestro [Present] incluido) y el
++// Present del driver.
++void Cuadro(unsigned long long tsc_acciones, unsigned long long tsc_present);   // HackerContext.cpp
++// Una vez por proceso, desde Present: placa y soporte de listas de comandos.
++void InfoDispositivo(ID3D11Device *dev);   // HackerContext.cpp
++
++} // namespace ttdiag
++
++// IniHandler.cpp: 1 = sesion abierta (marca valida), 0 = reposo, -1 = sin decidir.
++int TrueTripleDiagSesion();
 diff --git a/DirectX11/TrueTripleHudLayout.h b/DirectX11/TrueTripleHudLayout.h
 new file mode 100644
 index 00000000..e4792193
@@ -10329,6 +11209,76 @@ index 00000000..56741cd1
 +}
 +
 +} // namespace truetriple
+diff --git a/DirectX11/TrueTriplePrueba.h b/DirectX11/TrueTriplePrueba.h
+new file mode 100644
+index 00000000..24e683dc
+--- /dev/null
++++ b/DirectX11/TrueTriplePrueba.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++// TrueTriple: opciones de la VERSION DE PRUEBA de rendimiento en AMD (rama
++// fuente/dr2-amd-casillas, 25/11/2026, tarea "DR2: el triple deja la CPU como
++// limite en AMD").
++//
++// Cada opcion es una casilla de la app (Graficos > Pruebas de rendimiento). La
++// app no puede cambiar el plugin de Rust en una version de prueba, asi que las
++// casillas viajan por un archivo que el plugin YA escribe en cada Jugar: el
++// cartel de F3, TrueTriple.menu.txt, al lado del d3dx.ini. La web le agrega
++// una linea de comentario (el contrato del cartel ignora las que empiezan con
++// '#'; un dll estable no la ve):
++//
++//   #tt-prueba: liviano raster redibujo
++//
++// El dll la lee al cargar el ini (LoadConfigFile, solo con la marca de sesion
++// valida) y la deja en g_bits. Sin la linea, o sin sesion, todo apagado: el
++// dll hace exactamente lo de la estable.
++//
++//   LIVIANO   Map/Unmap sin los diagnosticos viejos (censos con spinlock
++//             global, volcados, 3 o 4 GetDesc por Map), las variables del ini
++//             que se leian con el candado global de 3Dmigoto en cada constant
++//             buffer leidas una vez por cuadro, y el prologo de la captura de
++//             camara (replay, sonda, ganchos, reporte) una vez por cuadro.
++//   RASTER    El redibujo de cada objeto (CustomShaderTripleRedraw, con
++//             rasterizer_state_merge) ya no crea un estado del rasterizador
++//             con ID3D11Device::CreateRasterizerState en CADA objeto (unas
++//             900 veces por cuadro, desde los 7 hilos, con el candado del
++//             dispositivo): se crea una vez por combinacion y se reusa.
++//   REDIBUJO  El redibujo de cada objeto deja de guardar y reponer los render
++//             targets, UAVs y viewports (no los cambia), no bindea la textura
++//             de parametros al domain shader si no hay ninguno, y mide el
++//             render target una vez por objeto y no una por tercio. Son
++//             llamadas que, en una placa sin listas de comandos del driver
++//             (AMD en DX11), el runtime repite en el hilo principal.
++
++#include <windows.h>
++
++namespace ttprueba {
++
++enum Opcion {
++	LIVIANO  = 1,
++	RASTER   = 2,
++	REDIBUJO = 4,
++};
++
++extern volatile LONG g_bits;   // IniHandler.cpp
++// Sube en cada carga del ini (tambien Ctrl+Alt+Shift+F10): los custom shaders
++// se vuelven a crear y un puntero viejo puede reaparecer en otra seccion, asi
++// que los caches por hilo que usan ese puntero se vacian al verlo cambiar.
++extern volatile LONG g_generacion;
++
++inline bool Activa(Opcion o)
++{
++	return (g_bits & (LONG)o) != 0;
++}
++
++// IniHandler.cpp: lee la linea "#tt-prueba:" de TrueTriple.menu.txt (al lado
++// del dll) y la deja en g_bits. Lo llama LoadConfigFile con la sesion abierta.
++void Leer();
++// "liviano raster" o "ninguna", para el log.
++const char *Texto();
++
++} // namespace ttprueba
 diff --git a/DirectX11/TrueTripleReposo.h b/DirectX11/TrueTripleReposo.h
 new file mode 100644
 index 00000000..5bb12493

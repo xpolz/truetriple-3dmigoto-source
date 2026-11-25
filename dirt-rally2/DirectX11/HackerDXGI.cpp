@@ -71,6 +71,7 @@
 #include "CommandList.h"
 #include "profiling.h"
 #include "cursor.h" // For InstallHookLate
+#include "TrueTripleDiag.h"
 
 
 // -----------------------------------------------------------------------------
@@ -547,6 +548,7 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 {
 	Profiling::State profiling_state = {0};
 	bool profiling = false;
+	unsigned long long tt_acc0 = ttdiag::Tsc(), tt_acc1 = tt_acc0;
 
 	LogDebug("HackerSwapChain::Present(%s@%p) called with\n", type_name(this), this);
 	LogDebug("  SyncInterval = %d\n", SyncInterval);
@@ -569,11 +571,22 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 
 		if (profiling)
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
+		tt_acc1 = ttdiag::Tsc();
 	}
 
 	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+	unsigned long long tt_p0 = ttdiag::Tsc();
 	HRESULT hr = mOrigSwapChain1->Present(SyncInterval, Flags);
+	unsigned long long tt_p1 = ttdiag::Tsc();
 	get_tls()->hooking_quirk_protection = false;
+	if (!(Flags & DXGI_PRESENT_TEST)) {
+		ttdiag::Cuadro(tt_acc1 - tt_acc0, tt_p1 - tt_p0);
+		static bool tt_info = false;
+		if (!tt_info && mHackerDevice) {
+			tt_info = true;
+			ttdiag::InfoDispositivo(mHackerDevice->GetPassThroughOrigDevice1());
+		}
+	}
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
 		if (profiling)
@@ -859,6 +872,7 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 	Profiling::State profiling_state = {0};
 	gLogDebug = true;
 	bool profiling = false;
+	unsigned long long tt_acc0 = ttdiag::Tsc(), tt_acc1 = tt_acc0;
 
 	LogDebug("HackerSwapChain::Present1(%s@%p) called\n", type_name(this), this);
 	LogDebug("  SyncInterval = %d\n", SyncInterval);
@@ -876,11 +890,22 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 
 		if (profiling)
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
+		tt_acc1 = ttdiag::Tsc();
 	}
 
 	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+	unsigned long long tt_p0 = ttdiag::Tsc();
 	HRESULT hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
+	unsigned long long tt_p1 = ttdiag::Tsc();
 	get_tls()->hooking_quirk_protection = false;
+	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+		ttdiag::Cuadro(tt_acc1 - tt_acc0, tt_p1 - tt_p0);
+		static bool tt_info1 = false;
+		if (!tt_info1 && mHackerDevice) {
+			tt_info1 = true;
+			ttdiag::InfoDispositivo(mHackerDevice->GetPassThroughOrigDevice1());
+		}
+	}
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
 		if (profiling)

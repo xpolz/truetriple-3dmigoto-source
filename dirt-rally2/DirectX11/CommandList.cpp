@@ -3,6 +3,8 @@
 #include "lock.h"
 
 #include "CommandList.h"
+#include "TrueTripleDiag.h"
+#include "TrueTriplePrueba.h"
 
 #include <DDSTextureLoader.h>
 #include <WICTextureLoader.h>
@@ -42,8 +44,92 @@ std::unordered_set<CommandList*> command_lists_profiling;
 std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
 std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
 
+// ---- Variables del ini leidas UNA vez por cuadro (diag/dr2-amd-map-unmap) ----
+//
+// TripleReadIniGlobal toma el candado global de 3Dmigoto (G->mCriticalSection)
+// y arma un std::wstring (malloc) para buscar en el mapa. Se llamaba varias
+// veces por cada Map de un constant buffer de 256 a 320 bytes, en los 7 hilos
+// de dibujo del juego, aunque F7 tuviera el triple apagado. Las variables de
+// esta lista son ajustes de la partida (las cambian la app, las teclas o el
+// [Present]), no cosas que el ini cambie en el medio de un cuadro: se copian
+// una vez por cuadro, la primera vez que alguien las pide, y el resto del
+// cuadro se leen sin candado. Cualquier otro nombre sigue por el camino de
+// siempre. TripleWriteIniGlobal actualiza tambien la copia.
+static const wchar_t *const kTtCacheNombres[] = {
+	L"$cull_widen", L"$mono", L"$replay_auto_off", L"$replay_force",
+	L"$en_replay", L"$shadow_practice014", L"$cull_site", L"$cull_hfov",
+};
+#define TT_CACHE_N ((int)(sizeof(kTtCacheNombres) / sizeof(kTtCacheNombres[0])))
+// bit 33 = cargado, bit 32 = existe, bits 0-31 = el float.
+static volatile LONG64 g_tt_cache_val[TT_CACHE_N];
+static volatile LONG g_tt_cache_cuadro = -1;
+
+static int tt_cache_indice(const wchar_t *name)
+{
+	if (!name || name[0] != L'$')
+		return -1;
+	for (int i = 0; i < TT_CACHE_N; i++)
+		if (name == kTtCacheNombres[i] || wcscmp(name, kTtCacheNombres[i]) == 0)
+			return i;
+	return -1;
+}
+
+static LONG64 tt_cache_empacar(bool found, float v)
+{
+	UINT32 bits = 0;
+	memcpy(&bits, &v, sizeof(bits));
+	return (1LL << 33) | (found ? (1LL << 32) : 0) | (LONG64)bits;
+}
+
+// Con el candado tomado.
+static void tt_cache_llenar()
+{
+	static const std::wstring *claves = NULL;
+	if (!claves) {
+		std::wstring *c = new std::wstring[TT_CACHE_N];
+		for (int i = 0; i < TT_CACHE_N; i++)
+			c[i] = kTtCacheNombres[i];
+		claves = c;
+	}
+	for (int i = 0; i < TT_CACHE_N; i++) {
+		auto it = command_list_globals.find(claves[i]);
+		bool found = it != command_list_globals.end();
+		InterlockedExchange64(&g_tt_cache_val[i], tt_cache_empacar(found, found ? it->second.fval : 0.0f));
+	}
+}
+
+static void tt_cache_refrescar_si_toca()
+{
+	LONG cuadro = (LONG)G->frame_no;
+	LONG antes = g_tt_cache_cuadro;
+	if (antes == cuadro)
+		return;
+	// Un solo hilo refresca por cuadro; los demas siguen con la copia anterior.
+	if (InterlockedCompareExchange(&g_tt_cache_cuadro, cuadro, antes) != antes)
+		return;
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	tt_cache_llenar();
+	LeaveCriticalSection(&G->mCriticalSection);
+}
+
 TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
 {
+	// Version de prueba: la copia por cuadro solo con la casilla LIVIANO; sin
+	// ella, cada lectura toma el candado como en la estable.
+	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
+	if (i >= 0) {
+		tt_cache_refrescar_si_toca();
+		LONG64 v = g_tt_cache_val[i];
+		if (v & (1LL << 33)) {
+			TripleIniSnapshot c = { (v & (1LL << 32)) != 0, fallback };
+			if (c.found) {
+				UINT32 bits = (UINT32)(v & 0xFFFFFFFFLL);
+				memcpy(&c.fval, &bits, sizeof(bits));
+			}
+			return c;
+		}
+	}
+	ttdiag::Sumar(ttdiag::INI_CANDADO, 1);
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 	auto it = command_list_globals.find(name);
 	TripleIniSnapshot value = { it != command_list_globals.end(), fallback };
@@ -54,9 +140,13 @@ TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
 
 void TripleWriteIniGlobal(const wchar_t *name, float value)
 {
+	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 	auto it = command_list_globals.find(name);
-	if (it != command_list_globals.end()) it->second.fval = value;
+	bool found = it != command_list_globals.end();
+	if (found) it->second.fval = value;
+	if (i >= 0 && (g_tt_cache_val[i] & (1LL << 33)))
+		InterlockedExchange64(&g_tt_cache_val[i], tt_cache_empacar(found, found ? value : 0.0f));
 	LeaveCriticalSection(&G->mCriticalSection);
 }
 
@@ -4310,14 +4400,31 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 	// Se actualiza antes de filtrar el buffer: el estado pertenece al renderer,
 	// no a una camara concreta. [Present] lo recibe en `$en_replay` y lo usa en
 	// el frame siguiente; los caminos C++ de culling leen el flag inmediatamente.
-	tt_replay_update();
-	TTVisibilityProbe::tick();
+	//
+	// diag/dr2-amd-map-unmap: esto corria en CADA constant buffer de 256 a 320
+	// bytes que el juego escribe (cientos o miles por cuadro, en 7 hilos), con
+	// varias lecturas del ini por llamada. Son cosas de una vez por cuadro: el
+	// detector de replay, el latido de la sonda de visibilidad, instalar los
+	// ganchos de culling si el ini los pide y el reporte cada 2 s. Ahora las
+	// hace el primer hilo que llega en cada cuadro.
+	{
+		static volatile LONG s_prologo_cuadro = -1;
+		LONG cuadro = (LONG)G->frame_no;
+		LONG antes = s_prologo_cuadro;
+		// Version de prueba: una vez por cuadro solo con LIVIANO; sin la
+		// casilla corre en cada constant buffer, como en la estable.
+		if (!ttprueba::Activa(ttprueba::LIVIANO) || (antes != cuadro &&
+		    InterlockedCompareExchange(&s_prologo_cuadro, cuadro, antes) == antes)) {
+			tt_replay_update();
+			TTVisibilityProbe::tick();
 
-	// 2026-09-05: relay de call sites, instalado SOLO si $cull_widen trae el bit 16 o 32
-	// (con 0 no se toca un byte del exe). El bit 32 abre unicamente CS10, la query de la
-	// vista principal, sin compuerta de FOV. Ver docs/CULLING-GHIDRA-2026-09-05.md.
-	bf_instalar_si_pedido();
-	bf_reportar();
+			// 2026-09-05: relay de call sites, instalado SOLO si $cull_widen trae el bit 16 o 32
+			// (con 0 no se toca un byte del exe). El bit 32 abre unicamente CS10, la query de la
+			// vista principal, sin compuerta de FOV. Ver docs/CULLING-GHIDRA-2026-09-05.md.
+			bf_instalar_si_pedido();
+			bf_reportar();
+		}
+	}
 
 	if (!data || size < 208 || size > sizeof(g_triple_cam_buf))
 		return;
@@ -5018,7 +5125,22 @@ void TripleRegionCommand::run(CommandListState *state)
 	// target real. Independiente de la resolucion. No toca ningun cbuffer.
 	if (scissor_only) {
 		float rw = 0.0f, rh = 0.0f;
-		if (region >= 0 && region < 3 && triple_get_rt_size(state, &rw, &rh)) {
+		// Version de prueba, casilla REDIBUJO: el render target es el mismo
+		// en los 3 tercios del objeto; se mide en el primero (el custom
+		// shader del redibujo pone tt_rt_w en -1 al empezar).
+		bool tt_medido = false;
+		if (state->tt_en_redibujo && state->tt_rt_w > 0.0f) {
+			rw = state->tt_rt_w;
+			rh = state->tt_rt_h;
+			tt_medido = true;
+		} else if (region >= 0 && region < 3 && triple_get_rt_size(state, &rw, &rh)) {
+			tt_medido = true;
+			if (state->tt_en_redibujo) {
+				state->tt_rt_w = rw;
+				state->tt_rt_h = rh;
+			}
+		}
+		if (region >= 0 && region < 3 && tt_medido) {
 			float flo, fhi;
 			triple_get_frac(region, &flo, &fhi);
 			D3D11_RECT r;
@@ -5265,7 +5387,11 @@ void TripleParamsCommand::run(CommandListState *state)
 
 	if (g_triple_par_srv[idx]) {
 		ctx->VSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
-		ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
+		// Version de prueba, casilla REDIBUJO: sin domain shader puesto por el
+		// juego (sin teselado) no hay quien lea el slot del DS.
+		HackerContext *hc = state->mHackerContext;
+		if (!(ttprueba::Activa(ttprueba::REDIBUJO) && hc && !hc->mCurrentDomainShaderHandle))
+			ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
 	}
 }
 
@@ -5704,6 +5830,7 @@ CustomShader::CustomShader() :
 	stencil_ref(0), stencil_ref_mask(~0),
 	rs_override(0), rs_state(NULL),
 	topology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED),
+	tt_redibujo(false),
 	substantiated(false),
 	max_executions_per_frame(0),
 	frame_no(0),
@@ -6158,6 +6285,83 @@ void CustomShader::merge_rasterizer_states(ID3D11RasterizerState *src_state, ID3
 	mOrigDevice1->CreateRasterizerState(&rs_desc, &rs_state);
 }
 
+// ---- Version de prueba, casilla RASTER (TrueTriplePrueba.h) ---------------
+// rasterizer_state_merge = true crea un estado nuevo con
+// ID3D11Device::CreateRasterizerState en CADA corrida del custom shader: en el
+// redibujo del triple es una vez por objeto, unas 900 por cuadro, desde los 7
+// hilos del juego, y cada una toma el candado del dispositivo (el juego lo crea
+// sin SINGLETHREADED, asi que es el mismo candado que usa el contexto
+// inmediato). Ademas escribe custom_shader->rs_state, que comparten todos los
+// hilos. Aca el estado combinado se crea una vez por (custom shader, estado
+// del juego) y se reusa, por hilo, sin tocar el miembro compartido. Es la
+// misma cuenta que merge_rasterizer_states: la descripcion del ini con los
+// campos de la mascara tomados del estado del juego.
+struct TtRsCache {
+	const CustomShader *cs;
+	D3D11_RASTERIZER_DESC src;
+	ID3D11RasterizerState *st;
+};
+#define TT_RS_CACHE_N 32
+static thread_local TtRsCache tt_rs_cache[TT_RS_CACHE_N];
+static thread_local int tt_rs_cache_n = 0;
+static thread_local int tt_rs_cache_prox = 0;
+static thread_local LONG tt_rs_cache_gen = 0;
+
+static ID3D11RasterizerState *tt_rs_combinado(CustomShader *cs, ID3D11RasterizerState *src_state, ID3D11Device *dev)
+{
+	D3D11_RASTERIZER_DESC src_desc;
+	if (src_state) {
+		src_state->GetDesc(&src_desc);
+	} else {
+		src_desc.FillMode = D3D11_FILL_SOLID;
+		src_desc.CullMode = D3D11_CULL_BACK;
+		src_desc.FrontCounterClockwise = FALSE;
+		src_desc.DepthBias = 0;
+		src_desc.SlopeScaledDepthBias = 0.0f;
+		src_desc.DepthBiasClamp = 0.0f;
+		src_desc.DepthClipEnable = TRUE;
+		src_desc.ScissorEnable = FALSE;
+		src_desc.MultisampleEnable = FALSE;
+		src_desc.AntialiasedLineEnable = FALSE;
+	}
+	// Ini recargado: los CustomShader son otros (y un puntero puede
+	// repetirse), asi que este hilo vacia su cache.
+	LONG gen = ttprueba::g_generacion;
+	if (gen != tt_rs_cache_gen) {
+		for (int i = 0; i < tt_rs_cache_n; i++)
+			if (tt_rs_cache[i].st)
+				tt_rs_cache[i].st->Release();
+		tt_rs_cache_n = 0;
+		tt_rs_cache_prox = 0;
+		tt_rs_cache_gen = gen;
+	}
+	for (int i = 0; i < tt_rs_cache_n; i++) {
+		TtRsCache &e = tt_rs_cache[i];
+		if (e.cs == cs && !memcmp(&e.src, &src_desc, sizeof(src_desc)))
+			return e.st;
+	}
+	D3D11_RASTERIZER_DESC desc = cs->rs_desc;
+	memcpy_masked_merge(&desc, &src_desc, &cs->rs_mask, sizeof(D3D11_RASTERIZER_DESC));
+	ID3D11RasterizerState *st = NULL;
+	if (FAILED(dev->CreateRasterizerState(&desc, &st)) || !st)
+		return NULL;
+	int k;
+	if (tt_rs_cache_n < TT_RS_CACHE_N) {
+		k = tt_rs_cache_n++;
+	} else {
+		// Lleno: se reemplaza en ronda. Un contexto que lo tenga puesto
+		// guarda su propia referencia, asi que soltarlo aca es seguro.
+		k = tt_rs_cache_prox;
+		tt_rs_cache_prox = (tt_rs_cache_prox + 1) % TT_RS_CACHE_N;
+		if (tt_rs_cache[k].st)
+			tt_rs_cache[k].st->Release();
+	}
+	tt_rs_cache[k].cs = cs;
+	tt_rs_cache[k].src = src_desc;
+	tt_rs_cache[k].st = st;
+	return st;
+}
+
 struct saved_shader_inst
 {
 	ID3D11ClassInstance *instances[256];
@@ -6268,8 +6472,15 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	}
 	if (custom_shader->rs_override) {
 		mOrigContext1->RSGetState(&saved_rs);
-		custom_shader->merge_rasterizer_states(saved_rs, mOrigDevice1);
-		mOrigContext1->RSSetState(custom_shader->rs_state);
+		ID3D11RasterizerState *tt_rs = NULL;
+		if (custom_shader->rs_override == 2 && ttprueba::Activa(ttprueba::RASTER))
+			tt_rs = tt_rs_combinado(custom_shader, saved_rs, mOrigDevice1);
+		if (tt_rs) {
+			mOrigContext1->RSSetState(tt_rs);
+		} else {
+			custom_shader->merge_rasterizer_states(saved_rs, mOrigDevice1);
+			mOrigContext1->RSSetState(custom_shader->rs_state);
+		}
 	}
 	if (custom_shader->topology != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED) {
 		mOrigContext1->IAGetPrimitiveTopology(&saved_topology);
@@ -6279,12 +6490,25 @@ void RunCustomShaderCommand::run(CommandListState *state)
 		mOrigContext1->PSGetSamplers(0, num_sampler, saved_sampler_states);
 		mOrigContext1->PSSetSamplers(0, 1, &custom_shader->sampler_state); //just one slot for the moment TODO: allow more via *.ini file
 	}
+	// Version de prueba, casilla REDIBUJO: el redibujo del triple solo
+	// bindea la textura de parametros, pone el scissor y dibuja; no cambia
+	// render targets, UAVs ni viewports, asi que no hace falta guardarlos y
+	// reponerlos en cada objeto (en AMD, sin listas de comandos del driver,
+	// el runtime repite esas llamadas en el hilo que ejecuta las listas).
+	const bool tt_sin_om = custom_shader->tt_redibujo && ttprueba::Activa(ttprueba::REDIBUJO);
+	if (!tt_sin_om) {
 	// We save off the viewports unconditionally for now. We could
 	// potentially skip this by flagging if a command list may alter them,
 	// but that probably wouldn't buy us anything:
 	mOrigContext1->RSGetViewports(&num_viewports, saved_viewports);
 	// Likewise, save off all RTVs, UAVs and DSVs unconditionally:
 	save_om_state(state->mOrigContext1, &om_state);
+	}
+	if (tt_sin_om) {
+		state->tt_rt_w = -1;
+		state->tt_rt_h = -1;
+		state->tt_en_redibujo = true;
+	}
 
 	// Run the command lists. This should generally include a draw or
 	// dispatch call, or call out to another command list which does.
@@ -6296,6 +6520,11 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	state->post = true;
 	_RunCommandList(&custom_shader->post_command_list, state);
 	state->post = saved_post;
+	if (tt_sin_om) {
+		state->tt_en_redibujo = false;
+		state->tt_rt_w = -1;
+		state->tt_rt_h = -1;
+	}
 
 	// Finally restore the original shaders
 	if (custom_shader->vs_override)
@@ -6321,8 +6550,10 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	if (custom_shader->sampler_override)
 		mOrigContext1->PSSetSamplers(0, num_sampler, saved_sampler_states);
 
+	if (!tt_sin_om) {
 	mOrigContext1->RSSetViewports(num_viewports, saved_viewports);
 	restore_om_state(mOrigContext1, &om_state);
+	}
 
 	if (saved_vs)
 		saved_vs->Release();
@@ -6557,6 +6788,9 @@ CommandListState::CommandListState() :
 	mOrigContext1(NULL),
 	rt_width(-1),
 	rt_height(-1),
+	tt_rt_w(-1),
+	tt_rt_h(-1),
+	tt_en_redibujo(false),
 	call_info(NULL),
 	this_target(NULL),
 	resource(NULL),

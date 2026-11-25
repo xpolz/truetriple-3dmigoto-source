@@ -84,3 +84,23 @@ de margen) en vez del aspecto de triple (3.6 a 12). Sin eso no se capturaba ning
 con un monitor: el estabilizador no recibía cabeceo, rolido ni altura y los pases de pantalla
 completa no se corregían. Con `$mono = 0` el comportamiento es el de antes. Compilada con
 `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll: `076f6282abebaa34aca12398b2823e84d7a932767ea0b58e18c037dcc9c6ea3e`; `nvapi64.dll`: `ae4218ef417a2ae3fd15069a0415d44c60d50827416852e870c6e841799e6b96`. Etiqueta `dr2-dll-076f6282`.
+
+## dll `fc84c6e3` (25/11/2026): versión de prueba de rendimiento (AMD)
+
+Para una versión de prueba de DR2 (canal prueba, sobre la 1.9.18), no para la estable. Tres
+opciones que la app prende con casillas: llegan en una línea de comentario
+`#tt-prueba: liviano raster redibujo` de `TrueTriple.menu.txt` y las lee `IniHandler.cpp`
+(`ttprueba::Leer`, solo con la sesión abierta); sin la línea, todo como la `076f6282`.
+`liviano` (`HackerContext.cpp`, `CommandList.cpp`): sin los diagnósticos viejos de
+`Map`/`Unmap`/`UpdateSubresource`, las variables del ini que se leían con el candado global en
+cada constant buffer copiadas una vez por cuadro, y el prólogo de `TripleCaptureCameraCB` una
+vez por cuadro. `raster` (`CommandList.cpp`): el custom shader con `rasterizer_state_merge`
+reusa el estado combinado (caché por hilo) en vez de llamar a `CreateRasterizerState` en cada
+corrida. `redibujo` (`CommandList.cpp`): `[CustomShaderTripleRedraw]` no guarda ni repone
+render targets, UAVs ni viewports, `triple_params` no bindea al domain shader sin domain
+shader y `triple_scissor` mide el render target una vez por objeto. Además
+(`TrueTripleDiag.h`, `HackerDXGI.cpp`, compilada con `CL=/DTT_DIAG_INSTRUMENTAR=1`): una línea
+de medición cada 10 s en `TrueTriple_diag.txt` y en `d3d11_log.txt`, y una vez la placa y
+`D3D11_FEATURE_THREADING`. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
+`fc84c6e316c42b8b37e77f5776beb2bf17c4e802636daa58a478440fb4224c46`; `nvapi64.dll` sin cambios.
+Etiqueta `dr2-dll-fc84c6e3`.

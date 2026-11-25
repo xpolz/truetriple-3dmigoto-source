@@ -29,6 +29,249 @@
 #include "ShaderRegex.h"
 #include "FrameAnalysis.h"
 #include "profiling.h"
+#include "TrueTripleDiag.h"
+
+// Los diagnosticos viejos de Map/Unmap/UpdateSubresource (censos de buffers,
+// volcados del pasto y de las zonas, copias de constant buffers para medir
+// FOV y sombras, el espia de buffers dinamicos). Solo escriben en el log y
+// algunos toman un spinlock global en cada Map de los 7 contextos del juego.
+// Apagados desde la rama diag/dr2-amd-map-unmap; con 1 vuelven tal cual.
+// Version de prueba (TrueTriplePrueba.h): corren como en la estable salvo
+// con la casilla LIVIANO.
+#include "TrueTriplePrueba.h"
+#define TT_VIEJOS_ACTIVOS (!ttprueba::Activa(ttprueba::LIVIANO))
+
+// ---- Diagnostico de rendimiento (TrueTripleDiag.h) ----------------------------------------------
+#if TT_DIAG_INSTRUMENTAR
+#include <stdio.h>
+#include <time.h>
+
+namespace ttdiag {
+
+#define TT_DIAG_MAX_HILOS 256
+static Hilo *g_hilos[TT_DIAG_MAX_HILOS];
+static volatile LONG g_nhilos = 0;
+static thread_local Hilo *tls_hilo = NULL;
+// Los hilos que pasan del tope cuentan aca (con carreras: es solo un aviso).
+static Hilo g_hilo_sobrante;
+
+Hilo *HiloActual()
+{
+	Hilo *h = tls_hilo;
+	if (h)
+		return h;
+	h = (Hilo *)_aligned_malloc(sizeof(Hilo), 64);
+	if (!h)
+		h = &g_hilo_sobrante;
+	else {
+		memset((void *)h, 0, sizeof(Hilo));
+		LONG i = InterlockedIncrement(&g_nhilos) - 1;
+		if (i < TT_DIAG_MAX_HILOS)
+			g_hilos[i] = h;
+		else
+			h = &g_hilo_sobrante;
+	}
+	tls_hilo = h;
+	return h;
+}
+
+static void sumar_todo(LONG64 out[N])
+{
+	for (int k = 0; k < N; k++)
+		out[k] = g_hilo_sobrante.c[k];
+	LONG n = InterlockedCompareExchange(&g_nhilos, 0, 0);
+	if (n > TT_DIAG_MAX_HILOS)
+		n = TT_DIAG_MAX_HILOS;
+	for (LONG i = 0; i < n; i++) {
+		Hilo *h = g_hilos[i];
+		if (!h)
+			continue;
+		for (int k = 0; k < N; k++)
+			out[k] += h->c[k];
+	}
+}
+
+static wchar_t g_ruta[MAX_PATH];
+
+static void armar_ruta()
+{
+	HMODULE yo = NULL;
+	g_ruta[0] = 0;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCWSTR)&armar_ruta, &yo))
+		return;
+	DWORD n = GetModuleFileNameW(yo, g_ruta, MAX_PATH);
+	if (!n || n >= MAX_PATH) {
+		g_ruta[0] = 0;
+		return;
+	}
+	wchar_t *barra = wcsrchr(g_ruta, L'\\');
+	if (!barra || (size_t)(barra - g_ruta) + 24 >= MAX_PATH) {
+		g_ruta[0] = 0;
+		return;
+	}
+	wcscpy_s(barra + 1, MAX_PATH - (barra + 1 - g_ruta), L"TrueTriple_diag.txt");
+}
+
+static void escribir(const char *linea)
+{
+	// Version de prueba: tambien al d3d11_log.txt, que es lo que adjunta
+	// "Informar un error" (la cola de 128 KiB).
+	LogInfo("TTDIAG %s", linea[0] == '\n' ? linea + 1 : linea);
+	if (!g_ruta[0])
+		return;
+	FILE *f = NULL;
+	if (_wfopen_s(&f, g_ruta, L"a") || !f)
+		return;
+	fputs(linea, f);
+	fclose(f);
+}
+
+static char variante()
+{
+#if TT_DIAG_VACIO
+	return 'A';
+#else
+	return 'P';	// version de prueba con casillas (TrueTriplePrueba.h)
+#endif
+}
+
+// Una vez: que placa es y si el driver arma las listas de comandos de DX11
+// por su cuenta (DriverCommandLists). Si no, el runtime las emula y repite
+// cada llamada de los contextos diferidos en el hilo que las ejecuta.
+void InfoDispositivo(ID3D11Device *dev)
+{
+	if (!dev)
+		return;
+	D3D11_FEATURE_DATA_THREADING th = {};
+	HRESULT hr = dev->CheckFeatureSupport(D3D11_FEATURE_THREADING, &th, sizeof(th));
+	char placa[160] = "?";
+	UINT vendor = 0;
+	IDXGIDevice *dxgi = NULL;
+	if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) && dxgi) {
+		IDXGIAdapter *ad = NULL;
+		if (SUCCEEDED(dxgi->GetAdapter(&ad)) && ad) {
+			DXGI_ADAPTER_DESC d;
+			if (SUCCEEDED(ad->GetDesc(&d))) {
+				vendor = d.VendorId;
+				WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, placa, sizeof(placa), NULL, NULL);
+			}
+			ad->Release();
+		}
+		dxgi->Release();
+	}
+	char l[400];
+	_snprintf_s(l, sizeof(l), _TRUNCATE,
+		"placa=%s vendor=0x%04x driver_command_lists=%d concurrent_creates=%d (hr=0x%08x) | opciones=%s\n",
+		placa, vendor, SUCCEEDED(hr) ? (int)th.DriverCommandLists : -1,
+		SUCCEEDED(hr) ? (int)th.DriverConcurrentCreates : -1, (unsigned)hr, ttprueba::Texto());
+	escribir(l);
+}
+
+void Cuadro(unsigned long long tsc_acciones, unsigned long long tsc_present)
+{
+	// Solo lo llama el hilo de Present: lo de aca no necesita candado.
+	static bool arrancado = false;
+	static LARGE_INTEGER qpf, qpc0, qpc_inicio;
+	static unsigned long long tsc0 = 0;
+	static LONG64 antes[N];
+	static unsigned long long cuadros = 0, acc_acciones = 0, acc_present = 0;
+	static float ms_max = 0.0f;
+	static unsigned long long tsc_cuadro_ant = 0;
+
+	LARGE_INTEGER ahora;
+	QueryPerformanceCounter(&ahora);
+	unsigned long long tsc = __rdtsc();
+	if (!arrancado) {
+		arrancado = true;
+		QueryPerformanceFrequency(&qpf);
+		qpc0 = ahora;
+		qpc_inicio = ahora;
+		tsc0 = tsc;
+		tsc_cuadro_ant = tsc;
+		sumar_todo(antes);
+		armar_ruta();
+		char l[512];
+		time_t t = time(NULL);
+		struct tm lt;
+		localtime_s(&lt, &t);
+		_snprintf_s(l, sizeof(l), _TRUNCATE,
+			"\n=== TrueTriple test build %c, %04d-%02d-%02d %02d:%02d, session=%d, opciones=%s ===\n",
+			variante(), lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min,
+			TrueTripleDiagSesion(), ttprueba::Texto());
+		escribir(l);
+		return;
+	}
+
+	cuadros++;
+	acc_acciones += tsc_acciones;
+	acc_present += tsc_present;
+	// El cuadro mas lento del tramo (tirones).
+	unsigned long long dt_cuadro = tsc - tsc_cuadro_ant;
+	tsc_cuadro_ant = tsc;
+
+	double seg = (double)(ahora.QuadPart - qpc0.QuadPart) / (double)qpf.QuadPart;
+	double tsc_por_ms = seg > 0.0 ? (double)(tsc - tsc0) / (seg * 1000.0) : 0.0;
+	if (tsc_por_ms > 0.0) {
+		float ms = (float)((double)dt_cuadro / tsc_por_ms);
+		if (ms > ms_max)
+			ms_max = ms;
+	}
+	if (seg < 10.0)
+		return;
+
+	LONG64 suma[N];
+	sumar_todo(suma);
+	LONG64 d[N];
+	for (int k = 0; k < N; k++)
+		d[k] = suma[k] - antes[k];
+
+	double c = (double)cuadros;
+	double ms = tsc_por_ms > 0.0 ? 1.0 / tsc_por_ms : 0.0;
+	float triple = -1.0f;
+#if !TT_DIAG_VACIO
+	triple = TripleReadIniGlobal(L"$triple_on", -1.0f).fval;
+#endif
+	// Una linea corta cada 10 s (cabe en una captura del Bloc de notas):
+	// F7 = $triple_on; fps y ms del cuadro (max = el mas lento); pres = adentro
+	// del Present del driver (alto = esperando a la GPU); acc = el [Present]
+	// del ini; por cuadro: draws, maps, cam = constant buffers de 256-320 bytes,
+	// rd = maps de lectura (la CPU espera a la GPU); ms por cuadro en Map y
+	// Unmap del driver, en lecturas, en nuestro codigo (ext); listas = cuantas
+	// y ms en Execute/FinishCommandList; ini = lecturas del ini con candado.
+	char l[512];
+	_snprintf_s(l, sizeof(l), _TRUNCATE,
+		"%c t=%.0fs F7=%g fps=%.1f ms=%.2f max=%.1f pres=%.2f acc=%.2f | draws=%.0f maps=%.0f cam=%.0f rd=%.1f"
+		" | ms map=%.2f unmap=%.2f rd=%.2f ext=%.2f | exec=%.1f/%.2fms fin=%.1f/%.2fms | ini=%.0f | %s\n",
+		variante(), (double)(ahora.QuadPart - qpc_inicio.QuadPart) / (double)qpf.QuadPart, (double)triple,
+		c / seg, seg * 1000.0 / c, ms_max,
+		(double)acc_present * ms / c, (double)acc_acciones * ms / c,
+		d[DRAWS] / c, d[MAPS] / c, d[MAPS_CAMARA] / c, d[MAPS_LECTURA] / c,
+		d[TSC_MAP_DRIVER] * ms / c, d[TSC_UNMAP_DRIVER] * ms / c, d[TSC_MAP_LECTURA] * ms / c,
+		d[TSC_EXTRAS] * ms / c,
+		d[EXECUTES] / c, d[TSC_EXECUTE] * ms / c, d[FINISHES] / c, d[TSC_FINISH] * ms / c,
+		d[INI_CANDADO] / c, ttprueba::Texto());
+	escribir(l);
+
+	for (int k = 0; k < N; k++)
+		antes[k] = suma[k];
+	cuadros = 0;
+	acc_acciones = 0;
+	acc_present = 0;
+	ms_max = 0.0f;
+	qpc0 = ahora;
+	tsc0 = tsc;
+}
+
+} // namespace ttdiag
+#else
+namespace ttdiag {
+Hilo *HiloActual() { static Hilo h; return &h; }
+void Cuadro(unsigned long long, unsigned long long) {}
+void InfoDispositivo(ID3D11Device *) {}
+}
+#endif
 
 // -----------------------------------------------------------------------------------------------
 
@@ -2038,9 +2281,26 @@ STDMETHODIMP HackerContext::Map(THIS_
 {
 	HRESULT hr;
 
+	unsigned long long tt_t0 = ttdiag::Tsc();
 	hr = mOrigContext1->Map(pResource, Subresource, MapType, MapFlags, pMappedResource);
+	unsigned long long tt_t1 = ttdiag::Tsc();
+#if TT_DIAG_INSTRUMENTAR
+	ttdiag::Sumar(ttdiag::MAPS, 1);
+	ttdiag::Sumar(ttdiag::TSC_MAP_DRIVER, (LONG64)(tt_t1 - tt_t0));
+	if (MapType == D3D11_MAP_READ || MapType == D3D11_MAP_READ_WRITE) {
+		ttdiag::Sumar(ttdiag::MAPS_LECTURA, 1);
+		ttdiag::Sumar(ttdiag::TSC_MAP_LECTURA, (LONG64)(tt_t1 - tt_t0));
+	} else {
+		ttdiag::Sumar(ttdiag::MAPS_ESCRITURA, 1);
+	}
+#endif
 
 	TrackAndDivertMap(hr, pResource, Subresource, MapType, MapFlags, pMappedResource);
+
+#if TT_DIAG_VACIO
+	return hr;
+#endif
+	unsigned long long tt_x0 = ttdiag::Tsc();
 
 	// v1.84: ESPIA de buffers dinamicos (diagnostico para la proxima
 	// iteracion). Cada auto tiene exactamente TRES buffers dinamicos propios
@@ -2060,6 +2320,7 @@ STDMETHODIMP HackerContext::Map(THIS_
 	// Sin candado a proposito: el hook corre en los 7 contextos del juego y
 	// una carrera puede duplicar algun log — tolerable; un mutex en el camino
 	// de Map no lo es.
+	if (TT_VIEJOS_ACTIVOS) {
 	if (LogFile && SUCCEEDED(hr) && pResource) {
 		D3D11_BUFFER_DESC sd;
 		if (triple_buffer_desc(pResource, &sd) && sd.Usage == D3D11_USAGE_DYNAMIC) {
@@ -2082,9 +2343,11 @@ STDMETHODIMP HackerContext::Map(THIS_
 			}
 		}
 	}
+	}
 
 	if (SUCCEEDED(hr) && pMappedResource && pMappedResource->pData &&
 	    (MapType == D3D11_MAP_WRITE_DISCARD || MapType == D3D11_MAP_WRITE)) {
+	if (TT_VIEJOS_ACTIVOS) {
 		D3D11_BUFFER_DESC zone_desc;
 		if (triple_buffer_desc(pResource, &zone_desc) &&
 			zone_desc.StructureByteStride == 48 &&
@@ -2095,12 +2358,15 @@ STDMETHODIMP HackerContext::Map(THIS_
 			tls_zone_ptr = pMappedResource->pData;
 			tls_zone_size = zone_desc.ByteWidth;
 		}
+	}
 		UINT sz = 0;
 		if (triple_is_camera_cb_candidate(pResource, &sz)) {
 			tls_triple_map_res = pResource;
 			tls_triple_map_ptr = pMappedResource->pData;
 			tls_triple_map_size = sz;
+			ttdiag::Sumar(ttdiag::MAPS_CAMARA, 1);
 		}
+	if (TT_VIEJOS_ACTIVOS) {
 		// v1.47: identificar el buffer de instancias del pasto por su FIRMA, no
 		// por quien lo bindea. El VS del pasto lo declara como
 		// `dcl_resource_structured t1, 112`: un structured buffer de stride 112
@@ -2202,7 +2468,9 @@ STDMETHODIMP HackerContext::Map(THIS_
 			tls_sniff_n++;
 		}
 	}
+	}
 
+	ttdiag::Sumar(ttdiag::TSC_EXTRAS, (LONG64)(ttdiag::Tsc() - tt_x0));
 	return hr;
 }
 
@@ -2212,6 +2480,18 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
 	/* [annotation] */
 	__in  UINT Subresource)
 {
+#if TT_DIAG_VACIO
+	TrackAndDivertUnmap(pResource, Subresource);
+	{
+		unsigned long long tt_u0 = ttdiag::Tsc();
+		mOrigContext1->Unmap(pResource, Subresource);
+		ttdiag::Sumar(ttdiag::TSC_UNMAP_DRIVER, (LONG64)(ttdiag::Tsc() - tt_u0));
+	}
+	return;
+#endif
+	unsigned long long tt_e0 = ttdiag::Tsc();
+	LONG64 tt_extras = 0;
+	if (TT_VIEJOS_ACTIVOS) {
 	if (tls_zone_dump && pResource == tls_zone_res) {
 		ID3D11Resource *zone_res = tls_zone_res;
 		void *zone_ptr = tls_zone_ptr;
@@ -2311,8 +2591,11 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
 			}
 		}
 	}
+	}
+	tt_extras += (LONG64)(ttdiag::Tsc() - tt_e0);
 
 	TrackAndDivertUnmap(pResource, Subresource);
+	tt_e0 = ttdiag::Tsc();
 
 	// Triple-monitor: snoop the camera cb the game just wrote (see Map above).
 	if (pResource == tls_triple_map_res && tls_triple_map_ptr) {
@@ -2324,7 +2607,11 @@ STDMETHODIMP_(void) HackerContext::Unmap(THIS_
 		tls_triple_map_ptr = NULL;
 	}
 
+	unsigned long long tt_u0 = ttdiag::Tsc();
+	tt_extras += (LONG64)(tt_u0 - tt_e0);
+	ttdiag::Sumar(ttdiag::TSC_EXTRAS, tt_extras);
 	mOrigContext1->Unmap(pResource, Subresource);
+	ttdiag::Sumar(ttdiag::TSC_UNMAP_DRIVER, (LONG64)(ttdiag::Tsc() - tt_u0));
 }
 
 STDMETHODIMP_(void) HackerContext::PSSetConstantBuffers(THIS_
@@ -2819,7 +3106,18 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
     // array. cull_site=100 tests full-map scissors; 0 preserves the game.
     // Keep the original rectangle above for the triple/UI restoration path.
     // Restrict this to square R32 depth arrays (3/4 cascades), never screen/UI.
-    if (NumRects == 1 && pRects) {
+    // Diag/dr2-amd: el sondeo (OMGetRenderTargets + GetResource + QI + GetDesc
+    // en CADA scissor del juego, en los contextos diferidos) solo sirve con
+    // $cull_site = 100, que ninguna tecla ni la app ponen. Se mira primero la
+    // variable (leida una vez por cuadro) y recien despues el resto.
+#if TT_DIAG_VACIO
+    if (false) {
+#else
+    // Version de prueba: el atajo solo con LIVIANO; sin la casilla, como en la
+    // estable (se sondea cada scissor de un rectangulo).
+    if (NumRects == 1 && pRects && (!ttprueba::Activa(ttprueba::LIVIANO) ||
+            TripleReadIniGlobal(L"$cull_site").fval == 100.0f)) {
+#endif
         ID3D11DepthStencilView *depthView = nullptr;
         mOrigContext1->OMGetRenderTargets(0, nullptr, &depthView);
         if (depthView) {
@@ -2995,6 +3293,7 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
 	// v1.44/46: los buffers del pasto tambien pueden subir por aca. En ese caso
 	// pSrcData es memoria PROPIA del juego —donde el culler escribio— y es
 	// mejor objetivo que un buffer mapeado: persiste entre frames.
+	if (TT_VIEJOS_ACTIVOS) {
 	if (pDstResource && g_bp_estado == 0 && pSrcData) {
 		D3D11_BUFFER_DESC gd;
 		if (triple_buffer_desc(pDstResource, &gd) &&
@@ -3009,8 +3308,15 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
 		}
 	}
 
+	}
+
 	const void *triple_src = pSrcData;
 	void *triple_tmp = NULL;
+	// TripleScanPlanesInCB esta neutralizado desde la v1.74 (devuelve 0 sin
+	// mirar nada) y cb_snap_store solo alimenta mediciones del log: con los
+	// diagnosticos viejos apagados este bloque no cambiaba nada y costaba un
+	// GetDesc y un spinlock global por cada constant buffer.
+	if (TT_VIEJOS_ACTIVOS) {
 	if (pSrcData && !pDstBox) {
 		D3D11_BUFFER_DESC bd;
 		if (triple_buffer_desc(pDstResource, &bd) &&
@@ -3029,6 +3335,8 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
 				}
 			}
 		}
+	}
+
 	}
 
 	 mOrigContext1->UpdateSubresource(pDstResource, DstSubresource, pDstBox, triple_src, SrcRowPitch,
@@ -3148,8 +3456,12 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 	__in  ID3D11CommandList *pCommandList,
 	BOOL RestoreContextState)
 {
-	if (G->deferred_contexts_enabled)
+	if (G->deferred_contexts_enabled) {
+		unsigned long long tt_c0 = ttdiag::Tsc();
 		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
+		ttdiag::Sumar(ttdiag::EXECUTES, 1);
+		ttdiag::Sumar(ttdiag::TSC_EXECUTE, (LONG64)(ttdiag::Tsc() - tt_c0));
+	}
 
 	if (!RestoreContextState) {
 		// This is equivalent to calling ClearState() afterwards, so we
@@ -3895,7 +4207,10 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
 	/* [annotation] */
 	__out_opt  ID3D11CommandList **ppCommandList)
 {
+	unsigned long long tt_f0 = ttdiag::Tsc();
 	BOOL ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
+	ttdiag::Sumar(ttdiag::FINISHES, 1);
+	ttdiag::Sumar(ttdiag::TSC_FINISH, (LONG64)(ttdiag::Tsc() - tt_f0));
 
 	// TRIPLE: al cerrar la lista, el contexto diferido vuelve al estado por
 	// defecto -> el rect del juego ya no esta puesto.
@@ -4142,10 +4457,13 @@ STDMETHODIMP_(void) HackerContext::DrawIndexed(THIS_
 	/* [annotation] */
 	__in  INT BaseVertexLocation)
 {
+	ttdiag::Sumar(ttdiag::DRAWS, 1);
+#if !TT_DIAG_VACIO
 	triple_medir_scatter(mCurrentVertexShader);
 	triple_medir_sombras(mCurrentPixelShader);
 	triple_medir_pasto_scatter(mCurrentVertexShader, IndexCount);
 	triple_medir_zonas(mCurrentVertexShader, IndexCount, 1);
+#endif
 	DrawContext c = DrawContext(DrawCall::DrawIndexed, 0, IndexCount, 0, BaseVertexLocation, StartIndexLocation, 0, NULL, 0);
 	BeforeDraw(c);
 
@@ -4160,10 +4478,13 @@ STDMETHODIMP_(void) HackerContext::Draw(THIS_
 	/* [annotation] */
 	__in  UINT StartVertexLocation)
 {
+	ttdiag::Sumar(ttdiag::DRAWS, 1);
+#if !TT_DIAG_VACIO
 	triple_medir_scatter(mCurrentVertexShader);
 	triple_medir_sombras(mCurrentPixelShader);
 	triple_medir_pasto_scatter(mCurrentVertexShader, VertexCount);
 	triple_medir_zonas(mCurrentVertexShader, VertexCount, 1);
+#endif
 	DrawContext c = DrawContext(DrawCall::Draw, VertexCount, 0, 0, StartVertexLocation, 0, 0, NULL, 0);
 	BeforeDraw(c);
 
@@ -4185,7 +4506,11 @@ STDMETHODIMP_(void) HackerContext::IASetIndexBuffer(THIS_
 	// Sin gate de hunting: se usa para identificar el auto por su malla en juego
 	// normal. El hash sale de un mapa poblado al crear el recurso, asi que esto
 	// es una busqueda y nada mas.
+#if TT_DIAG_VACIO
+	mTripleIB = 0;
+#else
 	mTripleIB = pIndexBuffer ? GetResourceHash(pIndexBuffer) : 0;
+#endif
 
 	// This is only used for index buffer hunting nowadays since the
 	// command list checks the hash on demand only when it is needed
@@ -4213,10 +4538,13 @@ STDMETHODIMP_(void) HackerContext::DrawIndexedInstanced(THIS_
 	/* [annotation] */
 	__in  UINT StartInstanceLocation)
 {
+	ttdiag::Sumar(ttdiag::DRAWS, 1);
+#if !TT_DIAG_VACIO
 	triple_medir_scatter(mCurrentVertexShader);
 	triple_medir_sombras(mCurrentPixelShader);
 	triple_medir_pasto_scatter(mCurrentVertexShader, IndexCountPerInstance);
 	triple_medir_zonas(mCurrentVertexShader, IndexCountPerInstance, InstanceCount);
+#endif
 	DrawContext c = DrawContext(DrawCall::DrawIndexedInstanced, 0, IndexCountPerInstance, InstanceCount, BaseVertexLocation, StartIndexLocation, StartInstanceLocation, NULL, 0);
 	BeforeDraw(c);
 
@@ -4236,10 +4564,13 @@ STDMETHODIMP_(void) HackerContext::DrawInstanced(THIS_
 	/* [annotation] */
 	__in  UINT StartInstanceLocation)
 {
+	ttdiag::Sumar(ttdiag::DRAWS, 1);
+#if !TT_DIAG_VACIO
 	triple_medir_scatter(mCurrentVertexShader);
 	triple_medir_sombras(mCurrentPixelShader);
 	triple_medir_pasto_scatter(mCurrentVertexShader, VertexCountPerInstance);
 	triple_medir_zonas(mCurrentVertexShader, VertexCountPerInstance, InstanceCount);
+#endif
 	DrawContext c = DrawContext(DrawCall::DrawInstanced, VertexCountPerInstance, 0, InstanceCount, StartVertexLocation, 0, StartInstanceLocation, NULL, 0);
 	BeforeDraw(c);
 
@@ -4261,7 +4592,11 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
 	// stride, y adivinar cual es el del pasto por su contenido lleva a
 	// confundirlo con los del spline de la pista (que tambien son posiciones).
 	// Con la sombra completa, el draw del pasto dice EXACTAMENTE que usa.
+#if !TT_DIAG_VACIO
 	if (ppShaderResourceViews) {
+#else
+	if (false) {
+#endif
 		for (UINT i = 0; i < NumViews; i++) {
 			UINT slot = StartSlot + i;
 			if (slot >= 32)

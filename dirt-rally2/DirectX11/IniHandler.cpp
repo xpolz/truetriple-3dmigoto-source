@@ -33,6 +33,95 @@ static int tt_sesion = -1;
 static const char *tt_motivo = "";
 static char tt_detalle[truetriple::kMarcaDetalleMax] = "";
 
+#include "TrueTripleDiag.h"
+#include "TrueTriplePrueba.h"
+
+// ---- Opciones de la version de prueba (TrueTriplePrueba.h) ----------------
+namespace ttprueba {
+
+volatile LONG g_bits = 0;
+volatile LONG g_generacion = 0;
+static char g_texto[64] = "ninguna";
+
+static void armar_texto(LONG b)
+{
+	g_texto[0] = 0;
+	if (b & LIVIANO)  strcat_s(g_texto, sizeof(g_texto), "liviano ");
+	if (b & RASTER)   strcat_s(g_texto, sizeof(g_texto), "raster ");
+	if (b & REDIBUJO) strcat_s(g_texto, sizeof(g_texto), "redibujo ");
+	size_t n = strlen(g_texto);
+	if (n)
+		g_texto[n - 1] = 0;
+	else
+		strcpy_s(g_texto, sizeof(g_texto), "ninguna");
+}
+
+const char *Texto()
+{
+	return g_texto;
+}
+
+// La linea "#tt-prueba: liviano raster redibujo" del cartel de F3. El archivo
+// lo escribe el plugin en cada Jugar con lo que arma la web (CONTRATO-MENU-F3:
+// las lineas con '#' no se dibujan). Cualquier otra palabra se ignora.
+void Leer()
+{
+	LONG b = 0;
+	wchar_t ruta[MAX_PATH];
+	if (GetModuleFileName(migoto_handle, ruta, MAX_PATH)) {
+		wchar_t *barra = wcsrchr(ruta, L'\\');
+		if (barra && (size_t)(barra + 1 - ruta) + 24 < MAX_PATH) {
+			wcscpy_s(barra + 1, MAX_PATH - (barra + 1 - ruta), L"TrueTriple.menu.txt");
+			FILE *f = NULL;
+			if (!_wfopen_s(&f, ruta, L"rb") && f) {
+				char linea[512];
+				while (fgets(linea, sizeof(linea), f)) {
+					const char *p = linea;
+					if (!strncmp(p, "\xEF\xBB\xBF", 3))
+						p += 3;
+					if (strncmp(p, "#tt-prueba:", 11))
+						continue;
+					p += 11;
+					if (strstr(p, "liviano"))  b |= LIVIANO;
+					if (strstr(p, "raster"))   b |= RASTER;
+					if (strstr(p, "redibujo")) b |= REDIBUJO;
+					break;
+				}
+				fclose(f);
+			}
+		}
+	}
+	InterlockedExchange(&g_bits, b);
+	InterlockedIncrement(&g_generacion);
+	armar_texto(b);
+}
+
+} // namespace ttprueba
+
+int TrueTripleDiagSesion()
+{
+	return tt_sesion;
+}
+
+#if TT_DIAG_VACIO
+// Variante A del dll de diagnostico (TrueTripleDiag.h): 3Dmigoto sin nada
+// nuestro. Como el ini inerte, pero sin log y con una carpeta de shaders que
+// no existe, asi no se carga ningun reemplazo de ShaderFixes. No necesita la
+// marca: no hace nada del mod.
+static const char kIniDiagVacio[] =
+	"[Logging]\n"
+	"calls=0\n"
+	"input=0\n"
+	"debug=0\n"
+	"unbuffered=0\n"
+	"force_cpu_affinity=0\n"
+	"crash=0\n"
+	"[Rendering]\n"
+	"override_directory=TrueTriple_diag_sin_shaders\n"
+	"[Hunting]\n"
+	"hunting=0\n";
+#endif
+
 #include <filesystem>
 
 // TrueTriple: eco del ini al log. Todo lo que repite contenido del d3dx.ini
@@ -3898,7 +3987,8 @@ static void _EnumerateCustomShaderSections(IniSections::iterator lower, IniSecti
 		std::transform(shader_id.begin(), shader_id.end(), shader_id.begin(), ::towlower);
 
 		// Construct a custom shader in the global list:
-		customShaders[shader_id];
+		customShaders[shader_id].tt_redibujo =
+			(shader_id == L"customshadertripleredraw");
 	}
 }
 static void EnumerateCustomShaderSections()
@@ -4188,6 +4278,11 @@ void LoadConfigFile()
 	// MarcaVerificarLocal devuelve el estado y el log deja el motivo del reposo
 	// y un detalle corto. El texto "TrueTriple: sin sesion" queda literal y
 	// seguido: lo buscan los scripts de build y el plugin en el binario.
+#if TT_DIAG_VACIO
+	// Reposo a la fuerza: d3dx_user.ini no se lee ni se toca.
+	tt_sesion = 0;
+	tt_motivo = "diagnostico A";
+#endif
 	if (tt_sesion < 0) {
 		const truetriple::MarcaEstado tt_estado = truetriple::MarcaVerificarLocal(
 			"dr2", (long long)time(NULL), tt_detalle, sizeof(tt_detalle));
@@ -4196,11 +4291,19 @@ void LoadConfigFile()
 	}
 	if (tt_sesion) {
 		LogInfo("TrueTriple: sesion abierta (%s)\n", tt_motivo);
+		ttprueba::Leer();
+		LogInfo("TrueTriple prueba: opciones = %s (bits=%ld)\n", ttprueba::Texto(), (long)ttprueba::g_bits);
 		ParseIniFile(iniFile);
 	} else {
+		InterlockedExchange(&ttprueba::g_bits, 0);
 		LogInfo("TrueTriple: sin sesion (%s), el mod queda en reposo [%s]\n", tt_motivo, tt_detalle);
 		ini_sections.clear();
+#if TT_DIAG_VACIO
+		LogInfo("TrueTriple: diagnostico A, 3Dmigoto vacio (sin ini, sin ShaderFixes)\n");
+		ParseIniExcerpt(kIniDiagVacio);
+#else
 		ParseIniExcerpt(truetriple::kIniReposo);
+#endif
 	}
 	InsertBuiltInIniSections();
 
