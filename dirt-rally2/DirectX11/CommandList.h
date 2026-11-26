@@ -48,7 +48,7 @@ public:
 	// common case we are going to store both width & height in separate
 	// ini params:
 	float rt_width, rt_height;
-	// Version de prueba, casilla REDIBUJO: el tamano del render target que
+	// Opcion de rendimiento REDIBUJO: el tamano del render target que
 	// mide triple_scissor, una vez por objeto (los 3 tercios lo comparten).
 	float tt_rt_w, tt_rt_h;
 	bool tt_en_redibujo;
@@ -342,7 +342,7 @@ public:
 	int max_executions_per_frame;
 	unsigned frame_no;
 
-	// Version de prueba (TrueTriplePrueba.h): la seccion es
+	// Opciones de rendimiento (TrueTripleRendimiento.h): la seccion es
 	// [CustomShaderTripleRedraw], el redibujo de cada objeto en los 3 tercios.
 	bool tt_redibujo;
 	int executions_this_frame;

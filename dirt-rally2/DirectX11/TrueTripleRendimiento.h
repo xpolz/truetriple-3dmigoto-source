@@ -1,21 +1,22 @@
 #pragma once
 
-// TrueTriple: opciones de la VERSION DE PRUEBA de rendimiento en AMD (rama
-// fuente/dr2-amd-casillas, 25/11/2026, tarea "DR2: el triple deja la CPU como
-// limite en AMD").
+// TrueTriple: OPCIONES DE RENDIMIENTO (nacieron en la version de prueba DR2
+// 1.9.18.1 del 25/11/2026, rama fuente/dr2-amd-casillas; pasaron a la version
+// normal el 26/11/2026). Con una RX 9070 XT y el triple, la CPU quedaba como
+// limite: de 69 a 106 FPS con las tres prendidas (97 solo con LIVIANO).
 //
-// Cada opcion es una casilla de la app (Graficos > Pruebas de rendimiento). La
-// app no puede cambiar el plugin de Rust en una version de prueba, asi que las
-// casillas viajan por un archivo que el plugin YA escribe en cada Jugar: el
-// cartel de F3, TrueTriple.menu.txt, al lado del d3dx.ini. La web le agrega
-// una linea de comentario (el contrato del cartel ignora las que empiezan con
-// '#'; un dll estable no la ve):
+// Cada opcion es una casilla de la seccion Rendimiento de la app, todas
+// apagadas por defecto. Se guardan en el perfil (perfil.ini: REND_LIVIANO,
+// REND_RASTER, REND_REDIBUJO) y el plugin las agrega en cada Jugar como una
+// linea de comentario al final del cartel de F3, TrueTriple.menu.txt, al lado
+// del d3dx.ini (el contrato del cartel ignora las lineas que empiezan con
+// '#'; un dll anterior no la ve):
 //
-//   #tt-prueba: liviano raster redibujo
+//   #tt-rendimiento: liviano raster redibujo
 //
 // El dll la lee al cargar el ini (LoadConfigFile, solo con la marca de sesion
-// valida) y la deja en g_bits. Sin la linea, o sin sesion, todo apagado: el
-// dll hace exactamente lo de la estable.
+// valida; tambien con Ctrl+Alt+Shift+F10) y la deja en g_bits. Sin la linea,
+// o sin sesion, todo apagado: el dll hace exactamente lo de siempre.
 //
 //   LIVIANO   Map/Unmap sin los diagnosticos viejos (censos con spinlock
 //             global, volcados, 3 o 4 GetDesc por Map), las variables del ini
@@ -36,7 +37,7 @@
 
 #include <windows.h>
 
-namespace ttprueba {
+namespace ttrend {
 
 enum Opcion {
 	LIVIANO  = 1,
@@ -55,10 +56,10 @@ inline bool Activa(Opcion o)
 	return (g_bits & (LONG)o) != 0;
 }
 
-// IniHandler.cpp: lee la linea "#tt-prueba:" de TrueTriple.menu.txt (al lado
+// IniHandler.cpp: lee la linea "#tt-rendimiento:" de TrueTriple.menu.txt (al lado
 // del dll) y la deja en g_bits. Lo llama LoadConfigFile con la sesion abierta.
 void Leer();
 // "liviano raster" o "ninguna", para el log.
 const char *Texto();
 
-} // namespace ttprueba
+} // namespace ttrend

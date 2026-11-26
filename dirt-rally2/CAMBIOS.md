@@ -104,3 +104,17 @@ de medición cada 10 s en `TrueTriple_diag.txt` y en `d3d11_log.txt`, y una vez 
 `D3D11_FEATURE_THREADING`. Compilada con `LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
 `fc84c6e316c42b8b37e77f5776beb2bf17c4e802636daa58a478440fb4224c46`; `nvapi64.dll` sin cambios.
 Etiqueta `dr2-dll-fc84c6e3`.
+
+## dll `382889c3` (26/11/2026): las opciones de rendimiento pasan a la versión normal
+
+Sobre la `fc84c6e3` de la versión de prueba (que con las tres opciones llevó una RX 9070 XT de
+69 a 106 FPS con el triple). Las mismas tres opciones (`liviano`, `raster`, `redibujo`), ahora en
+`TrueTripleRendimiento.h` (espacio `ttrend`, antes `TrueTriplePrueba.h`/`ttprueba`), que llegan
+en la línea `#tt-rendimiento: liviano raster redibujo` de `TrueTriple.menu.txt` (la escribe el
+plugin con lo que el usuario eligió en la app; `IniHandler.cpp`, solo con la sesión abierta); sin
+la línea, todo como la `076f6282`. La medición (`TrueTripleDiag.h`) queda compilada por defecto
+(`TT_DIAG_INSTRUMENTAR` vale 1 sin pasarlo por `CL`) y su línea cada 10 s va solo al
+`d3d11_log.txt` (ya no escribe `TrueTriple_diag.txt`). Compilada con
+`LINK=/PDBALTPATH:%_PDB%`. SHA-256 de la dll:
+`382889c337591d97c9add11d434c48004febbaaa076b0e968928ce41f442a418`; `nvapi64.dll` sin cambios.
+Etiqueta `dr2-dll-382889c3`.

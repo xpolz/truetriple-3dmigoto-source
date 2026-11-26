@@ -4,7 +4,7 @@
 
 #include "CommandList.h"
 #include "TrueTripleDiag.h"
-#include "TrueTriplePrueba.h"
+#include "TrueTripleRendimiento.h"
 
 #include <DDSTextureLoader.h>
 #include <WICTextureLoader.h>
@@ -114,9 +114,9 @@ static void tt_cache_refrescar_si_toca()
 
 TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
 {
-	// Version de prueba: la copia por cuadro solo con la casilla LIVIANO; sin
+	// Opciones de rendimiento: la copia por cuadro solo con la casilla LIVIANO; sin
 	// ella, cada lectura toma el candado como en la estable.
-	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
+	int i = ttrend::Activa(ttrend::LIVIANO) ? tt_cache_indice(name) : -1;
 	if (i >= 0) {
 		tt_cache_refrescar_si_toca();
 		LONG64 v = g_tt_cache_val[i];
@@ -140,7 +140,7 @@ TripleIniSnapshot TripleReadIniGlobal(const wchar_t *name, float fallback)
 
 void TripleWriteIniGlobal(const wchar_t *name, float value)
 {
-	int i = ttprueba::Activa(ttprueba::LIVIANO) ? tt_cache_indice(name) : -1;
+	int i = ttrend::Activa(ttrend::LIVIANO) ? tt_cache_indice(name) : -1;
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 	auto it = command_list_globals.find(name);
 	bool found = it != command_list_globals.end();
@@ -4411,9 +4411,9 @@ void TripleCaptureCameraCB(const void *data, unsigned size)
 		static volatile LONG s_prologo_cuadro = -1;
 		LONG cuadro = (LONG)G->frame_no;
 		LONG antes = s_prologo_cuadro;
-		// Version de prueba: una vez por cuadro solo con LIVIANO; sin la
+		// Opciones de rendimiento: una vez por cuadro solo con LIVIANO; sin la
 		// casilla corre en cada constant buffer, como en la estable.
-		if (!ttprueba::Activa(ttprueba::LIVIANO) || (antes != cuadro &&
+		if (!ttrend::Activa(ttrend::LIVIANO) || (antes != cuadro &&
 		    InterlockedCompareExchange(&s_prologo_cuadro, cuadro, antes) == antes)) {
 			tt_replay_update();
 			TTVisibilityProbe::tick();
@@ -5125,7 +5125,7 @@ void TripleRegionCommand::run(CommandListState *state)
 	// target real. Independiente de la resolucion. No toca ningun cbuffer.
 	if (scissor_only) {
 		float rw = 0.0f, rh = 0.0f;
-		// Version de prueba, casilla REDIBUJO: el render target es el mismo
+		// Opcion de rendimiento REDIBUJO: el render target es el mismo
 		// en los 3 tercios del objeto; se mide en el primero (el custom
 		// shader del redibujo pone tt_rt_w en -1 al empezar).
 		bool tt_medido = false;
@@ -5387,10 +5387,10 @@ void TripleParamsCommand::run(CommandListState *state)
 
 	if (g_triple_par_srv[idx]) {
 		ctx->VSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
-		// Version de prueba, casilla REDIBUJO: sin domain shader puesto por el
+		// Opcion de rendimiento REDIBUJO: sin domain shader puesto por el
 		// juego (sin teselado) no hay quien lea el slot del DS.
 		HackerContext *hc = state->mHackerContext;
-		if (!(ttprueba::Activa(ttprueba::REDIBUJO) && hc && !hc->mCurrentDomainShaderHandle))
+		if (!(ttrend::Activa(ttrend::REDIBUJO) && hc && !hc->mCurrentDomainShaderHandle))
 			ctx->DSSetShaderResources((UINT)G->IniParamsReg, 1, &g_triple_par_srv[idx]);
 	}
 }
@@ -6285,7 +6285,7 @@ void CustomShader::merge_rasterizer_states(ID3D11RasterizerState *src_state, ID3
 	mOrigDevice1->CreateRasterizerState(&rs_desc, &rs_state);
 }
 
-// ---- Version de prueba, casilla RASTER (TrueTriplePrueba.h) ---------------
+// ---- Opcion de rendimiento RASTER (TrueTripleRendimiento.h) ---------------
 // rasterizer_state_merge = true crea un estado nuevo con
 // ID3D11Device::CreateRasterizerState en CADA corrida del custom shader: en el
 // redibujo del triple es una vez por objeto, unas 900 por cuadro, desde los 7
@@ -6326,7 +6326,7 @@ static ID3D11RasterizerState *tt_rs_combinado(CustomShader *cs, ID3D11Rasterizer
 	}
 	// Ini recargado: los CustomShader son otros (y un puntero puede
 	// repetirse), asi que este hilo vacia su cache.
-	LONG gen = ttprueba::g_generacion;
+	LONG gen = ttrend::g_generacion;
 	if (gen != tt_rs_cache_gen) {
 		for (int i = 0; i < tt_rs_cache_n; i++)
 			if (tt_rs_cache[i].st)
@@ -6473,7 +6473,7 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	if (custom_shader->rs_override) {
 		mOrigContext1->RSGetState(&saved_rs);
 		ID3D11RasterizerState *tt_rs = NULL;
-		if (custom_shader->rs_override == 2 && ttprueba::Activa(ttprueba::RASTER))
+		if (custom_shader->rs_override == 2 && ttrend::Activa(ttrend::RASTER))
 			tt_rs = tt_rs_combinado(custom_shader, saved_rs, mOrigDevice1);
 		if (tt_rs) {
 			mOrigContext1->RSSetState(tt_rs);
@@ -6490,12 +6490,12 @@ void RunCustomShaderCommand::run(CommandListState *state)
 		mOrigContext1->PSGetSamplers(0, num_sampler, saved_sampler_states);
 		mOrigContext1->PSSetSamplers(0, 1, &custom_shader->sampler_state); //just one slot for the moment TODO: allow more via *.ini file
 	}
-	// Version de prueba, casilla REDIBUJO: el redibujo del triple solo
+	// Opcion de rendimiento REDIBUJO: el redibujo del triple solo
 	// bindea la textura de parametros, pone el scissor y dibuja; no cambia
 	// render targets, UAVs ni viewports, asi que no hace falta guardarlos y
 	// reponerlos en cada objeto (en AMD, sin listas de comandos del driver,
 	// el runtime repite esas llamadas en el hilo que ejecuta las listas).
-	const bool tt_sin_om = custom_shader->tt_redibujo && ttprueba::Activa(ttprueba::REDIBUJO);
+	const bool tt_sin_om = custom_shader->tt_redibujo && ttrend::Activa(ttrend::REDIBUJO);
 	if (!tt_sin_om) {
 	// We save off the viewports unconditionally for now. We could
 	// potentially skip this by flagging if a command list may alter them,

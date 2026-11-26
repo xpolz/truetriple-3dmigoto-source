@@ -34,10 +34,10 @@ static const char *tt_motivo = "";
 static char tt_detalle[truetriple::kMarcaDetalleMax] = "";
 
 #include "TrueTripleDiag.h"
-#include "TrueTriplePrueba.h"
+#include "TrueTripleRendimiento.h"
 
-// ---- Opciones de la version de prueba (TrueTriplePrueba.h) ----------------
-namespace ttprueba {
+// ---- Opciones de la version de prueba (TrueTripleRendimiento.h) ----------------
+namespace ttrend {
 
 volatile LONG g_bits = 0;
 volatile LONG g_generacion = 0;
@@ -61,9 +61,10 @@ const char *Texto()
 	return g_texto;
 }
 
-// La linea "#tt-prueba: liviano raster redibujo" del cartel de F3. El archivo
-// lo escribe el plugin en cada Jugar con lo que arma la web (CONTRATO-MENU-F3:
-// las lineas con '#' no se dibujan). Cualquier otra palabra se ignora.
+// La linea "#tt-rendimiento: liviano raster redibujo" del cartel de F3. El
+// plugin la agrega en cada Jugar, sacada del perfil (perfil.ini), al final del
+// cartel que arma la web (CONTRATO-MENU-F3: las lineas con '#' no se dibujan).
+// Cualquier otra palabra se ignora.
 void Leer()
 {
 	LONG b = 0;
@@ -79,9 +80,9 @@ void Leer()
 					const char *p = linea;
 					if (!strncmp(p, "\xEF\xBB\xBF", 3))
 						p += 3;
-					if (strncmp(p, "#tt-prueba:", 11))
+					if (strncmp(p, "#tt-rendimiento:", 16))
 						continue;
-					p += 11;
+					p += 16;
 					if (strstr(p, "liviano"))  b |= LIVIANO;
 					if (strstr(p, "raster"))   b |= RASTER;
 					if (strstr(p, "redibujo")) b |= REDIBUJO;
@@ -96,7 +97,7 @@ void Leer()
 	armar_texto(b);
 }
 
-} // namespace ttprueba
+} // namespace ttrend
 
 int TrueTripleDiagSesion()
 {
@@ -4291,11 +4292,11 @@ void LoadConfigFile()
 	}
 	if (tt_sesion) {
 		LogInfo("TrueTriple: sesion abierta (%s)\n", tt_motivo);
-		ttprueba::Leer();
-		LogInfo("TrueTriple prueba: opciones = %s (bits=%ld)\n", ttprueba::Texto(), (long)ttprueba::g_bits);
+		ttrend::Leer();
+		LogInfo("TrueTriple rendimiento: opciones = %s (bits=%ld)\n", ttrend::Texto(), (long)ttrend::g_bits);
 		ParseIniFile(iniFile);
 	} else {
-		InterlockedExchange(&ttprueba::g_bits, 0);
+		InterlockedExchange(&ttrend::g_bits, 0);
 		LogInfo("TrueTriple: sin sesion (%s), el mod queda en reposo [%s]\n", tt_motivo, tt_detalle);
 		ini_sections.clear();
 #if TT_DIAG_VACIO

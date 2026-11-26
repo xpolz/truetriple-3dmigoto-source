@@ -1,31 +1,27 @@
 #pragma once
 
-// TrueTriple: dll de DIAGNOSTICO de rendimiento (rama diag/dr2-amd-map-unmap,
-// 24/11/2026, caso de una RX 9070 XT que queda con la GPU al 30-50% con el mod
-// enganchado aunque F7 apague el triple).
+// TrueTriple: MEDICION de rendimiento. Nacio en la rama diag/dr2-amd-map-unmap
+// (24/11/2026, una RX 9070 XT con la GPU al 30-50% con el mod enganchado
+// aunque F7 apague el triple) y desde el 26/11/2026 va en el dll normal.
 //
-// Nada de esto entra en un build normal: las dos macros valen 0 salvo que el
-// build las pase por la variable de entorno CL (ver tools/build-diag-amd.ps1):
-//
-//   TT_DIAG_INSTRUMENTAR=1  cuenta por cuadro Map/Unmap, draws, listas de
-//                           comandos y el tiempo de Present, y cada 10 s escribe
-//                           una linea en TrueTriple_diag.txt al lado del dll.
-//   TT_DIAG_VACIO=1         variante A: 3Dmigoto "vacio". No carga ningun ini
-//                           de la carpeta (ni el armado ni el inerte), no carga
-//                           ShaderFixes y saltea nuestros agregados en los
-//                           caminos calientes del contexto. Es el intermediario
-//                           solo, para ver si ya eso frena.
-//
-// Sin VACIO, el build con INSTRUMENTAR es la variante B: el dll normal con el
-// arreglo candidato (variables del ini leidas una vez por cuadro y sin los
-// diagnosticos viejos en Map/Unmap) mas los contadores.
+//   TT_DIAG_INSTRUMENTAR    (1 por defecto) cuenta por cuadro Map/Unmap, draws,
+//                           listas de comandos y el tiempo de Present, y cada
+//                           10 s escribe una linea "TTDIAG" en el d3d11_log.txt
+//                           (lo que adjunta "Informar un error"): FPS, ms del
+//                           cuadro, ms en Present y las opciones de rendimiento
+//                           prendidas. Una vez al arrancar: la placa y
+//                           driver_command_lists. Con 0 no queda nada.
+//   TT_DIAG_VACIO=1         variante A, solo diagnostico (build-diag-amd.ps1):
+//                           3Dmigoto "vacio". No carga ningun ini de la carpeta
+//                           (ni el armado ni el inerte), no carga ShaderFixes y
+//                           saltea nuestros agregados en los caminos calientes.
 //
 // Los contadores son por hilo (cada contexto diferido del juego es un hilo):
 // sin candados ni atomicos en el camino caliente. El hilo de Present los suma
 // cada 10 s; una lectura corrida en un contador no importa para un promedio.
 
 #ifndef TT_DIAG_INSTRUMENTAR
-#define TT_DIAG_INSTRUMENTAR 0
+#define TT_DIAG_INSTRUMENTAR 1
 #endif
 #ifndef TT_DIAG_VACIO
 #define TT_DIAG_VACIO 0

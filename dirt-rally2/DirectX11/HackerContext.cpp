@@ -35,11 +35,10 @@
 // volcados del pasto y de las zonas, copias de constant buffers para medir
 // FOV y sombras, el espia de buffers dinamicos). Solo escriben en el log y
 // algunos toman un spinlock global en cada Map de los 7 contextos del juego.
-// Apagados desde la rama diag/dr2-amd-map-unmap; con 1 vuelven tal cual.
-// Version de prueba (TrueTriplePrueba.h): corren como en la estable salvo
-// con la casilla LIVIANO.
-#include "TrueTriplePrueba.h"
-#define TT_VIEJOS_ACTIVOS (!ttprueba::Activa(ttprueba::LIVIANO))
+// Corren como siempre salvo con la opcion de rendimiento LIVIANO
+// (TrueTripleRendimiento.h), que los saltea.
+#include "TrueTripleRendimiento.h"
+#define TT_VIEJOS_ACTIVOS (!ttrend::Activa(ttrend::LIVIANO))
 
 // ---- Diagnostico de rendimiento (TrueTripleDiag.h) ----------------------------------------------
 #if TT_DIAG_INSTRUMENTAR
@@ -91,41 +90,12 @@ static void sumar_todo(LONG64 out[N])
 	}
 }
 
-static wchar_t g_ruta[MAX_PATH];
-
-static void armar_ruta()
-{
-	HMODULE yo = NULL;
-	g_ruta[0] = 0;
-	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			(LPCWSTR)&armar_ruta, &yo))
-		return;
-	DWORD n = GetModuleFileNameW(yo, g_ruta, MAX_PATH);
-	if (!n || n >= MAX_PATH) {
-		g_ruta[0] = 0;
-		return;
-	}
-	wchar_t *barra = wcsrchr(g_ruta, L'\\');
-	if (!barra || (size_t)(barra - g_ruta) + 24 >= MAX_PATH) {
-		g_ruta[0] = 0;
-		return;
-	}
-	wcscpy_s(barra + 1, MAX_PATH - (barra + 1 - g_ruta), L"TrueTriple_diag.txt");
-}
-
+// La linea de medicion va solo al d3d11_log.txt, que es lo que adjunta
+// "Informar un error" (la cola de 128 KiB). El TrueTriple_diag.txt de la
+// version de prueba (un archivo mas en la carpeta del juego) ya no se escribe.
 static void escribir(const char *linea)
 {
-	// Version de prueba: tambien al d3d11_log.txt, que es lo que adjunta
-	// "Informar un error" (la cola de 128 KiB).
 	LogInfo("TTDIAG %s", linea[0] == '\n' ? linea + 1 : linea);
-	if (!g_ruta[0])
-		return;
-	FILE *f = NULL;
-	if (_wfopen_s(&f, g_ruta, L"a") || !f)
-		return;
-	fputs(linea, f);
-	fclose(f);
 }
 
 static char variante()
@@ -133,7 +103,7 @@ static char variante()
 #if TT_DIAG_VACIO
 	return 'A';
 #else
-	return 'P';	// version de prueba con casillas (TrueTriplePrueba.h)
+	return 'R';	// el dll normal con las opciones de rendimiento (TrueTripleRendimiento.h)
 #endif
 }
 
@@ -165,7 +135,7 @@ void InfoDispositivo(ID3D11Device *dev)
 	_snprintf_s(l, sizeof(l), _TRUNCATE,
 		"placa=%s vendor=0x%04x driver_command_lists=%d concurrent_creates=%d (hr=0x%08x) | opciones=%s\n",
 		placa, vendor, SUCCEEDED(hr) ? (int)th.DriverCommandLists : -1,
-		SUCCEEDED(hr) ? (int)th.DriverConcurrentCreates : -1, (unsigned)hr, ttprueba::Texto());
+		SUCCEEDED(hr) ? (int)th.DriverConcurrentCreates : -1, (unsigned)hr, ttrend::Texto());
 	escribir(l);
 }
 
@@ -191,15 +161,14 @@ void Cuadro(unsigned long long tsc_acciones, unsigned long long tsc_present)
 		tsc0 = tsc;
 		tsc_cuadro_ant = tsc;
 		sumar_todo(antes);
-		armar_ruta();
 		char l[512];
 		time_t t = time(NULL);
 		struct tm lt;
 		localtime_s(&lt, &t);
 		_snprintf_s(l, sizeof(l), _TRUNCATE,
-			"\n=== TrueTriple test build %c, %04d-%02d-%02d %02d:%02d, session=%d, opciones=%s ===\n",
+			"\n=== TrueTriple medicion %c, %04d-%02d-%02d %02d:%02d, session=%d, opciones=%s ===\n",
 			variante(), lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min,
-			TrueTripleDiagSesion(), ttprueba::Texto());
+			TrueTripleDiagSesion(), ttrend::Texto());
 		escribir(l);
 		return;
 	}
@@ -251,7 +220,7 @@ void Cuadro(unsigned long long tsc_acciones, unsigned long long tsc_present)
 		d[TSC_MAP_DRIVER] * ms / c, d[TSC_UNMAP_DRIVER] * ms / c, d[TSC_MAP_LECTURA] * ms / c,
 		d[TSC_EXTRAS] * ms / c,
 		d[EXECUTES] / c, d[TSC_EXECUTE] * ms / c, d[FINISHES] / c, d[TSC_FINISH] * ms / c,
-		d[INI_CANDADO] / c, ttprueba::Texto());
+		d[INI_CANDADO] / c, ttrend::Texto());
 	escribir(l);
 
 	for (int k = 0; k < N; k++)
@@ -3113,9 +3082,9 @@ STDMETHODIMP_(void) HackerContext::RSSetScissorRects(THIS_
 #if TT_DIAG_VACIO
     if (false) {
 #else
-    // Version de prueba: el atajo solo con LIVIANO; sin la casilla, como en la
+    // Opciones de rendimiento: el atajo solo con LIVIANO; sin la casilla, como en la
     // estable (se sondea cada scissor de un rectangulo).
-    if (NumRects == 1 && pRects && (!ttprueba::Activa(ttprueba::LIVIANO) ||
+    if (NumRects == 1 && pRects && (!ttrend::Activa(ttrend::LIVIANO) ||
             TripleReadIniGlobal(L"$cull_site").fval == 100.0f)) {
 #endif
         ID3D11DepthStencilView *depthView = nullptr;
